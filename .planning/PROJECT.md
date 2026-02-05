@@ -58,7 +58,7 @@ Final output is a structured report:
 
 ## Constraints
 
-- **Tech Stack:** TypeScript — better MCP SDK support
+- **Tech Stack:** Python — preferred language, good MCP SDK support via `mcp` package
 - **Starting Point:** Steam Official API first (stable, provides foundation AppIDs)
 - **Scraping Fragility:** SteamDB has no public API — scraping added in Step 2, not Step 1
 - **Rate Limits:** Steam API has 200 requests/5 min on some endpoints
@@ -68,7 +68,7 @@ Final output is a structured report:
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| TypeScript for MCP | Better SDK support, Cursor compatibility | — Pending |
+| Python for MCP | Preferred language, good SDK support via `mcp` package | — Pending |
 | Steam API before SteamDB | Stable foundation, need AppIDs first | — Pending |
 | Personal tool, no multi-user | Faster iteration, complexity reduction | — Pending |
 | Skip Reddit/Twitch/YouTube initially | Focus on core market data that powers Phase 1-3 | — Pending |
