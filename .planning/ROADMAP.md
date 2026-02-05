@@ -30,10 +30,14 @@ Decimal phases appear between their surrounding integers in numeric order.
   4. Steam API rate limits are respected automatically (no manual delay insertion needed)
   5. All MCP server logs appear in stderr only (stdout shows clean JSON-RPC communication)
 
-**Plans**: TBD (to be defined during planning phase)
+**Plans**: 5 plans
 
 Plans:
-- [ ] TBD during `/gsd:plan-phase 1`
+- [ ] 01-01-PLAN.md - Project setup, config module, rate-limited HTTP client
+- [ ] 01-02-PLAN.md - MCP server skeleton with stdio transport and stderr logging
+- [ ] 01-03-PLAN.md - Steam API clients (SteamSpy for search, Steam Store for metadata)
+- [ ] 01-04-PLAN.md - MCP tool implementations and server wiring
+- [ ] 01-05-PLAN.md - Documentation and end-to-end verification (checkpoint)
 
 ## Progress
 
@@ -42,4 +46,4 @@ Phases execute in numeric order.
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. MCP Foundation & Steam API Integration | 0/TBD | Not started | - |
+| 1. MCP Foundation & Steam API Integration | 0/5 | Not started | - |
