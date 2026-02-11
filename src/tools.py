@@ -3,16 +3,17 @@
 import json
 from mcp.server.fastmcp import FastMCP
 
-from src.http_client import RateLimitedClient
+from src.http_client import CachedAPIClient
+from src.cache import TTLCache
+from src.rate_limiter import HostRateLimiter
 from src.steam_api import SteamSpyClient, SteamStoreClient
 from src.schemas import APIError
-from src.config import Config
 from src.logging_config import get_logger
 
 logger = get_logger(__name__)
 
 # Module-level clients (initialized in register_tools)
-_http_client: RateLimitedClient | None = None
+_http_client: CachedAPIClient | None = None
 _steamspy: SteamSpyClient | None = None
 _steam_store: SteamStoreClient | None = None
 
@@ -21,12 +22,14 @@ def register_tools(mcp: FastMCP):
     """Register all MCP tools with the server."""
     global _http_client, _steamspy, _steam_store
 
-    # Initialize shared clients
-    _http_client = RateLimitedClient(rate_limit_delay=Config.RATE_LIMIT_DELAY)
+    # Initialize shared infrastructure with per-host rate limiting and TTL cache
+    cache = TTLCache(default_ttl=3600)  # 1 hour default
+    rate_limiter = HostRateLimiter()
+    _http_client = CachedAPIClient(cache=cache, rate_limiter=rate_limiter)
     _steamspy = SteamSpyClient(_http_client)
     _steam_store = SteamStoreClient(_http_client)
 
-    logger.info("Initializing MCP tools with rate limit: %.1fs", Config.RATE_LIMIT_DELAY)
+    logger.info("Initializing MCP tools with per-host rate limiting and TTL cache")
 
     @mcp.tool()
     async def search_genre(genre: str, limit: int = 10) -> str:
@@ -34,7 +37,7 @@ def register_tools(mcp: FastMCP):
 
         Args:
             genre: Steam tag to search (e.g., "Roguelike", "Action", "RPG")
-            limit: Maximum number of results (1-100, default 10)
+            limit: Maximum number of results (1-10000, default 10). Use 0 to return all matching AppIDs.
 
         Returns:
             JSON string with list of Steam AppIDs matching the genre
@@ -43,11 +46,18 @@ def register_tools(mcp: FastMCP):
         if not genre or not genre.strip():
             return json.dumps({"error": "genre is required", "error_type": "validation"})
 
-        if not 1 <= limit <= 100:
-            return json.dumps({"error": "limit must be between 1 and 100", "error_type": "validation"})
+        # Handle 0 as "return all"
+        return_all = (limit == 0)
+        
+        # Validate limit if not returning all
+        if not return_all and not 1 <= limit <= 10000:
+            return json.dumps({"error": "limit must be between 1 and 10000, or 0 for all results", "error_type": "validation"})
+        
+        limit_value = None if return_all else limit
 
-        logger.info("Searching for genre: %s, limit: %d", genre, limit)
-        result = await _steamspy.search_by_tag(genre.strip(), limit)
+        limit_str = "all" if return_all else str(limit)
+        logger.info("Searching for genre: %s, limit: %s", genre, limit_str)
+        result = await _steamspy.search_by_tag(genre.strip(), limit_value)
 
         if isinstance(result, APIError):
             return json.dumps(result.model_dump())

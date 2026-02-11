@@ -2,7 +2,7 @@
 
 import httpx
 from datetime import datetime, timezone
-from src.http_client import RateLimitedClient
+from src.http_client import CachedAPIClient
 from src.schemas import GameMetadata, SearchResult, APIError
 from src.logging_config import get_logger
 
@@ -14,11 +14,11 @@ class SteamSpyClient:
 
     BASE_URL = "https://steamspy.com/api.php"
 
-    def __init__(self, http_client: RateLimitedClient):
-        """Initialize SteamSpy client with rate-limited HTTP client.
+    def __init__(self, http_client: CachedAPIClient):
+        """Initialize SteamSpy client with cached HTTP client.
 
         Args:
-            http_client: RateLimitedClient instance for API requests
+            http_client: CachedAPIClient instance for API requests
         """
         self.http = http_client
 
@@ -33,9 +33,11 @@ class SteamSpyClient:
             SearchResult with AppID list, or APIError on failure
         """
         try:
-            data = await self.http.get(
+            # Use get_with_metadata for freshness tracking (1 hour cache TTL)
+            data, fetched_at, cache_age = await self.http.get_with_metadata(
                 self.BASE_URL,
-                params={"request": "tag", "tag": tag}
+                params={"request": "tag", "tag": tag},
+                cache_ttl=3600
             )
             # SteamSpy returns {appid: {game_data}, ...}
             all_appids = [int(appid) for appid in data.keys()]
@@ -45,7 +47,8 @@ class SteamSpyClient:
                 appids=appids,
                 tag=tag,
                 total_found=len(data),
-                fetched_at=datetime.now(timezone.utc)
+                fetched_at=fetched_at,
+                cache_age_seconds=cache_age
             )
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
@@ -69,11 +72,11 @@ class SteamStoreClient:
 
     BASE_URL = "https://store.steampowered.com/api"
 
-    def __init__(self, http_client: RateLimitedClient):
-        """Initialize Steam Store client with rate-limited HTTP client.
+    def __init__(self, http_client: CachedAPIClient):
+        """Initialize Steam Store client with cached HTTP client.
 
         Args:
-            http_client: RateLimitedClient instance for API requests
+            http_client: CachedAPIClient instance for API requests
         """
         self.http = http_client
 
@@ -87,9 +90,11 @@ class SteamStoreClient:
             GameMetadata with game details, or APIError on failure
         """
         try:
-            data = await self.http.get(
+            # Use get_with_metadata for freshness tracking (24 hour cache TTL)
+            data, fetched_at, cache_age = await self.http.get_with_metadata(
                 f"{self.BASE_URL}/appdetails",
-                params={"appids": str(appid)}
+                params={"appids": str(appid)},
+                cache_ttl=86400
             )
             # Response: {"12345": {"success": true, "data": {...}}}
             app_data = data.get(str(appid), {})
@@ -113,7 +118,8 @@ class SteamStoreClient:
                 tags=tags,
                 developer=developer,
                 description=details.get("short_description", ""),
-                fetched_at=datetime.now(timezone.utc)
+                fetched_at=fetched_at,
+                cache_age_seconds=cache_age
             )
         except httpx.HTTPStatusError as e:
             status = e.response.status_code

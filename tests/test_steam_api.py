@@ -2,7 +2,7 @@
 
 import pytest
 import httpx
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 from src.schemas import GameMetadata, SearchResult, APIError
@@ -11,6 +11,7 @@ from src.steam_api import SteamSpyClient, SteamStoreClient
 
 @pytest.fixture
 def mock_http():
+    """Mock CachedAPIClient with get_with_metadata method."""
     client = AsyncMock()
     return client
 
@@ -18,11 +19,12 @@ def mock_http():
 class TestSteamSpyClient:
     @pytest.mark.asyncio
     async def test_search_by_tag_success(self, mock_http):
-        mock_http.get.return_value = {
+        data = {
             "646570": {"name": "Slay the Spire"},
             "2379780": {"name": "Balatro"},
             "247080": {"name": "Crypt of the NecroDancer"},
         }
+        mock_http.get_with_metadata.return_value = (data, datetime.now(timezone.utc), 0)
         client = SteamSpyClient(mock_http)
         result = await client.search_by_tag("Roguelike", limit=2)
 
@@ -30,10 +32,12 @@ class TestSteamSpyClient:
         assert len(result.appids) == 2
         assert result.tag == "Roguelike"
         assert result.total_found == 3
+        assert isinstance(result.fetched_at, datetime)
+        assert result.cache_age_seconds == 0
 
     @pytest.mark.asyncio
     async def test_search_by_tag_empty_response(self, mock_http):
-        mock_http.get.return_value = {}
+        mock_http.get_with_metadata.return_value = ({}, datetime.now(timezone.utc), 0)
         client = SteamSpyClient(mock_http)
         result = await client.search_by_tag("NonexistentTag")
 
@@ -44,7 +48,7 @@ class TestSteamSpyClient:
     @pytest.mark.asyncio
     async def test_search_by_tag_http_429(self, mock_http):
         response = httpx.Response(429, request=httpx.Request("GET", "https://steamspy.com"))
-        mock_http.get.side_effect = httpx.HTTPStatusError(
+        mock_http.get_with_metadata.side_effect = httpx.HTTPStatusError(
             "Rate limited", request=response.request, response=response
         )
         client = SteamSpyClient(mock_http)
@@ -57,7 +61,7 @@ class TestSteamSpyClient:
     @pytest.mark.asyncio
     async def test_search_by_tag_http_500(self, mock_http):
         response = httpx.Response(500, request=httpx.Request("GET", "https://steamspy.com"))
-        mock_http.get.side_effect = httpx.HTTPStatusError(
+        mock_http.get_with_metadata.side_effect = httpx.HTTPStatusError(
             "Server error", request=response.request, response=response
         )
         client = SteamSpyClient(mock_http)
@@ -69,7 +73,7 @@ class TestSteamSpyClient:
 
     @pytest.mark.asyncio
     async def test_search_by_tag_unexpected_exception(self, mock_http):
-        mock_http.get.side_effect = ConnectionError("DNS failed")
+        mock_http.get_with_metadata.side_effect = ConnectionError("DNS failed")
         client = SteamSpyClient(mock_http)
         result = await client.search_by_tag("Action")
 
@@ -79,7 +83,8 @@ class TestSteamSpyClient:
 
     @pytest.mark.asyncio
     async def test_search_limit_caps_results(self, mock_http):
-        mock_http.get.return_value = {str(i): {} for i in range(50)}
+        data = {str(i): {} for i in range(50)}
+        mock_http.get_with_metadata.return_value = (data, datetime.now(timezone.utc), 0)
         client = SteamSpyClient(mock_http)
         result = await client.search_by_tag("RPG", limit=5)
 
@@ -91,7 +96,7 @@ class TestSteamSpyClient:
 class TestSteamStoreClient:
     @pytest.mark.asyncio
     async def test_get_app_details_success(self, mock_http):
-        mock_http.get.return_value = {
+        data = {
             "646570": {
                 "success": True,
                 "data": {
@@ -105,6 +110,7 @@ class TestSteamStoreClient:
                 },
             }
         }
+        mock_http.get_with_metadata.return_value = (data, datetime.now(timezone.utc), 0)
         client = SteamStoreClient(mock_http)
         result = await client.get_app_details(646570)
 
@@ -115,10 +121,12 @@ class TestSteamStoreClient:
         assert result.developer == "Mega Crit"
         assert result.description == "A deckbuilder roguelike"
         assert isinstance(result.fetched_at, datetime)
+        assert result.cache_age_seconds == 0
 
     @pytest.mark.asyncio
     async def test_get_app_details_not_found(self, mock_http):
-        mock_http.get.return_value = {"99999999": {"success": False}}
+        data = {"99999999": {"success": False}}
+        mock_http.get_with_metadata.return_value = (data, datetime.now(timezone.utc), 0)
         client = SteamStoreClient(mock_http)
         result = await client.get_app_details(99999999)
 
@@ -128,12 +136,13 @@ class TestSteamStoreClient:
 
     @pytest.mark.asyncio
     async def test_get_app_details_missing_fields(self, mock_http):
-        mock_http.get.return_value = {
+        data = {
             "123": {
                 "success": True,
                 "data": {"name": "Minimal Game"},
             }
         }
+        mock_http.get_with_metadata.return_value = (data, datetime.now(timezone.utc), 0)
         client = SteamStoreClient(mock_http)
         result = await client.get_app_details(123)
 
@@ -147,7 +156,7 @@ class TestSteamStoreClient:
     @pytest.mark.asyncio
     async def test_get_app_details_http_error(self, mock_http):
         response = httpx.Response(500, request=httpx.Request("GET", "https://store.steampowered.com"))
-        mock_http.get.side_effect = httpx.HTTPStatusError(
+        mock_http.get_with_metadata.side_effect = httpx.HTTPStatusError(
             "Server error", request=response.request, response=response
         )
         client = SteamStoreClient(mock_http)
@@ -158,7 +167,7 @@ class TestSteamStoreClient:
 
     @pytest.mark.asyncio
     async def test_get_app_details_appid_missing_in_response(self, mock_http):
-        mock_http.get.return_value = {}
+        mock_http.get_with_metadata.return_value = ({}, datetime.now(timezone.utc), 0)
         client = SteamStoreClient(mock_http)
         result = await client.get_app_details(646570)
 
