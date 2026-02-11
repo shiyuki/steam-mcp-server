@@ -1,18 +1,17 @@
 """Pydantic schemas for Steam API responses."""
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class GameMetadata(BaseModel):
     """Metadata for a single Steam game."""
+    model_config = ConfigDict(extra="ignore")
+
     appid: int
     name: str
     tags: list[str] = Field(default_factory=list)
     developer: str = ""
     description: str = ""
-
-    class Config:
-        extra = "ignore"  # Ignore extra fields from Steam API
 
 
 class SearchResult(BaseModel):
