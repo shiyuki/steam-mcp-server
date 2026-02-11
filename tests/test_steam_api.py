@@ -2,6 +2,7 @@
 
 import pytest
 import httpx
+from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
 from src.schemas import GameMetadata, SearchResult, APIError
@@ -113,6 +114,7 @@ class TestSteamStoreClient:
         assert result.tags == ["Indie", "Strategy"]
         assert result.developer == "Mega Crit"
         assert result.description == "A deckbuilder roguelike"
+        assert isinstance(result.fetched_at, datetime)
 
     @pytest.mark.asyncio
     async def test_get_app_details_not_found(self, mock_http):
@@ -140,6 +142,7 @@ class TestSteamStoreClient:
         assert result.tags == []
         assert result.developer == ""
         assert result.description == ""
+        assert isinstance(result.fetched_at, datetime)
 
     @pytest.mark.asyncio
     async def test_get_app_details_http_error(self, mock_http):

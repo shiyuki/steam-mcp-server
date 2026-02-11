@@ -2,6 +2,7 @@
 
 import json
 import pytest
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch, MagicMock
 
 from src.schemas import SearchResult, GameMetadata, APIError
@@ -18,7 +19,9 @@ def _make_search_genre(steamspy_mock):
         result = await steamspy_mock.search_by_tag(genre.strip(), limit)
         if isinstance(result, APIError):
             return json.dumps(result.model_dump())
-        return json.dumps({"appids": result.appids, "tag": result.tag, "total_found": result.total_found})
+        # Use model_dump with mode='json' to serialize datetime
+        dumped = result.model_dump(mode='json')
+        return json.dumps({"appids": dumped["appids"], "tag": dumped["tag"], "total_found": dumped["total_found"]})
 
     return search_genre
 
@@ -32,7 +35,7 @@ def _make_fetch_metadata(store_mock):
         result = await store_mock.get_app_details(appid)
         if isinstance(result, APIError):
             return json.dumps(result.model_dump())
-        return json.dumps(result.model_dump())
+        return result.model_dump_json()
 
     return fetch_metadata
 
@@ -73,7 +76,7 @@ class TestSearchGenreValidation:
     @pytest.mark.asyncio
     async def test_valid_request_returns_results(self):
         mock = AsyncMock()
-        mock.search_by_tag.return_value = SearchResult(appids=[1, 2], tag="RPG", total_found=2)
+        mock.search_by_tag.return_value = SearchResult(appids=[1, 2], tag="RPG", total_found=2, fetched_at=datetime.now(timezone.utc))
         fn = _make_search_genre(mock)
         result = json.loads(await fn("RPG", limit=10))
 
@@ -84,7 +87,7 @@ class TestSearchGenreValidation:
     @pytest.mark.asyncio
     async def test_genre_is_stripped(self):
         mock = AsyncMock()
-        mock.search_by_tag.return_value = SearchResult(appids=[], tag="RPG", total_found=0)
+        mock.search_by_tag.return_value = SearchResult(appids=[], tag="RPG", total_found=0, fetched_at=datetime.now(timezone.utc))
         fn = _make_search_genre(mock)
         await fn("  RPG  ", limit=10)
 
@@ -126,6 +129,7 @@ class TestFetchMetadataValidation:
             tags=["Indie"],
             developer="Mega Crit",
             description="A deckbuilder",
+            fetched_at=datetime.now(timezone.utc)
         )
         fn = _make_fetch_metadata(mock)
         result = json.loads(await fn(646570))

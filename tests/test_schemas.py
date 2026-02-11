@@ -1,6 +1,7 @@
 """Tests for Pydantic schema parsing."""
 
 import pytest
+from datetime import datetime, timezone
 from src.schemas import GameMetadata, SearchResult, APIError
 
 
@@ -12,6 +13,7 @@ class TestGameMetadata:
             tags=["Indie", "Strategy"],
             developer="Mega Crit",
             description="A deckbuilder roguelike",
+            fetched_at=datetime.now(timezone.utc)
         )
         assert meta.appid == 646570
         assert meta.name == "Slay the Spire"
@@ -19,7 +21,7 @@ class TestGameMetadata:
         assert meta.developer == "Mega Crit"
 
     def test_defaults_for_optional_fields(self):
-        meta = GameMetadata(appid=1, name="Test")
+        meta = GameMetadata(appid=1, name="Test", fetched_at=datetime.now(timezone.utc))
         assert meta.tags == []
         assert meta.developer == ""
         assert meta.description == ""
@@ -30,6 +32,7 @@ class TestGameMetadata:
             name="Test",
             unknown_field="should be ignored",
             another_extra=123,
+            fetched_at=datetime.now(timezone.utc)
         )
         assert meta.appid == 1
         assert not hasattr(meta, "unknown_field")
@@ -37,13 +40,13 @@ class TestGameMetadata:
 
 class TestSearchResult:
     def test_parses_search_result(self):
-        result = SearchResult(appids=[1, 2, 3], tag="Roguelike", total_found=100)
+        result = SearchResult(appids=[1, 2, 3], tag="Roguelike", total_found=100, fetched_at=datetime.now(timezone.utc))
         assert result.appids == [1, 2, 3]
         assert result.tag == "Roguelike"
         assert result.total_found == 100
 
     def test_empty_appids(self):
-        result = SearchResult(appids=[], tag="Nonexistent", total_found=0)
+        result = SearchResult(appids=[], tag="Nonexistent", total_found=0, fetched_at=datetime.now(timezone.utc))
         assert result.appids == []
         assert result.total_found == 0
 

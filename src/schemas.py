@@ -1,9 +1,22 @@
 """Pydantic schemas for Steam API responses."""
 
+from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 
 
-class GameMetadata(BaseModel):
+class CachedResponse(BaseModel):
+    """Base class for API responses with data freshness tracking.
+
+    All API responses that pass through the cache system inherit this
+    to provide fetched_at timestamp and cache_age_seconds.
+    """
+    model_config = ConfigDict(json_encoders={datetime: lambda v: v.isoformat()})
+
+    fetched_at: datetime
+    cache_age_seconds: int = 0
+
+
+class GameMetadata(CachedResponse):
     """Metadata for a single Steam game."""
     model_config = ConfigDict(extra="ignore")
 
@@ -14,7 +27,7 @@ class GameMetadata(BaseModel):
     description: str = ""
 
 
-class SearchResult(BaseModel):
+class SearchResult(CachedResponse):
     """Result from tag-based game search."""
     appids: list[int]
     tag: str

@@ -1,6 +1,7 @@
 """Steam API clients for SteamSpy and Steam Store."""
 
 import httpx
+from datetime import datetime, timezone
 from src.http_client import RateLimitedClient
 from src.schemas import GameMetadata, SearchResult, APIError
 from src.logging_config import get_logger
@@ -21,12 +22,12 @@ class SteamSpyClient:
         """
         self.http = http_client
 
-    async def search_by_tag(self, tag: str, limit: int = 10) -> SearchResult | APIError:
+    async def search_by_tag(self, tag: str, limit: int | None = 10) -> SearchResult | APIError:
         """Search for games by tag using SteamSpy API.
 
         Args:
             tag: Tag to search for (e.g., "roguelike", "indie")
-            limit: Maximum number of AppIDs to return (default: 10)
+            limit: Maximum number of AppIDs to return (default: 10). Use None to return all results.
 
         Returns:
             SearchResult with AppID list, or APIError on failure
@@ -37,11 +38,14 @@ class SteamSpyClient:
                 params={"request": "tag", "tag": tag}
             )
             # SteamSpy returns {appid: {game_data}, ...}
-            appids = [int(appid) for appid in list(data.keys())[:limit]]
+            all_appids = [int(appid) for appid in data.keys()]
+            # If limit is None, return all AppIDs; otherwise slice to limit
+            appids = all_appids if limit is None else all_appids[:limit]
             return SearchResult(
                 appids=appids,
                 tag=tag,
-                total_found=len(data)
+                total_found=len(data),
+                fetched_at=datetime.now(timezone.utc)
             )
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
@@ -108,7 +112,8 @@ class SteamStoreClient:
                 name=details.get("name", "Unknown"),
                 tags=tags,
                 developer=developer,
-                description=details.get("short_description", "")
+                description=details.get("short_description", ""),
+                fetched_at=datetime.now(timezone.utc)
             )
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
