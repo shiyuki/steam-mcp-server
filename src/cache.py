@@ -77,8 +77,9 @@ class TTLCache:
                 entry = self._cache[key]
                 age = time.monotonic() - entry.created_at
                 if age < entry.ttl:
-                    # Cache hit - update cache_age_seconds
-                    entry.value.cache_age_seconds = int(age)
+                    # Cache hit - update cache_age_seconds if value supports it
+                    if hasattr(entry.value, 'cache_age_seconds'):
+                        entry.value.cache_age_seconds = round(age)
                     return entry
 
             # Cache miss or expired - fetch
@@ -112,8 +113,9 @@ class TTLCache:
         if age >= entry.ttl:
             return None
 
-        # Update cache_age_seconds
-        entry.value.cache_age_seconds = int(age)
+        # Update cache_age_seconds if value supports it
+        if hasattr(entry.value, 'cache_age_seconds'):
+            entry.value.cache_age_seconds = round(age)
         return entry
 
     def invalidate(self, key: str) -> None:
