@@ -15,8 +15,23 @@ import asyncio
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
+from src.config import Config
+from src.tools import register_tools
+
+# Validate configuration on startup (fail fast)
+try:
+    Config.validate()
+except ValueError as e:
+    logger.error("Configuration error: %s", e)
+    raise
+
 # Initialize MCP server
 mcp = Server(name="steam-server")
+
+# Register tools
+register_tools(mcp)
+logger.info("Registered tools: search_genre, fetch_metadata")
+
 
 async def main():
     """Run MCP server with stdio transport."""
@@ -28,6 +43,7 @@ async def main():
             write_stream,
             mcp.create_initialization_options()
         )
+
 
 if __name__ == "__main__":
     asyncio.run(main())
