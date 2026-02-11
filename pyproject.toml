@@ -1,0 +1,13 @@
+[project]
+name = "steam-mcp-server"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "httpx>=0.28.1",
+    "mcp[cli]>=1.26.0",
+    "pydantic>=2.12.5",
+    "python-dotenv>=1.2.1",
+    "tenacity>=9.1.4",
+]
