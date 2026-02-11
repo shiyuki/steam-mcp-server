@@ -1,7 +1,7 @@
 """Pydantic schemas for Steam API responses."""
 
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 
 class CachedResponse(BaseModel):
@@ -10,10 +10,13 @@ class CachedResponse(BaseModel):
     All API responses that pass through the cache system inherit this
     to provide fetched_at timestamp and cache_age_seconds.
     """
-    model_config = ConfigDict(json_encoders={datetime: lambda v: v.isoformat()})
-
     fetched_at: datetime
     cache_age_seconds: int = 0
+
+    @field_serializer('fetched_at')
+    def serialize_datetime(self, dt: datetime, _info) -> str:
+        """Serialize datetime to ISO format string for JSON compatibility."""
+        return dt.isoformat()
 
 
 class GameMetadata(CachedResponse):
