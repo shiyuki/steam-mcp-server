@@ -62,11 +62,7 @@ def register_tools(mcp: FastMCP):
         if isinstance(result, APIError):
             return json.dumps(result.model_dump())
 
-        return json.dumps({
-            "appids": result.appids,
-            "tag": result.tag,
-            "total_found": result.total_found
-        })
+        return json.dumps(result.model_dump())
 
     @mcp.tool()
     async def fetch_metadata(appid: int) -> str:
