@@ -1,8 +1,7 @@
 """MCP tool definitions for Steam API."""
 
 import json
-from mcp.types import TextContent, CallToolResult
-from mcp.server import Server
+from mcp.server.fastmcp import FastMCP
 
 from src.http_client import RateLimitedClient
 from src.steam_api import SteamSpyClient, SteamStoreClient
@@ -18,7 +17,7 @@ _steamspy: SteamSpyClient | None = None
 _steam_store: SteamStoreClient | None = None
 
 
-def register_tools(mcp: Server):
+def register_tools(mcp: FastMCP):
     """Register all MCP tools with the server."""
     global _http_client, _steamspy, _steam_store
 
@@ -29,8 +28,8 @@ def register_tools(mcp: Server):
 
     logger.info("Initializing MCP tools with rate limit: %.1fs", Config.RATE_LIMIT_DELAY)
 
-    @mcp.call_tool()
-    async def search_genre(genre: str, limit: int = 10) -> CallToolResult:
+    @mcp.tool()
+    async def search_genre(genre: str, limit: int = 10) -> str:
         """Search Steam games by genre/tag and return AppIDs.
 
         Args:
@@ -38,85 +37,45 @@ def register_tools(mcp: Server):
             limit: Maximum number of results (1-100, default 10)
 
         Returns:
-            List of Steam AppIDs matching the genre
+            JSON string with list of Steam AppIDs matching the genre
         """
         # Input validation
         if not genre or not genre.strip():
-            return CallToolResult(
-                content=[TextContent(
-                    type="text",
-                    text=json.dumps({"error": "genre is required", "error_type": "validation"})
-                )],
-                isError=True
-            )
+            return json.dumps({"error": "genre is required", "error_type": "validation"})
 
         if not 1 <= limit <= 100:
-            return CallToolResult(
-                content=[TextContent(
-                    type="text",
-                    text=json.dumps({"error": "limit must be between 1 and 100", "error_type": "validation"})
-                )],
-                isError=True
-            )
+            return json.dumps({"error": "limit must be between 1 and 100", "error_type": "validation"})
 
         logger.info("Searching for genre: %s, limit: %d", genre, limit)
         result = await _steamspy.search_by_tag(genre.strip(), limit)
 
         if isinstance(result, APIError):
-            return CallToolResult(
-                content=[TextContent(
-                    type="text",
-                    text=json.dumps(result.model_dump())
-                )],
-                isError=True
-            )
+            return json.dumps(result.model_dump())
 
-        return CallToolResult(
-            content=[TextContent(
-                type="text",
-                text=json.dumps({
-                    "appids": result.appids,
-                    "tag": result.tag,
-                    "total_found": result.total_found
-                })
-            )]
-        )
+        return json.dumps({
+            "appids": result.appids,
+            "tag": result.tag,
+            "total_found": result.total_found
+        })
 
-    @mcp.call_tool()
-    async def fetch_metadata(appid: int) -> CallToolResult:
+    @mcp.tool()
+    async def fetch_metadata(appid: int) -> str:
         """Fetch metadata for a Steam game by AppID.
 
         Args:
             appid: Steam AppID (e.g., 646570 for Slay the Spire)
 
         Returns:
-            Game metadata including name, tags, developer, and description
+            JSON string with game metadata including name, tags, developer, and description
         """
         # Input validation
         if appid <= 0:
-            return CallToolResult(
-                content=[TextContent(
-                    type="text",
-                    text=json.dumps({"error": "appid must be positive", "error_type": "validation"})
-                )],
-                isError=True
-            )
+            return json.dumps({"error": "appid must be positive", "error_type": "validation"})
 
         logger.info("Fetching metadata for AppID: %d", appid)
         result = await _steam_store.get_app_details(appid)
 
         if isinstance(result, APIError):
-            return CallToolResult(
-                content=[TextContent(
-                    type="text",
-                    text=json.dumps(result.model_dump())
-                )],
-                isError=True
-            )
+            return json.dumps(result.model_dump())
 
-        return CallToolResult(
-            content=[TextContent(
-                type="text",
-                text=json.dumps(result.model_dump())
-            )]
-        )
+        return json.dumps(result.model_dump())

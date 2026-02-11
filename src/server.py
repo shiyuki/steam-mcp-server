@@ -11,12 +11,9 @@ setup_logging()
 
 logger = get_logger(__name__)
 
-import asyncio
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
+from mcp.server.fastmcp import FastMCP
 
 from src.config import Config
-from src.tools import register_tools
 
 # Validate configuration on startup (fail fast)
 try:
@@ -26,24 +23,13 @@ except ValueError as e:
     raise
 
 # Initialize MCP server
-mcp = Server(name="steam-server")
+mcp = FastMCP("steam-server")
 
-# Register tools
+# Register tools (imports mcp from this module)
+from src.tools import register_tools
 register_tools(mcp)
 logger.info("Registered tools: search_genre, fetch_metadata")
 
 
-async def main():
-    """Run MCP server with stdio transport."""
-    logger.info("Starting steam-server MCP server")
-
-    async with stdio_server() as (read_stream, write_stream):
-        await mcp.run(
-            read_stream,
-            write_stream,
-            mcp.create_initialization_options()
-        )
-
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    mcp.run("stdio")
