@@ -591,7 +591,7 @@ class TestAggregateEngagement:
         result = await client.aggregate_engagement(tag="Roguelike")
 
         assert isinstance(result, AggregateEngagementData)
-        assert result.tag == "Roguelike"
+        assert result.tag == "Rogue-like"  # Tag is normalized
         assert result.games_total == 5
         assert result.games_analyzed == 5
 

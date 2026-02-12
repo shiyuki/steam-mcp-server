@@ -30,7 +30,7 @@ class TestSteamSpyClient:
 
         assert isinstance(result, SearchResult)
         assert len(result.appids) == 2
-        assert result.tag == "Roguelike"
+        assert result.tag == "Rogue-like"  # Tag is normalized
         assert result.total_found == 3
         assert isinstance(result.fetched_at, datetime)
         assert result.cache_age_seconds == 0

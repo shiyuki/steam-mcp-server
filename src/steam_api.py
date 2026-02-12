@@ -14,6 +14,56 @@ from src.logging_config import get_logger
 logger = get_logger(__name__)
 
 
+# Tag normalization: Map common user-friendly tag names to SteamSpy's exact format
+TAG_ALIASES: dict[str, str] = {
+    "roguelike": "Rogue-like",
+    "roguelite": "Rogue-lite",
+    "roguevania": "Rogue-like",
+    "metroidvania": "Metroidvania",
+    "hack and slash": "Hack and Slash",
+    "beat em up": "Beat 'em up",
+    "shoot em up": "Shoot 'Em Up",
+    "4x": "4X",
+    "turn based": "Turn-Based",
+    "turn based strategy": "Turn-Based Strategy",
+    "turn based tactics": "Turn-Based Tactics",
+    "real time strategy": "Real-Time Strategy",
+    "real time tactics": "Real-Time Tactics",
+    "co op": "Co-op",
+    "local co op": "Local Co-Op",
+    "sci fi": "Sci-fi",
+    "choose your own adventure": "Choose Your Own Adventure",
+    "city builder": "City Builder",
+    "base building": "Base Building",
+    "tower defense": "Tower Defense",
+    "deck building": "Deckbuilder",
+    "deckbuilding": "Deckbuilder",
+    "bullet hell": "Bullet Hell",
+    "souls like": "Souls-like",
+    "soulslike": "Souls-like",
+    "rogue like": "Rogue-like",
+    "rogue lite": "Rogue-lite",
+}
+
+
+def normalize_tag(tag: str) -> str:
+    """Normalize tag name to SteamSpy's expected format.
+
+    Args:
+        tag: User-provided tag name
+
+    Returns:
+        Normalized tag name (from alias map if found, otherwise original with whitespace stripped)
+    """
+    tag = tag.strip()
+    normalized = TAG_ALIASES.get(tag.lower())
+    return normalized if normalized else tag
+
+
+# Bowling fallback detection: Known AppIDs in SteamSpy's default fallback set
+BOWLING_FALLBACK_APPIDS = {436590, 212370, 340170}
+
+
 class SteamSpyClient:
     """Client for SteamSpy API (tag-based game search)."""
 
@@ -27,6 +77,30 @@ class SteamSpyClient:
         """
         self.http = http_client
 
+    def _detect_steamspy_fallback(self, data: dict, tag: str) -> bool:
+        """Detect if SteamSpy returned its default bowling game fallback instead of actual tag results.
+
+        SteamSpy returns a default ~70 bowling games dataset for unrecognized tags.
+        Detection: Small result set (<100) containing known bowling game AppIDs.
+
+        Args:
+            data: SteamSpy API response dict (appid keys)
+            tag: Tag that was queried
+
+        Returns:
+            True if bowling fallback detected, False otherwise
+        """
+        # Only check for small result sets (fallback is ~70 games)
+        if len(data) >= 100:
+            return False
+
+        # Convert string AppID keys to integers
+        appids_in_response = {int(appid) for appid in data.keys()}
+
+        # Check if at least 2 known bowling game AppIDs are present
+        bowling_matches = len(BOWLING_FALLBACK_APPIDS & appids_in_response)
+        return bowling_matches >= 2
+
     async def search_by_tag(self, tag: str, limit: int | None = 10) -> SearchResult | APIError:
         """Search for games by tag using SteamSpy API.
 
@@ -37,6 +111,9 @@ class SteamSpyClient:
         Returns:
             SearchResult with AppID list, or APIError on failure
         """
+        # Normalize tag before API call
+        tag = normalize_tag(tag)
+
         try:
             # Use get_with_metadata for freshness tracking (1 hour cache TTL)
             data, fetched_at, cache_age = await self.http.get_with_metadata(
@@ -44,6 +121,16 @@ class SteamSpyClient:
                 params={"request": "tag", "tag": tag},
                 cache_ttl=3600
             )
+
+            # Check for bowling fallback before processing
+            if self._detect_steamspy_fallback(data, tag):
+                logger.warning(f"SteamSpy returned bowling fallback for tag '{tag}' - tag may not exist")
+                return APIError(
+                    error_code=404,
+                    error_type="tag_not_found",
+                    message=f"Tag '{tag}' not recognized by SteamSpy. The API returned default results instead of matching games. Try a different tag name or check Steam's tag list."
+                )
+
             # SteamSpy returns {appid: {game_data}, ...}
             all_appids = [int(appid) for appid in data.keys()]
             # If limit is None, return all AppIDs; otherwise slice to limit
@@ -292,6 +379,9 @@ class SteamSpyClient:
 
         # Branch 1: Tag-based (bulk endpoint)
         if tag:
+            # Normalize tag before API call
+            tag = normalize_tag(tag)
+
             try:
                 data, fetched_at, cache_age = await self.http.get_with_metadata(
                     self.BASE_URL,
@@ -304,6 +394,15 @@ class SteamSpyClient:
                         error_code=404,
                         error_type="not_found",
                         message=f"No games found for tag: {tag}"
+                    )
+
+                # Check for bowling fallback before processing
+                if self._detect_steamspy_fallback(data, tag):
+                    logger.warning(f"SteamSpy returned bowling fallback for tag '{tag}' in aggregation")
+                    return APIError(
+                        error_code=404,
+                        error_type="tag_not_found",
+                        message=f"Tag '{tag}' not recognized by SteamSpy. The API returned default results instead of matching games. Try a different tag name or check Steam's tag list."
                     )
 
                 # Parse each game from tag endpoint
