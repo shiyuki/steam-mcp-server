@@ -37,6 +37,24 @@ class SearchResult(CachedResponse):
     total_found: int
 
 
+class CommercialData(CachedResponse):
+    """Commercial data for a single Steam game including revenue estimates."""
+    model_config = ConfigDict(extra="ignore")
+
+    appid: int
+    name: str = ""
+    price: float | None = None
+    revenue_min: float
+    revenue_max: float
+    currency: str = "USD"
+    confidence: str  # "high" or "low"
+    source: str  # "gamalytic" or "review_estimate"
+    method: str | None = None
+    triangulation_warning: str | None = None
+    steamspy_implied_revenue: float | None = None
+    gamalytic_revenue: float | None = None
+
+
 class APIError(BaseModel):
     """Structured error response for MCP."""
     error_code: int
