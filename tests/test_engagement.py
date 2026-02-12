@@ -6,8 +6,8 @@ import httpx
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
-from src.schemas import EngagementData, AggregateEngagementData, APIError
-from src.steam_api import SteamSpyClient
+from src.schemas import EngagementData, AggregateEngagementData, APIError, GameEngagementSummary, SearchResult
+from src.steam_api import SteamSpyClient, normalize_tag
 
 
 @pytest.fixture
@@ -1121,3 +1121,260 @@ class TestAggregateEngagementValidation:
             appids=None,
             sort_by="owners"
         )
+
+
+class TestTagNormalization:
+    """Test normalize_tag function for tag alias mapping."""
+
+    def test_roguelike_normalized_to_hyphenated(self):
+        """Test 'Roguelike' normalizes to 'Rogue-like'."""
+        assert normalize_tag("Roguelike") == "Rogue-like"
+
+    def test_roguelite_normalized_to_hyphenated(self):
+        """Test 'Roguelite' normalizes to 'Rogue-lite'."""
+        assert normalize_tag("Roguelite") == "Rogue-lite"
+
+    def test_soulslike_normalized_to_hyphenated(self):
+        """Test 'soulslike' normalizes to 'Souls-like'."""
+        assert normalize_tag("soulslike") == "Souls-like"
+
+    def test_case_insensitive_normalization(self):
+        """Test normalization is case-insensitive."""
+        assert normalize_tag("ROGUELIKE") == "Rogue-like"
+        assert normalize_tag("roguelike") == "Rogue-like"
+        assert normalize_tag("RoGuElIkE") == "Rogue-like"
+
+    def test_unknown_tag_passes_through(self):
+        """Test unknown tag returns original value unchanged."""
+        assert normalize_tag("Action") == "Action"
+        assert normalize_tag("Puzzle") == "Puzzle"
+
+    def test_whitespace_stripped(self):
+        """Test whitespace is stripped from tag."""
+        assert normalize_tag("  Roguelike  ") == "Rogue-like"
+        assert normalize_tag("\tco op\n") == "Co-op"
+
+    def test_already_correct_tag_unchanged(self):
+        """Test tag already in correct format passes through."""
+        # "Rogue-like" (with hyphen and capital R) is not in the alias map
+        # so it should pass through unchanged
+        assert normalize_tag("Rogue-like") == "Rogue-like"
+        assert normalize_tag("Metroidvania") == "Metroidvania"
+
+    def test_co_op_normalized(self):
+        """Test 'co op' normalizes to 'Co-op'."""
+        assert normalize_tag("co op") == "Co-op"
+        assert normalize_tag("CO OP") == "Co-op"
+
+
+def _create_bowling_fallback_data() -> dict:
+    """Helper to generate mock bowling fallback data (~70 games with known bowling AppIDs)."""
+    data = {}
+    # Add known bowling AppIDs (fingerprint)
+    bowling_appids = [436590, 212370, 340170]
+    for appid in bowling_appids:
+        data[str(appid)] = {
+            "appid": str(appid),
+            "name": f"Bowling Game {appid}",
+            "owners": "1,000 .. 2,000",
+            "ccu": 5,
+            "positive": 100,
+            "negative": 10,
+            "average_forever": 600,
+            "average_2weeks": 60,
+            "price": "999"
+        }
+
+    # Add filler games to reach ~70 total
+    for i in range(100000, 100067):
+        data[str(i)] = {
+            "appid": str(i),
+            "name": f"Game {i}",
+            "owners": "500 .. 1,000",
+            "ccu": 3,
+            "positive": 50,
+            "negative": 5,
+            "average_forever": 300,
+            "average_2weeks": 30,
+            "price": "499"
+        }
+
+    return data
+
+
+class TestBowlingFallbackDetection:
+    """Test bowling fallback detection in search_by_tag and aggregate_engagement."""
+
+    @pytest.mark.asyncio
+    async def test_bowling_fallback_detected_returns_error(self, mock_http):
+        """Test bowling fallback (70 games with known AppIDs) returns tag_not_found error."""
+        fallback_data = _create_bowling_fallback_data()
+        mock_http.get_with_metadata.return_value = (
+            fallback_data,
+            datetime.now(timezone.utc),
+            0
+        )
+
+        client = SteamSpyClient(mock_http)
+        result = await client.search_by_tag("NonexistentTag123")
+
+        assert isinstance(result, APIError)
+        assert result.error_type == "tag_not_found"
+        assert "not recognized by SteamSpy" in result.message
+
+    @pytest.mark.asyncio
+    async def test_legitimate_small_tag_not_flagged(self, mock_http):
+        """Test legitimate small tag (70 games, no bowling AppIDs) passes through."""
+        # Create 70 games WITHOUT bowling AppIDs
+        legitimate_data = {}
+        for i in range(200000, 200070):
+            legitimate_data[str(i)] = {
+                "appid": str(i),
+                "name": f"Obscure Game {i}",
+                "owners": "500 .. 1,000",
+                "ccu": 5,
+                "positive": 50,
+                "negative": 5,
+                "average_forever": 300,
+                "average_2weeks": 30,
+                "price": "999"
+            }
+
+        mock_http.get_with_metadata.return_value = (
+            legitimate_data,
+            datetime.now(timezone.utc),
+            0
+        )
+
+        client = SteamSpyClient(mock_http)
+        result = await client.search_by_tag("ObscureButRealTag")
+
+        # Should NOT be flagged as fallback - legitimate small tag
+        assert isinstance(result, SearchResult)
+        assert len(result.appids) == 10  # default limit
+
+    @pytest.mark.asyncio
+    async def test_large_result_set_not_flagged(self, mock_http):
+        """Test large result set (500+ games) not flagged even if bowling AppIDs present."""
+        # Create 500 games including bowling AppIDs
+        large_data = {}
+        bowling_appids = [436590, 212370, 340170]
+        for appid in bowling_appids:
+            large_data[str(appid)] = {
+                "appid": str(appid),
+                "name": f"Bowling Game {appid}",
+                "owners": "1,000 .. 2,000",
+                "ccu": 5,
+                "positive": 100,
+                "negative": 10,
+                "average_forever": 600,
+                "average_2weeks": 60,
+                "price": "999"
+            }
+
+        for i in range(300000, 300497):
+            large_data[str(i)] = {
+                "appid": str(i),
+                "name": f"Game {i}",
+                "owners": "10,000 .. 20,000",
+                "ccu": 100,
+                "positive": 1000,
+                "negative": 100,
+                "average_forever": 1200,
+                "average_2weeks": 120,
+                "price": "1999"
+            }
+
+        mock_http.get_with_metadata.return_value = (
+            large_data,
+            datetime.now(timezone.utc),
+            0
+        )
+
+        client = SteamSpyClient(mock_http)
+        result = await client.search_by_tag("PopularTag")
+
+        # Should NOT be flagged - large result sets are legitimate
+        assert isinstance(result, SearchResult)
+        assert result.total_found == 500
+
+    @pytest.mark.asyncio
+    async def test_aggregate_bowling_fallback_returns_error(self, mock_http):
+        """Test bowling fallback in aggregate_engagement returns tag_not_found error."""
+        fallback_data = _create_bowling_fallback_data()
+        mock_http.get_with_metadata.return_value = (
+            fallback_data,
+            datetime.now(timezone.utc),
+            0
+        )
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(tag="FakeTag")
+
+        assert isinstance(result, APIError)
+        assert result.error_type == "tag_not_found"
+        assert "not recognized by SteamSpy" in result.message
+
+    @pytest.mark.asyncio
+    async def test_tag_normalization_applied_in_search(self, mock_http):
+        """Test tag normalization is applied before API call in search_by_tag."""
+        # Return valid data
+        valid_data = {
+            "646570": {"name": "Slay the Spire"},
+            "2379780": {"name": "Balatro"},
+        }
+        mock_http.get_with_metadata.return_value = (
+            valid_data,
+            datetime.now(timezone.utc),
+            0
+        )
+
+        client = SteamSpyClient(mock_http)
+        result = await client.search_by_tag("Roguelike")
+
+        # Verify the API was called with normalized tag
+        mock_http.get_with_metadata.assert_called_once()
+        call_args = mock_http.get_with_metadata.call_args
+        assert call_args[1]["params"]["tag"] == "Rogue-like"
+
+    @pytest.mark.asyncio
+    async def test_tag_normalization_applied_in_aggregation(self, mock_http):
+        """Test tag normalization is applied before API call in aggregate_engagement."""
+        # Return valid data with at least 2 games for stats
+        valid_data = {
+            "646570": {
+                "appid": "646570",
+                "name": "Slay the Spire",
+                "owners": "2,000,000 .. 5,000,000",
+                "ccu": 1500,
+                "positive": 82000,
+                "negative": 1500,
+                "average_forever": 4200,
+                "average_2weeks": 420,
+                "price": "2499"
+            },
+            "2379780": {
+                "appid": "2379780",
+                "name": "Balatro",
+                "owners": "1,000,000 .. 2,000,000",
+                "ccu": 800,
+                "positive": 50000,
+                "negative": 500,
+                "average_forever": 3000,
+                "average_2weeks": 600,
+                "price": "1499"
+            }
+        }
+        mock_http.get_with_metadata.return_value = (
+            valid_data,
+            datetime.now(timezone.utc),
+            0
+        )
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(tag="Roguelike")
+
+        # Verify the API was called with normalized tag
+        mock_http.get_with_metadata.assert_called_once()
+        call_args = mock_http.get_with_metadata.call_args
+        assert call_args[1]["params"]["tag"] == "Rogue-like"
