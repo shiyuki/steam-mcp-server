@@ -3,7 +3,7 @@
 import httpx
 from datetime import datetime, timezone
 from src.http_client import CachedAPIClient
-from src.schemas import GameMetadata, SearchResult, CommercialData, APIError
+from src.schemas import GameMetadata, SearchResult, CommercialData, EngagementData, APIError
 from src.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -60,6 +60,142 @@ class SteamSpyClient:
             )
         except Exception as e:
             logger.error(f"SteamSpy error: {e}")
+            return APIError(
+                error_code=502,
+                error_type="api_error",
+                message=str(e)
+            )
+
+    async def get_engagement_data(self, appid: int) -> EngagementData | APIError:
+        """Fetch player engagement metrics for a specific game from SteamSpy.
+
+        Args:
+            appid: Steam AppID to fetch engagement data for
+
+        Returns:
+            EngagementData with CCU, owners, playtime, reviews, tags, and derived metrics, or APIError on failure
+        """
+        try:
+            # Use get_with_metadata for freshness tracking (1 hour cache TTL)
+            data, fetched_at, cache_age = await self.http.get_with_metadata(
+                self.BASE_URL,
+                params={"request": "appdetails", "appid": str(appid)},
+                cache_ttl=3600
+            )
+
+            # Parse owner range: "20,000 .. 50,000" -> owners_min, owners_max, owners_midpoint
+            owners_str = data.get("owners", "0 .. 0")
+            owners_str = owners_str.replace(",", "")
+            parts = owners_str.split(" .. ")
+            if len(parts) == 2:
+                try:
+                    owners_min = int(parts[0])
+                    owners_max = int(parts[1])
+                except ValueError:
+                    owners_min = 0
+                    owners_max = 0
+            else:
+                owners_min = 0
+                owners_max = 0
+            owners_midpoint = (owners_min + owners_max) / 2
+
+            # Get raw values
+            ccu = data.get("ccu", 0)
+            positive = data.get("positive", 0)
+            negative = data.get("negative", 0)
+            total_reviews = positive + negative
+
+            # Convert playtime from minutes to hours
+            average_forever = data.get("average_forever", 0) / 60.0
+            average_2weeks = data.get("average_2weeks", 0) / 60.0
+            median_forever = data.get("median_forever", 0) / 60.0
+            median_2weeks = data.get("median_2weeks", 0) / 60.0
+
+            # Convert price from cents to dollars
+            price_str = data.get("price", "0")
+            try:
+                price = int(price_str) / 100.0
+            except (ValueError, TypeError):
+                price = 0.0
+
+            # Parse tags dict (SteamSpy returns {"TagName": weight_int, ...})
+            tags = data.get("tags", {})
+            if not isinstance(tags, dict):
+                tags = {}
+
+            # Compute derived metrics with division-by-zero guards
+            ccu_ratio = round(ccu / owners_midpoint * 100, 2) if owners_midpoint > 0 else None
+            review_score = round(positive / total_reviews * 100, 2) if total_reviews > 0 else None
+            playtime_engagement = round(median_forever / average_forever, 2) if average_forever > 0 else None
+            activity_ratio = round(average_2weeks / average_forever * 100, 2) if average_forever > 0 else None
+
+            # Apply context-aware quality flags
+            # Pattern: if zero AND other data exists = "available" (real zero)
+            #          if zero AND no other data = "zero_uncertain" (likely missing)
+            has_other_data = owners_midpoint > 0 or total_reviews > 0
+
+            if ccu == 0:
+                ccu_quality = "available" if has_other_data else "zero_uncertain"
+            else:
+                ccu_quality = "available"
+
+            if owners_midpoint == 0:
+                owners_quality = "available" if (ccu > 0 or total_reviews > 0) else "zero_uncertain"
+            else:
+                owners_quality = "available"
+
+            if average_forever == 0 and median_forever == 0:
+                playtime_quality = "available" if has_other_data else "zero_uncertain"
+            else:
+                playtime_quality = "available"
+
+            if total_reviews == 0:
+                reviews_quality = "available" if (ccu > 0 or owners_midpoint > 0) else "zero_uncertain"
+            else:
+                reviews_quality = "available"
+
+            return EngagementData(
+                appid=appid,
+                name=data.get("name", ""),
+                developer=data.get("developer", ""),
+                publisher=data.get("publisher", ""),
+                ccu=ccu,
+                owners_min=owners_min,
+                owners_max=owners_max,
+                owners_midpoint=owners_midpoint,
+                average_forever=average_forever,
+                average_2weeks=average_2weeks,
+                median_forever=median_forever,
+                median_2weeks=median_2weeks,
+                positive=positive,
+                negative=negative,
+                total_reviews=total_reviews,
+                price=price,
+                score_rank=data.get("score_rank", ""),
+                genre=data.get("genre", ""),
+                languages=data.get("languages", ""),
+                tags=tags,
+                ccu_ratio=ccu_ratio,
+                review_score=review_score,
+                playtime_engagement=playtime_engagement,
+                activity_ratio=activity_ratio,
+                ccu_quality=ccu_quality,
+                owners_quality=owners_quality,
+                playtime_quality=playtime_quality,
+                reviews_quality=reviews_quality,
+                fetched_at=fetched_at,
+                cache_age_seconds=cache_age
+            )
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            error_type = "rate_limit" if status == 429 else "api_error"
+            return APIError(
+                error_code=status,
+                error_type=error_type,
+                message=f"SteamSpy API error: {status}"
+            )
+        except Exception as e:
+            logger.error(f"SteamSpy engagement data error for AppID {appid}: {e}")
             return APIError(
                 error_code=502,
                 error_type="api_error",

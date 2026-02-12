@@ -55,6 +55,55 @@ class CommercialData(CachedResponse):
     gamalytic_revenue: float | None = None
 
 
+class EngagementData(CachedResponse):
+    """Player engagement metrics for a single Steam game from SteamSpy."""
+    model_config = ConfigDict(extra="ignore")
+
+    # Basic identification
+    appid: int
+    name: str
+    developer: str = ""
+    publisher: str = ""
+
+    # Player counts
+    ccu: int  # Current concurrent users
+    owners_min: int
+    owners_max: int
+    owners_midpoint: float
+
+    # Playtime metrics (all in hours, converted from API minutes)
+    average_forever: float
+    average_2weeks: float
+    median_forever: float
+    median_2weeks: float
+
+    # Review metrics
+    positive: int
+    negative: int
+    total_reviews: int
+
+    # Commercial
+    price: float  # In dollars, converted from API cents; 0.0 for F2P
+
+    # Metadata
+    score_rank: str = ""
+    genre: str = ""
+    languages: str = ""
+    tags: dict[str, int] = Field(default_factory=dict)  # Tag name -> weight
+
+    # Derived health metrics (None when data insufficient)
+    ccu_ratio: float | None = None  # CCU / owners_midpoint * 100
+    review_score: float | None = None  # positive / total_reviews * 100
+    playtime_engagement: float | None = None  # median_forever / average_forever (ratio, not %)
+    activity_ratio: float | None = None  # average_2weeks / average_forever * 100
+
+    # Quality flags (distinguish real zeros from missing data)
+    ccu_quality: str | None = None  # "available" or "zero_uncertain"
+    owners_quality: str | None = None
+    playtime_quality: str | None = None
+    reviews_quality: str | None = None
+
+
 class APIError(BaseModel):
     """Structured error response for MCP."""
     error_code: int
