@@ -104,6 +104,57 @@ class EngagementData(CachedResponse):
     reviews_quality: str | None = None
 
 
+class MetricStats(BaseModel):
+    """Statistical distribution for a single metric across multiple games."""
+    mean: float
+    median: float
+    p25: float  # 25th percentile
+    p75: float  # 75th percentile
+    min: float
+    max: float
+    games_with_data: int  # Number of games with valid data for this metric
+
+
+class GameEngagementSummary(BaseModel):
+    """Lightweight per-game entry for aggregation breakdown lists."""
+    appid: int
+    name: str = ""
+    ccu: int = 0
+    owners_midpoint: float = 0
+    average_forever: float = 0  # hours
+    average_2weeks: float = 0  # hours
+    positive: int = 0
+    negative: int = 0
+    review_score: float | None = None
+    price: float = 0
+
+
+class AggregateEngagementData(CachedResponse):
+    """Genre-level engagement aggregation with statistical distribution data."""
+    # Input identification
+    tag: str | None = None  # If tag-based query
+    appids_requested: list[int] | None = None  # If AppID-list query
+
+    # Coverage metrics
+    games_total: int  # Total games found/requested
+    games_analyzed: int  # Games with sufficient data for stats
+
+    # Per-metric statistical distributions (None when insufficient data)
+    ccu_stats: MetricStats | None = None
+    owners_stats: MetricStats | None = None
+    playtime_stats: MetricStats | None = None  # Based on average_forever in hours
+    review_score_stats: MetricStats | None = None
+
+    # Dual metric approaches for different analytical perspectives
+    market_weighted: dict[str, float | None] = Field(default_factory=dict)  # Aggregate raw then compute
+    per_game_average: dict[str, float | None] = Field(default_factory=dict)  # Compute per game then average
+
+    # Per-game breakdown
+    games: list[GameEngagementSummary] = Field(default_factory=list)
+    failures: list[dict] = Field(default_factory=list)  # Failed AppIDs with reasons
+    sort_by: str = "owners"  # Field used for sorting
+
+
 class APIError(BaseModel):
     """Structured error response for MCP."""
     error_code: int

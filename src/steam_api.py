@@ -1,9 +1,14 @@
 """Steam API clients for SteamSpy and Steam Store."""
 
+import asyncio
 import httpx
 from datetime import datetime, timezone
+from statistics import mean, median, quantiles
 from src.http_client import CachedAPIClient
-from src.schemas import GameMetadata, SearchResult, CommercialData, EngagementData, APIError
+from src.schemas import (
+    GameMetadata, SearchResult, CommercialData, EngagementData, APIError,
+    AggregateEngagementData, MetricStats, GameEngagementSummary
+)
 from src.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -201,6 +206,285 @@ class SteamSpyClient:
                 error_type="api_error",
                 message=str(e)
             )
+
+    def _parse_game_data(self, data: dict) -> dict:
+        """Parse common fields from SteamSpy game data into standardized format.
+
+        Args:
+            data: Raw SteamSpy game data dict
+
+        Returns:
+            Parsed dict with standardized field names and types
+        """
+        # Parse owner range
+        owners_str = data.get("owners", "0 .. 0")
+        owners_str = owners_str.replace(",", "")
+        parts = owners_str.split(" .. ")
+        if len(parts) == 2:
+            try:
+                owners_min = int(parts[0])
+                owners_max = int(parts[1])
+            except ValueError:
+                owners_min = 0
+                owners_max = 0
+        else:
+            owners_min = 0
+            owners_max = 0
+        owners_midpoint = (owners_min + owners_max) / 2
+
+        # Get raw values
+        ccu = data.get("ccu", 0)
+        positive = data.get("positive", 0)
+        negative = data.get("negative", 0)
+
+        # Convert playtime from minutes to hours
+        average_forever = data.get("average_forever", 0) / 60.0
+        average_2weeks = data.get("average_2weeks", 0) / 60.0
+
+        # Convert price from cents to dollars
+        price_str = data.get("price", "0")
+        try:
+            price = int(price_str) / 100.0
+        except (ValueError, TypeError):
+            price = 0.0
+
+        # Compute review score if reviews exist
+        total_reviews = positive + negative
+        review_score = round(positive / total_reviews * 100, 2) if total_reviews > 0 else None
+
+        return {
+            "appid": int(data.get("appid", 0)),
+            "name": data.get("name", ""),
+            "ccu": ccu,
+            "owners_midpoint": owners_midpoint,
+            "average_forever": average_forever,
+            "average_2weeks": average_2weeks,
+            "positive": positive,
+            "negative": negative,
+            "review_score": review_score,
+            "price": price
+        }
+
+    async def aggregate_engagement(
+        self,
+        tag: str | None = None,
+        appids: list[int] | None = None,
+        sort_by: str = "owners"
+    ) -> AggregateEngagementData | APIError:
+        """Aggregate engagement metrics across multiple games.
+
+        Supports two input modes:
+        1. Tag-based: Fetch all games in a tag (bulk endpoint, 1 API call)
+        2. AppID-list: Fetch specific games (concurrent individual calls)
+
+        Args:
+            tag: Steam tag name for bulk query
+            appids: List of AppIDs for custom selection
+            sort_by: Sort field for per-game list ("owners", "ccu", "reviews", "playtime")
+
+        Returns:
+            AggregateEngagementData with per-metric stats, dual metric approaches, per-game breakdown, or APIError
+        """
+        games_list = []
+        failures = []
+        fetched_at = datetime.now(timezone.utc)
+        cache_age = 0
+
+        # Branch 1: Tag-based (bulk endpoint)
+        if tag:
+            try:
+                data, fetched_at, cache_age = await self.http.get_with_metadata(
+                    self.BASE_URL,
+                    params={"request": "tag", "tag": tag},
+                    cache_ttl=3600
+                )
+
+                if not data:
+                    return APIError(
+                        error_code=404,
+                        error_type="not_found",
+                        message=f"No games found for tag: {tag}"
+                    )
+
+                # Parse each game from tag endpoint
+                for game_data in data.values():
+                    parsed = self._parse_game_data(game_data)
+                    games_list.append(GameEngagementSummary(**parsed))
+
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                error_type = "rate_limit" if status == 429 else "api_error"
+                return APIError(
+                    error_code=status,
+                    error_type=error_type,
+                    message=f"SteamSpy API error: {status}"
+                )
+            except Exception as e:
+                logger.error(f"Tag aggregation error: {e}")
+                return APIError(
+                    error_code=502,
+                    error_type="api_error",
+                    message=str(e)
+                )
+
+        # Branch 2: AppID-list (concurrent individual calls)
+        elif appids:
+            tasks = [self.get_engagement_data(appid) for appid in appids]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for appid, result in zip(appids, results):
+                if isinstance(result, Exception):
+                    failures.append({"appid": appid, "reason": "exception"})
+                elif isinstance(result, APIError):
+                    failures.append({"appid": appid, "reason": result.error_type})
+                elif isinstance(result, EngagementData):
+                    # Convert EngagementData to GameEngagementSummary
+                    games_list.append(GameEngagementSummary(
+                        appid=result.appid,
+                        name=result.name,
+                        ccu=result.ccu,
+                        owners_midpoint=result.owners_midpoint,
+                        average_forever=result.average_forever,
+                        average_2weeks=result.average_2weeks,
+                        positive=result.positive,
+                        negative=result.negative,
+                        review_score=result.review_score,
+                        price=result.price
+                    ))
+
+            if not games_list:
+                return APIError(
+                    error_code=404,
+                    error_type="not_found",
+                    message="No valid games retrieved from AppID list"
+                )
+
+        else:
+            return APIError(
+                error_code=400,
+                error_type="validation",
+                message="Either tag or appids must be provided"
+            )
+
+        # Compute statistics for each metric
+        games_total = len(games_list) + len(failures)
+        games_analyzed = len(games_list)
+
+        # Helper to compute stats for a metric
+        def compute_metric_stats(values: list[float]) -> MetricStats | None:
+            if len(values) < 2:
+                return None
+            return MetricStats(
+                mean=round(mean(values), 2),
+                median=round(median(values), 2),
+                p25=round(quantiles(values, n=4)[0], 2),
+                p75=round(quantiles(values, n=4)[2], 2),
+                min=round(min(values), 2),
+                max=round(max(values), 2),
+                games_with_data=len(values)
+            )
+
+        # CCU stats (include zeros - real measurement)
+        ccu_values = [g.ccu for g in games_list]
+        ccu_stats = compute_metric_stats(ccu_values)
+
+        # Owners stats (exclude zeros)
+        owners_values = [g.owners_midpoint for g in games_list if g.owners_midpoint > 0]
+        owners_stats = compute_metric_stats(owners_values)
+
+        # Playtime stats (exclude zeros)
+        playtime_values = [g.average_forever for g in games_list if g.average_forever > 0]
+        playtime_stats = compute_metric_stats(playtime_values)
+
+        # Review score stats (exclude None)
+        review_score_values = [g.review_score for g in games_list if g.review_score is not None]
+        review_score_stats = compute_metric_stats(review_score_values)
+
+        # Compute dual metrics: market-weighted vs per-game average
+        market_weighted = {}
+        per_game_average = {}
+
+        # CCU ratio
+        total_ccu = sum(g.ccu for g in games_list)
+        total_owners = sum(g.owners_midpoint for g in games_list)
+        if total_owners > 0:
+            market_weighted["ccu_ratio"] = round(total_ccu / total_owners * 100, 2)
+        else:
+            market_weighted["ccu_ratio"] = None
+
+        # Per-game CCU ratio
+        ccu_ratios = [
+            g.ccu / g.owners_midpoint * 100
+            for g in games_list
+            if g.owners_midpoint > 0
+        ]
+        if ccu_ratios:
+            per_game_average["ccu_ratio"] = round(mean(ccu_ratios), 2)
+        else:
+            per_game_average["ccu_ratio"] = None
+
+        # Review score (market-weighted)
+        total_positive = sum(g.positive for g in games_list)
+        total_negative = sum(g.negative for g in games_list)
+        total_reviews = total_positive + total_negative
+        if total_reviews > 0:
+            market_weighted["review_score"] = round(total_positive / total_reviews * 100, 2)
+        else:
+            market_weighted["review_score"] = None
+
+        # Review score (per-game average)
+        review_scores = [g.review_score for g in games_list if g.review_score is not None]
+        if review_scores:
+            per_game_average["review_score"] = round(mean(review_scores), 2)
+        else:
+            per_game_average["review_score"] = None
+
+        # Activity ratio (market-weighted)
+        total_avg_2weeks = sum(g.average_2weeks for g in games_list)
+        total_avg_forever = sum(g.average_forever for g in games_list)
+        if total_avg_forever > 0:
+            market_weighted["activity_ratio"] = round(total_avg_2weeks / total_avg_forever * 100, 2)
+        else:
+            market_weighted["activity_ratio"] = None
+
+        # Activity ratio (per-game average)
+        activity_ratios = [
+            g.average_2weeks / g.average_forever * 100
+            for g in games_list
+            if g.average_forever > 0
+        ]
+        if activity_ratios:
+            per_game_average["activity_ratio"] = round(mean(activity_ratios), 2)
+        else:
+            per_game_average["activity_ratio"] = None
+
+        # Sort per-game list
+        sort_key_map = {
+            "owners": lambda g: g.owners_midpoint,
+            "ccu": lambda g: g.ccu,
+            "reviews": lambda g: g.positive + g.negative,
+            "playtime": lambda g: g.average_forever
+        }
+        sort_key = sort_key_map.get(sort_by, sort_key_map["owners"])
+        games_list.sort(key=sort_key, reverse=True)
+
+        return AggregateEngagementData(
+            tag=tag,
+            appids_requested=appids,
+            games_total=games_total,
+            games_analyzed=games_analyzed,
+            ccu_stats=ccu_stats,
+            owners_stats=owners_stats,
+            playtime_stats=playtime_stats,
+            review_score_stats=review_score_stats,
+            market_weighted=market_weighted,
+            per_game_average=per_game_average,
+            games=games_list,
+            failures=failures,
+            sort_by=sort_by,
+            fetched_at=fetched_at,
+            cache_age_seconds=cache_age
+        )
 
 
 class SteamStoreClient:
