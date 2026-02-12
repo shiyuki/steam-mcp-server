@@ -144,3 +144,56 @@ def register_tools(mcp: FastMCP):
             return json.dumps(result.model_dump())
 
         return json.dumps(result.model_dump())
+
+    @mcp.tool()
+    async def aggregate_engagement(tag: str = "", appids: str = "", sort_by: str = "owners") -> str:
+        """Aggregate engagement metrics across all games in a genre/tag or custom AppID list.
+
+        Provides statistical distribution (mean, median, p25, p75, min, max) for CCU, owners,
+        playtime, and review scores across the genre. Includes both market-weighted and per-game
+        average metric calculations for different analytical perspectives.
+
+        Use tag for quick genre overview (1 API call, all games in tag).
+        Use appids for custom game selections (concurrent calls, rate-limited).
+
+        Args:
+            tag: Steam tag name (e.g., "Roguelike", "Indie"). Mutually exclusive with appids.
+            appids: Comma-separated AppIDs (e.g., "646570,2379780,247080"). Mutually exclusive with tag.
+            sort_by: Sort per-game list by: "owners" (default), "ccu", "reviews", "playtime"
+
+        Returns:
+            JSON string with per-metric stats, market-weighted and per-game ratios, per-game breakdown, coverage info
+        """
+        # Validate: exactly one of tag or appids must be provided
+        tag = tag.strip()
+        appids_str = appids.strip()
+
+        if not tag and not appids_str:
+            return json.dumps({"error": "Either tag or appids must be provided", "error_type": "validation"})
+
+        if tag and appids_str:
+            return json.dumps({"error": "Provide either tag or appids, not both", "error_type": "validation"})
+
+        # Parse AppID list if provided
+        appid_list = None
+        if appids_str:
+            try:
+                appid_list = [int(a.strip()) for a in appids_str.split(",") if a.strip()]
+                if not appid_list:
+                    return json.dumps({"error": "appids list is empty", "error_type": "validation"})
+                if any(a <= 0 for a in appid_list):
+                    return json.dumps({"error": "All appids must be positive", "error_type": "validation"})
+            except ValueError:
+                return json.dumps({"error": "appids must be comma-separated integers", "error_type": "validation"})
+
+        logger.info("Aggregating engagement for tag=%s, appids=%s, sort_by=%s", tag or "N/A", appids_str or "N/A", sort_by)
+        result = await _steamspy.aggregate_engagement(
+            tag=tag if tag else None,
+            appids=appid_list,
+            sort_by=sort_by
+        )
+
+        if isinstance(result, APIError):
+            return json.dumps(result.model_dump())
+
+        return json.dumps(result.model_dump())
