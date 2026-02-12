@@ -112,3 +112,35 @@ def register_tools(mcp: FastMCP):
             return json.dumps(result.model_dump())
 
         return json.dumps(result.model_dump())
+
+    @mcp.tool()
+    async def fetch_engagement(appid: int) -> str:
+        """Fetch player engagement metrics for a Steam game from SteamSpy.
+
+        Returns CCU, owner estimates (min/max/midpoint), playtime (avg/median, forever/2weeks in hours),
+        review counts and score, price, tags with weights, and derived health metrics.
+
+        Derived metrics (numeric ratios, Claude interprets significance):
+        - ccu_ratio: CCU / owners_midpoint * 100 (% of owners currently playing; <1% low engagement, >5% cult following)
+        - review_score: positive / total_reviews * 100 (% positive reviews)
+        - playtime_engagement: median_playtime / average_playtime (distribution skew; <1 means long-tail outliers inflate average)
+        - activity_ratio: average_2weeks / average_forever * 100 (% of lifetime playtime happening recently; high = still active)
+
+        Quality flags per ambiguous numeric field: "available" = real measurement, "zero_uncertain" = likely no data.
+
+        Args:
+            appid: Steam AppID (e.g., 646570 for Slay the Spire)
+
+        Returns:
+            JSON string with engagement metrics, derived health metrics, and quality flags
+        """
+        if appid <= 0:
+            return json.dumps({"error": "appid must be positive", "error_type": "validation"})
+
+        logger.info("Fetching engagement data for AppID: %d", appid)
+        result = await _steamspy.get_engagement_data(appid)
+
+        if isinstance(result, APIError):
+            return json.dumps(result.model_dump())
+
+        return json.dumps(result.model_dump())
