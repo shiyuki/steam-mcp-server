@@ -6,7 +6,7 @@ from mcp.server.fastmcp import FastMCP
 from src.http_client import CachedAPIClient
 from src.cache import TTLCache
 from src.rate_limiter import HostRateLimiter
-from src.steam_api import SteamSpyClient, SteamStoreClient
+from src.steam_api import SteamSpyClient, SteamStoreClient, GamalyticClient
 from src.schemas import APIError
 from src.logging_config import get_logger
 
@@ -16,11 +16,12 @@ logger = get_logger(__name__)
 _http_client: CachedAPIClient | None = None
 _steamspy: SteamSpyClient | None = None
 _steam_store: SteamStoreClient | None = None
+_gamalytic: GamalyticClient | None = None
 
 
 def register_tools(mcp: FastMCP):
     """Register all MCP tools with the server."""
-    global _http_client, _steamspy, _steam_store
+    global _http_client, _steamspy, _steam_store, _gamalytic
 
     # Initialize shared infrastructure with per-host rate limiting and TTL cache
     cache = TTLCache(default_ttl=3600)  # 1 hour default
@@ -28,6 +29,7 @@ def register_tools(mcp: FastMCP):
     _http_client = CachedAPIClient(cache=cache, rate_limiter=rate_limiter)
     _steamspy = SteamSpyClient(_http_client)
     _steam_store = SteamStoreClient(_http_client)
+    _gamalytic = GamalyticClient(_http_client)
 
     logger.info("Initializing MCP tools with per-host rate limiting and TTL cache")
 
@@ -80,6 +82,31 @@ def register_tools(mcp: FastMCP):
 
         logger.info("Fetching metadata for AppID: %d", appid)
         result = await _steam_store.get_app_details(appid)
+
+        if isinstance(result, APIError):
+            return json.dumps(result.model_dump())
+
+        return json.dumps(result.model_dump())
+
+    @mcp.tool()
+    async def fetch_commercial(appid: int) -> str:
+        """Fetch commercial data (pricing, revenue estimates) for a Steam game.
+
+        Returns revenue as a range (min-max) with confidence level and data source.
+        Uses Gamalytic API as primary source, falls back to review-based estimation.
+        Includes triangulation warning when data sources disagree significantly.
+
+        Args:
+            appid: Steam AppID (e.g., 646570 for Slay the Spire)
+
+        Returns:
+            JSON string with revenue range, confidence, source, and optional triangulation warning
+        """
+        if appid <= 0:
+            return json.dumps({"error": "appid must be positive", "error_type": "validation"})
+
+        logger.info("Fetching commercial data for AppID: %d", appid)
+        result = await _gamalytic.get_revenue_estimate(appid)
 
         if isinstance(result, APIError):
             return json.dumps(result.model_dump())
