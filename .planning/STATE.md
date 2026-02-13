@@ -10,19 +10,19 @@ See: .planning/PROJECT.md (updated 2026-02-11)
 
 ## Current Position
 
-Phase: milestone-uat of 5 (UAT Gap Closure) — COMPLETE
-Plan: milestone-uat-01 of 1 complete (bowling fallback fingerprint corrected)
+Phase: 04-engagement-data of 5 — COMPLETE (gap closure verified)
+Plan: 04-05 of 5 complete (uncapped tag cross-validation)
 Status: Ready for Phase 5
-Last activity: 2026-02-13 — Milestone UAT gap closure complete, bowling fallback detection fixed
+Last activity: 2026-02-13 — Removed TAG_VALIDATION_LIMIT cap, all bulk results now cross-validated
 
-Progress: [█████████░] 94% (15/16 estimated plans)
+Progress: [█████████░] 96% (17/17 plans complete, Phase 5 remaining)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 15
+- Total plans completed: 17
 - Average duration: 3.1 min
-- Total execution time: 0.84 hours
+- Total execution time: 0.97 hours
 
 **By Phase:**
 
@@ -31,12 +31,12 @@ Progress: [█████████░] 94% (15/16 estimated plans)
 | 01-mcp-foundation | 5 | 18 min | 3.6 min |
 | 02-infrastructure-layer | 3 | 18 min | 6.0 min |
 | 03-commercial-data | 2 | 6 min | 3.0 min |
-| 04-engagement-data | 4 | 13 min | 3.3 min |
-| milestone-uat | 1 | 1 min | 1.0 min |
+| 04-engagement-data | 5 | 15 min | 3.0 min |
+| milestone-uat | 2 | 9 min | 4.5 min |
 
 **Recent Trend:**
-- Last 5 plans: 04-01 (2min), 04-02 (3min), 04-03 (4min), 04-04 (4min), milestone-uat-01 (1min)
-- Trend: Very fast gap closure, consistent execution speed overall
+- Last 5 plans: 04-04 (4min), milestone-uat-01 (1min), milestone-uat-02 (8min), 04-05 (2min)
+- Trend: Gap closures fast (1-2 min), consistent execution
 
 *Updated after each plan completion*
 
@@ -123,6 +123,10 @@ Recent decisions affecting current work:
 - Real bowling fallback AppIDs: {901583, 12210, 2990, 891040, 22230} empirically verified from SteamSpy — milestone-uat-01
 - Tests use real AppIDs for non-circular validation instead of invented fingerprint — milestone-uat-01
 
+**From Phase 04 Plan 05 (gap closure):**
+- TAG_VALIDATION_LIMIT removed — all bulk results cross-validated for niche tags — 04-05
+- TAG_CROSSVAL_THRESHOLD (5000) broad-tag bypass preserved — 04-05
+
 ### Pending Todos
 
 None yet.
@@ -141,8 +145,8 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-13T02:33:53Z
-Stopped at: Completed milestone-uat-01-PLAN.md — bowling fallback detection corrected
+Last session: 2026-02-13T09:45:00Z
+Stopped at: Completed 04-05 gap closure — uncapped tag cross-validation, phase 04 verified
 Resume file: None
 
 Config (if exists):
