@@ -20,14 +20,62 @@ class CachedResponse(BaseModel):
 
 
 class GameMetadata(CachedResponse):
-    """Metadata for a single Steam game."""
+    """Metadata for a single Steam game with comprehensive Steam Store data."""
     model_config = ConfigDict(extra="ignore")
 
+    # Core identification (existing fields - unchanged)
     appid: int
     name: str
     tags: list[str] = Field(default_factory=list)
     developer: str = ""
-    description: str = ""
+    description: str = ""  # Kept for backward compat (same as short_description)
+
+    # Publishing
+    publisher: str = ""
+
+    # Descriptions
+    short_description: str = ""  # Explicit short description
+    detailed_description: str = ""  # HTML-stripped plain text
+
+    # Visual assets
+    header_image: str = ""  # Main capsule art URL
+
+    # Pricing
+    price: float | None = None  # In dollars; None if unavailable (not F2P)
+    is_free_to_play: bool = False
+
+    # Platform support
+    platforms: dict[str, bool] = Field(default_factory=dict)  # {"windows": True, "mac": False, "linux": True}
+
+    # Release information
+    release_date: str | None = None  # ISO format "2019-01-23" or None
+    release_date_raw: str = ""  # Original string "23 Jan, 2019"
+
+    # Review aggregation
+    metacritic_score: int | None = None
+    metacritic_url: str = ""
+
+    # Classification
+    categories: list[str] = Field(default_factory=list)  # Steam feature tags ("Single-player", "Steam Achievements")
+    genres: list[str] = Field(default_factory=list)  # Steam genre classification ("Indie", "Strategy")
+
+    # Community metrics
+    recommendations: int = 0  # Total recommendations count
+
+    # Media assets
+    screenshots: list[str] = Field(default_factory=list)  # Screenshot URLs (full size)
+    screenshots_count: int = 0
+    movies: list[dict] = Field(default_factory=list)  # Trailer dicts with {name, thumbnail, webm_url, mp4_url}
+    movies_count: int = 0
+
+    # DLC
+    dlc: list[int] = Field(default_factory=list)  # DLC AppIDs
+    dlc_count: int = 0
+
+    # Content information
+    content_descriptors: list[str] = Field(default_factory=list)  # Content descriptor notes
+    supported_languages_count: int = 0
+    supported_languages_raw: str = ""  # Raw languages string from API
 
 
 class GameSummary(BaseModel):

@@ -4,6 +4,8 @@ import asyncio
 import httpx
 from datetime import datetime, timezone
 from statistics import mean, median, quantiles
+from html.parser import HTMLParser
+from html import unescape
 from src.http_client import CachedAPIClient
 from src.schemas import (
     GameMetadata, SearchResult, CommercialData, EngagementData, APIError,
@@ -12,6 +14,63 @@ from src.schemas import (
 from src.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+class _HTMLTextExtractor(HTMLParser):
+    """HTML parser for extracting plain text from HTML."""
+    def __init__(self):
+        super().__init__()
+        self.text_parts = []
+
+    def handle_data(self, data):
+        self.text_parts.append(data)
+
+    def get_text(self):
+        return unescape(''.join(self.text_parts)).strip()
+
+
+def strip_html(html: str) -> str:
+    """Convert HTML to plain text, stripping tags and unescaping entities.
+
+    Args:
+        html: HTML string to convert
+
+    Returns:
+        Plain text with HTML tags removed and entities unescaped
+    """
+    if not html:
+        return ""
+    parser = _HTMLTextExtractor()
+    parser.feed(html)
+    return parser.get_text()
+
+
+def parse_steam_date(date_str: str) -> str | None:
+    """Parse Steam date string to ISO format YYYY-MM-DD.
+
+    Handles common Steam date formats:
+    - "23 Jan, 2019"
+    - "Jan 23, 2019"
+    - "January 23, 2019"
+    - "23 January, 2019"
+
+    Args:
+        date_str: Steam date string
+
+    Returns:
+        ISO date string "YYYY-MM-DD" or None if unparseable/placeholder
+    """
+    if not date_str or date_str.lower() in ("coming soon", "tba", "to be announced"):
+        return None
+
+    for fmt in ["%d %b, %Y", "%b %d, %Y", "%B %d, %Y", "%d %B, %Y"]:
+        try:
+            dt = datetime.strptime(date_str.strip(), fmt)
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    return None
 
 
 # Tag normalization: Map common user-friendly tag names to SteamSpy's exact format
