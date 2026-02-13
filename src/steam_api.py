@@ -66,6 +66,9 @@ BOWLING_FALLBACK_APPIDS = {901583, 12210, 2990, 891040, 22230}
 
 # Maximum number of games to validate via appdetails for tag cross-validation
 TAG_VALIDATION_LIMIT = 100
+# Tags with fewer games than this threshold get cross-validated via appdetails;
+# broad tags (>=5000) use bulk data as-is for coverage
+TAG_CROSSVAL_THRESHOLD = 5000
 
 
 class SteamSpyClient:
@@ -409,47 +412,53 @@ class SteamSpyClient:
                         message=f"Tag '{tag}' not recognized by SteamSpy. The API returned default results instead of matching games. Try a different tag name or check Steam's tag list."
                     )
 
-                # Sort bulk results by owners (descending) to validate highest-value games first
-                bulk_games = []
-                for game_data in data.values():
-                    parsed = self._parse_game_data(game_data)
-                    bulk_games.append(parsed)
-                bulk_games.sort(key=lambda g: g["owners_midpoint"], reverse=True)
+                if len(data) >= TAG_CROSSVAL_THRESHOLD:
+                    # Broad tag: use bulk data as-is (cross-validation too aggressive for large tags)
+                    for game_data in data.values():
+                        parsed = self._parse_game_data(game_data)
+                        games_list.append(GameEngagementSummary(**parsed))
+                    logger.info(f"Broad tag '{tag}': {len(games_list)} games from bulk endpoint (>={TAG_CROSSVAL_THRESHOLD}, skipping cross-validation)")
+                else:
+                    # Niche tag: cross-validate via appdetails to filter irrelevant games
+                    bulk_games = []
+                    for game_data in data.values():
+                        parsed = self._parse_game_data(game_data)
+                        bulk_games.append(parsed)
+                    bulk_games.sort(key=lambda g: g["owners_midpoint"], reverse=True)
 
-                # Validate top N candidates via appdetails (which includes per-game tags)
-                candidates = bulk_games[:TAG_VALIDATION_LIMIT]
-                candidate_appids = [g["appid"] for g in candidates]
+                    # Validate top N candidates via appdetails (which includes per-game tags)
+                    candidates = bulk_games[:TAG_VALIDATION_LIMIT]
+                    candidate_appids = [g["appid"] for g in candidates]
 
-                # Fetch appdetails concurrently for tag validation
-                detail_tasks = [self.get_engagement_data(appid) for appid in candidate_appids]
-                results = await asyncio.gather(*detail_tasks, return_exceptions=True)
+                    # Fetch appdetails concurrently for tag validation
+                    detail_tasks = [self.get_engagement_data(appid) for appid in candidate_appids]
+                    results = await asyncio.gather(*detail_tasks, return_exceptions=True)
 
-                # Filter to games where searched tag is in their tag dict
-                tag_lower = tag.lower()
-                for appid, result in zip(candidate_appids, results):
-                    if isinstance(result, Exception):
-                        failures.append({"appid": appid, "reason": "exception"})
-                    elif isinstance(result, APIError):
-                        failures.append({"appid": appid, "reason": result.error_type})
-                    elif isinstance(result, EngagementData):
-                        # Check if searched tag appears in this game's tags (case-insensitive)
-                        game_tag_names_lower = {t.lower() for t in result.tags.keys()}
-                        if tag_lower in game_tag_names_lower:
-                            games_list.append(GameEngagementSummary(
-                                appid=result.appid,
-                                name=result.name,
-                                ccu=result.ccu,
-                                owners_midpoint=result.owners_midpoint,
-                                average_forever=result.average_forever,
-                                average_2weeks=result.average_2weeks,
-                                positive=result.positive,
-                                negative=result.negative,
-                                review_score=result.review_score,
-                                price=result.price,
-                                tags=result.tags
-                            ))
+                    # Filter to games where searched tag is in their tag dict
+                    tag_lower = tag.lower()
+                    for appid, result in zip(candidate_appids, results):
+                        if isinstance(result, Exception):
+                            failures.append({"appid": appid, "reason": "exception"})
+                        elif isinstance(result, APIError):
+                            failures.append({"appid": appid, "reason": result.error_type})
+                        elif isinstance(result, EngagementData):
+                            game_tag_names_lower = {t.lower() for t in result.tags.keys()}
+                            if tag_lower in game_tag_names_lower:
+                                games_list.append(GameEngagementSummary(
+                                    appid=result.appid,
+                                    name=result.name,
+                                    ccu=result.ccu,
+                                    owners_midpoint=result.owners_midpoint,
+                                    average_forever=result.average_forever,
+                                    average_2weeks=result.average_2weeks,
+                                    positive=result.positive,
+                                    negative=result.negative,
+                                    review_score=result.review_score,
+                                    price=result.price,
+                                    tags=result.tags
+                                ))
 
-                logger.info(f"Tag validation: {len(games_list)}/{len(candidates)} games confirmed with tag '{tag}'")
+                    logger.info(f"Tag validation: {len(games_list)}/{len(candidates)} games confirmed with tag '{tag}'")
 
             except httpx.HTTPStatusError as e:
                 status = e.response.status_code
