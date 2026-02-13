@@ -30,11 +30,41 @@ class GameMetadata(CachedResponse):
     description: str = ""
 
 
+class GameSummary(BaseModel):
+    """Per-game summary data from SteamSpy bulk endpoint.
+
+    All fields available in SteamSpy bulk response (request=tag).
+    For detailed per-game tag weights, use fetch_engagement(appid) instead.
+    """
+    appid: int
+    name: str = ""
+    developer: str = ""
+    publisher: str = ""
+    owners_midpoint: float = 0
+    ccu: int = 0
+    price: float = 0  # In dollars, converted from API cents
+    review_score: float | None = None  # Percentage (positive / total * 100)
+    positive: int = 0
+    negative: int = 0
+    average_playtime: float = 0  # Hours, converted from API minutes
+    median_playtime: float = 0  # Hours, converted from API minutes
+    average_2weeks: float = 0  # Hours, converted from API minutes
+    median_2weeks: float = 0  # Hours, converted from API minutes
+    score_rank: str = ""
+    userscore: float = 0
+
+
 class SearchResult(CachedResponse):
-    """Result from tag-based game search."""
+    """Result from tag-based game search with enriched per-game summaries."""
+    # DEPRECATED: Use games list instead; kept for backward compatibility
     appids: list[int]
     tag: str
     total_found: int
+    # NEW FIELDS: Phase 5 enrichment
+    games: list[GameSummary] = Field(default_factory=list)
+    sort_by: str = "owners"  # Sort field applied to games list
+    result_size_warning: str | None = None  # Warning for large result sets (>5000 games)
+    normalized_tag: str | None = None  # Tag after normalization (shows what was actually queried)
 
 
 class CommercialData(CachedResponse):
