@@ -13,6 +13,7 @@ This roadmap delivers the foundational MCP server that connects Claude/Cursor to
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [ ] **Phase 1: MCP Foundation & Steam API Integration** - Working MCP server with genre search and metadata tools
+- [ ] **Milestone UAT: Gap Closure** - Fix bowling fallback detection and add tag cross-validation
 
 ## Phase Details
 
@@ -39,6 +40,22 @@ Plans:
 - [ ] 01-04-PLAN.md - MCP tool implementations and server wiring
 - [ ] 01-05-PLAN.md - Documentation and end-to-end verification (checkpoint)
 
+### Milestone UAT: Gap Closure
+**Goal**: Fix two UAT failures from v1.1 milestone testing -- bowling fallback detection and tag cross-validation in aggregate_engagement
+
+**Depends on**: Phases 1-4 complete
+
+**Success Criteria** (what must be TRUE):
+  1. Unrecognized tag returns error with error_type tag_not_found, not bowling game data
+  2. aggregate_engagement only returns games where the searched tag appears in the game's top tags
+  3. All 135+ existing tests still pass
+
+**Plans**: 2 plans
+
+Plans:
+- [ ] milestone-uat-01-PLAN.md — Fix bowling fallback fingerprint AppIDs (wrong constant + circular tests)
+- [ ] milestone-uat-02-PLAN.md — Add per-game tag cross-validation to aggregate_engagement
+
 ## Progress
 
 **Execution Order:**
@@ -47,3 +64,4 @@ Phases execute in numeric order.
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. MCP Foundation & Steam API Integration | 0/5 | Not started | - |
+| Milestone UAT: Gap Closure | 0/2 | Not started | - |
