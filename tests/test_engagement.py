@@ -581,11 +581,24 @@ class TestAggregateEngagement:
                 "price": "1499"
             }
         }
-        mock_http.get_with_metadata.return_value = (
-            tag_data,
-            datetime.now(timezone.utc),
-            0
-        )
+
+        # Mock side_effect: bulk call returns tag data, then appdetails for each game
+        def mock_side_effect(*args, **kwargs):
+            params = kwargs.get("params", {})
+            if params.get("request") == "tag":
+                return (tag_data, datetime.now(timezone.utc), 0)
+            elif params.get("request") == "appdetails":
+                appid = params.get("appid")  # This is a string
+                game_data = tag_data.get(appid, {})
+                if not game_data:
+                    # If lookup fails, create minimal data
+                    return ({"appid": appid, "owners": "0 .. 0", "ccu": 0, "positive": 0, "negative": 0, "average_forever": 0, "average_2weeks": 0, "price": "0"}, datetime.now(timezone.utc), 0)
+                # Add tags field to each game - all have "Rogue-like" tag for this test (normalized form)
+                game_with_tags = dict(game_data)
+                game_with_tags["tags"] = {"Rogue-like": 100, "Indie": 90}
+                return (game_with_tags, datetime.now(timezone.utc), 0)
+
+        mock_http.get_with_metadata.side_effect = mock_side_effect
 
         client = SteamSpyClient(mock_http)
         result = await client.aggregate_engagement(tag="Roguelike")
@@ -662,11 +675,20 @@ class TestAggregateEngagement:
                 "price": "1500"
             }
         }
-        mock_http.get_with_metadata.return_value = (
-            tag_data,
-            datetime.now(timezone.utc),
-            0
-        )
+
+        # Mock side_effect for tag + appdetails calls
+        def mock_side_effect(*args, **kwargs):
+            params = kwargs.get("params", {})
+            if params.get("request") == "tag":
+                return (tag_data, datetime.now(timezone.utc), 0)
+            elif params.get("request") == "appdetails":
+                appid = params.get("appid")
+                game_data = tag_data.get(appid, {})
+                game_with_tags = dict(game_data)
+                game_with_tags["tags"] = {"Test": 100}
+                return (game_with_tags, datetime.now(timezone.utc), 0)
+
+        mock_http.get_with_metadata.side_effect = mock_side_effect
 
         client = SteamSpyClient(mock_http)
         result = await client.aggregate_engagement(tag="Test")
@@ -817,11 +839,20 @@ class TestAggregateEngagement:
                 "price": "1000"
             }
         }
-        mock_http.get_with_metadata.return_value = (
-            tag_data,
-            datetime.now(timezone.utc),
-            0
-        )
+
+        # Mock side_effect for tag + appdetails calls
+        def mock_side_effect(*args, **kwargs):
+            params = kwargs.get("params", {})
+            if params.get("request") == "tag":
+                return (tag_data, datetime.now(timezone.utc), 0)
+            elif params.get("request") == "appdetails":
+                appid = params.get("appid")
+                game_data = tag_data.get(appid, {})
+                game_with_tags = dict(game_data)
+                game_with_tags["tags"] = {"Test": 100}
+                return (game_with_tags, datetime.now(timezone.utc), 0)
+
+        mock_http.get_with_metadata.side_effect = mock_side_effect
 
         client = SteamSpyClient(mock_http)
         result = await client.aggregate_engagement(tag="Test", sort_by="owners")
@@ -871,11 +902,20 @@ class TestAggregateEngagement:
                 "price": "1500"
             }
         }
-        mock_http.get_with_metadata.return_value = (
-            tag_data,
-            datetime.now(timezone.utc),
-            0
-        )
+
+        # Mock side_effect for tag + appdetails calls
+        def mock_side_effect(*args, **kwargs):
+            params = kwargs.get("params", {})
+            if params.get("request") == "tag":
+                return (tag_data, datetime.now(timezone.utc), 0)
+            elif params.get("request") == "appdetails":
+                appid = params.get("appid")
+                game_data = tag_data.get(appid, {})
+                game_with_tags = dict(game_data)
+                game_with_tags["tags"] = {"Test": 100}
+                return (game_with_tags, datetime.now(timezone.utc), 0)
+
+        mock_http.get_with_metadata.side_effect = mock_side_effect
 
         client = SteamSpyClient(mock_http)
         result = await client.aggregate_engagement(tag="Test", sort_by="ccu")
@@ -904,11 +944,19 @@ class TestAggregateEngagement:
                 "price": "1000"
             }
 
-        mock_http.get_with_metadata.return_value = (
-            tag_data,
-            datetime.now(timezone.utc),
-            0
-        )
+        # Mock side_effect for tag + appdetails calls
+        def mock_side_effect(*args, **kwargs):
+            params = kwargs.get("params", {})
+            if params.get("request") == "tag":
+                return (tag_data, datetime.now(timezone.utc), 0)
+            elif params.get("request") == "appdetails":
+                appid = params.get("appid")
+                game_data = tag_data.get(appid, {})
+                game_with_tags = dict(game_data)
+                game_with_tags["tags"] = {"Test": 100}
+                return (game_with_tags, datetime.now(timezone.utc), 0)
+
+        mock_http.get_with_metadata.side_effect = mock_side_effect
 
         client = SteamSpyClient(mock_http)
         result = await client.aggregate_engagement(tag="Test")
@@ -950,11 +998,20 @@ class TestAggregateEngagement:
                 "price": "2000"
             }
         }
-        mock_http.get_with_metadata.return_value = (
-            tag_data,
-            datetime.now(timezone.utc),
-            0
-        )
+
+        # Mock side_effect for tag + appdetails calls
+        def mock_side_effect(*args, **kwargs):
+            params = kwargs.get("params", {})
+            if params.get("request") == "tag":
+                return (tag_data, datetime.now(timezone.utc), 0)
+            elif params.get("request") == "appdetails":
+                appid = params.get("appid")
+                game_data = tag_data.get(appid, {})
+                game_with_tags = dict(game_data)
+                game_with_tags["tags"] = {"Test": 100}
+                return (game_with_tags, datetime.now(timezone.utc), 0)
+
+        mock_http.get_with_metadata.side_effect = mock_side_effect
 
         client = SteamSpyClient(mock_http)
         result = await client.aggregate_engagement(tag="Test")
@@ -1365,16 +1422,181 @@ class TestBowlingFallbackDetection:
                 "price": "1499"
             }
         }
-        mock_http.get_with_metadata.return_value = (
-            valid_data,
-            datetime.now(timezone.utc),
-            0
-        )
+
+        # Mock side_effect for tag + appdetails calls
+        def mock_side_effect(*args, **kwargs):
+            params = kwargs.get("params", {})
+            if params.get("request") == "tag":
+                return (valid_data, datetime.now(timezone.utc), 0)
+            elif params.get("request") == "appdetails":
+                appid = params.get("appid")
+                game_data = valid_data.get(appid, {})
+                game_with_tags = dict(game_data)
+                game_with_tags["tags"] = {"Rogue-like": 100, "Indie": 90}
+                return (game_with_tags, datetime.now(timezone.utc), 0)
+
+        mock_http.get_with_metadata.side_effect = mock_side_effect
 
         client = SteamSpyClient(mock_http)
         result = await client.aggregate_engagement(tag="Roguelike")
 
         # Verify the API was called with normalized tag
-        mock_http.get_with_metadata.assert_called_once()
-        call_args = mock_http.get_with_metadata.call_args
-        assert call_args[1]["params"]["tag"] == "Rogue-like"
+        # First call should be the bulk tag call
+        first_call_args = mock_http.get_with_metadata.call_args_list[0]
+        assert first_call_args[1]["params"]["tag"] == "Rogue-like"
+
+
+class TestTagCrossValidation:
+    """Test tag cross-validation in aggregate_engagement."""
+
+    @pytest.mark.asyncio
+    async def test_aggregate_filters_games_without_searched_tag(self, mock_http):
+        """Tag validation filters out games where searched tag is not in their tag list."""
+        # Bulk endpoint returns 5 games
+        bulk_response = {
+            "1": {"appid": 1, "name": "Game1", "owners": "100000 .. 200000", "ccu": 100, "positive": 500, "negative": 50, "average_forever": 600, "average_2weeks": 60, "median_forever": 300, "median_2weeks": 30, "price": "999"},
+            "2": {"appid": 2, "name": "Game2", "owners": "90000 .. 180000", "ccu": 90, "positive": 450, "negative": 45, "average_forever": 540, "average_2weeks": 54, "median_forever": 270, "median_2weeks": 27, "price": "899"},
+            "3": {"appid": 3, "name": "Game3", "owners": "80000 .. 160000", "ccu": 80, "positive": 400, "negative": 40, "average_forever": 480, "average_2weeks": 48, "median_forever": 240, "median_2weeks": 24, "price": "799"},
+            "4": {"appid": 4, "name": "Game4", "owners": "70000 .. 140000", "ccu": 70, "positive": 350, "negative": 35, "average_forever": 420, "average_2weeks": 42, "median_forever": 210, "median_2weeks": 21, "price": "699"},
+            "5": {"appid": 5, "name": "Game5", "owners": "60000 .. 120000", "ccu": 60, "positive": 300, "negative": 30, "average_forever": 360, "average_2weeks": 36, "median_forever": 180, "median_2weeks": 18, "price": "599"},
+        }
+
+        # Mock side_effect: bulk call returns 5 games, then appdetails for each
+        def mock_side_effect(*args, **kwargs):
+            params = kwargs.get("params", {})
+            if params.get("request") == "tag":
+                # Bulk endpoint call
+                return (bulk_response, datetime.now(timezone.utc), 0)
+            elif params.get("request") == "appdetails":
+                # Individual appdetails calls - games 1, 3, 5 have "Indie", 2 and 4 don't
+                appid = int(params.get("appid"))  # appid is passed as string
+                base_data = {
+                    "appid": appid,
+                    "name": f"Game{appid}",
+                    "owners": "100000 .. 200000",
+                    "ccu": 100,
+                    "positive": 500,
+                    "negative": 50,
+                    "average_forever": 600,
+                    "average_2weeks": 60,
+                    "median_forever": 300,
+                    "median_2weeks": 30,
+                    "price": "999"
+                }
+                if appid in [1, 3, 5]:
+                    base_data["tags"] = {"Indie": 100, "Action": 90}
+                else:
+                    base_data["tags"] = {"Action": 100, "Strategy": 90}
+                return (base_data, datetime.now(timezone.utc), 0)
+
+        mock_http.get_with_metadata.side_effect = mock_side_effect
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(tag="Indie")
+
+        # Only 3 games (1, 3, 5) should be in results
+        assert isinstance(result, AggregateEngagementData)
+        assert result.games_analyzed == 3
+        assert len(result.games) == 3
+        # Verify correct games made it through
+        appids_in_results = {g.appid for g in result.games}
+        assert appids_in_results == {1, 3, 5}
+
+    @pytest.mark.asyncio
+    async def test_aggregate_tag_validation_bounded(self, mock_http):
+        """Tag validation fetches at most TAG_VALIDATION_LIMIT appdetails."""
+        from src.steam_api import TAG_VALIDATION_LIMIT
+
+        # Bulk endpoint returns 200 games (more than limit)
+        bulk_response = {
+            str(i): {
+                "appid": i,
+                "name": f"Game{i}",
+                "owners": f"{100000 - i*100} .. {200000 - i*100}",
+                "ccu": 100,
+                "positive": 500,
+                "negative": 50,
+                "average_forever": 600,
+                "average_2weeks": 60,
+                "median_forever": 300,
+                "median_2weeks": 30,
+                "price": "999"
+            }
+            for i in range(1, 201)
+        }
+
+        appdetails_call_count = 0
+
+        def mock_side_effect(*args, **kwargs):
+            nonlocal appdetails_call_count
+            params = kwargs.get("params", {})
+            if params.get("request") == "tag":
+                return (bulk_response, datetime.now(timezone.utc), 0)
+            elif params.get("request") == "appdetails":
+                appdetails_call_count += 1
+                appid = int(params.get("appid"))  # appid is passed as string
+                return ({
+                    "appid": appid,
+                    "name": f"Game{appid}",
+                    "owners": "100000 .. 200000",
+                    "ccu": 100,
+                    "positive": 500,
+                    "negative": 50,
+                    "average_forever": 600,
+                    "average_2weeks": 60,
+                    "median_forever": 300,
+                    "median_2weeks": 30,
+                    "price": "999",
+                    "tags": {"Indie": 100}
+                }, datetime.now(timezone.utc), 0)
+
+        mock_http.get_with_metadata.side_effect = mock_side_effect
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(tag="Indie")
+
+        # Should validate at most TAG_VALIDATION_LIMIT games
+        assert appdetails_call_count <= TAG_VALIDATION_LIMIT
+        assert isinstance(result, AggregateEngagementData)
+
+    @pytest.mark.asyncio
+    async def test_aggregate_includes_tags_in_summary(self, mock_http):
+        """GameEngagementSummary includes tags dict from validated games."""
+        bulk_response = {
+            "1": {"appid": 1, "name": "Game1", "owners": "100000 .. 200000", "ccu": 100, "positive": 500, "negative": 50, "average_forever": 600, "average_2weeks": 60, "median_forever": 300, "median_2weeks": 30, "price": "999"},
+            "2": {"appid": 2, "name": "Game2", "owners": "90000 .. 180000", "ccu": 90, "positive": 450, "negative": 45, "average_forever": 540, "average_2weeks": 54, "median_forever": 270, "median_2weeks": 27, "price": "899"},
+        }
+
+        def mock_side_effect(*args, **kwargs):
+            params = kwargs.get("params", {})
+            if params.get("request") == "tag":
+                return (bulk_response, datetime.now(timezone.utc), 0)
+            elif params.get("request") == "appdetails":
+                appid = int(params.get("appid"))  # appid is passed as string
+                return ({
+                    "appid": appid,
+                    "name": f"Game{appid}",
+                    "owners": "100000 .. 200000",
+                    "ccu": 100,
+                    "positive": 500,
+                    "negative": 50,
+                    "average_forever": 600,
+                    "average_2weeks": 60,
+                    "median_forever": 300,
+                    "median_2weeks": 30,
+                    "price": "999",
+                    "tags": {"Indie": 100, "Roguelike": 90, "Strategy": 80}
+                }, datetime.now(timezone.utc), 0)
+
+        mock_http.get_with_metadata.side_effect = mock_side_effect
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(tag="Indie")
+
+        assert isinstance(result, AggregateEngagementData)
+        assert len(result.games) == 2
+        # Check that each game has tags
+        for game in result.games:
+            assert isinstance(game.tags, dict)
+            assert len(game.tags) > 0
+            assert "Indie" in game.tags or "indie" in {k.lower() for k in game.tags.keys()}
