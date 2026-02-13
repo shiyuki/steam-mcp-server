@@ -76,7 +76,13 @@ class TestSearchGenreValidation:
     @pytest.mark.asyncio
     async def test_valid_request_returns_results(self):
         mock = AsyncMock()
-        mock.search_by_tag.return_value = SearchResult(appids=[1, 2], tag="RPG", total_found=2, fetched_at=datetime.now(timezone.utc))
+        mock.search_by_tag.return_value = SearchResult(
+            appids=[1, 2],
+            tag="RPG",
+            total_found=2,
+            fetched_at=datetime.now(timezone.utc),
+            games=[]  # Phase 5: Include games field (can be empty for tool tests)
+        )
         fn = _make_search_genre(mock)
         result = json.loads(await fn("RPG", limit=10))
 
@@ -87,7 +93,13 @@ class TestSearchGenreValidation:
     @pytest.mark.asyncio
     async def test_genre_is_stripped(self):
         mock = AsyncMock()
-        mock.search_by_tag.return_value = SearchResult(appids=[], tag="RPG", total_found=0, fetched_at=datetime.now(timezone.utc))
+        mock.search_by_tag.return_value = SearchResult(
+            appids=[],
+            tag="RPG",
+            total_found=0,
+            fetched_at=datetime.now(timezone.utc),
+            games=[]  # Phase 5: Include games field
+        )
         fn = _make_search_genre(mock)
         await fn("  RPG  ", limit=10)
 

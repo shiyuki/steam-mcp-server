@@ -34,6 +34,10 @@ class TestSteamSpyClient:
         assert result.total_found == 3
         assert isinstance(result.fetched_at, datetime)
         assert result.cache_age_seconds == 0
+        # Phase 5: Verify enriched games list
+        assert hasattr(result, 'games')
+        assert len(result.games) == 2
+        assert len(result.games) == len(result.appids)
 
     @pytest.mark.asyncio
     async def test_search_by_tag_empty_response(self, mock_http):
@@ -44,6 +48,8 @@ class TestSteamSpyClient:
         assert isinstance(result, SearchResult)
         assert result.appids == []
         assert result.total_found == 0
+        # Phase 5: Empty games list for empty response
+        assert result.games == []
 
     @pytest.mark.asyncio
     async def test_search_by_tag_http_429(self, mock_http):
@@ -91,6 +97,9 @@ class TestSteamSpyClient:
         assert isinstance(result, SearchResult)
         assert len(result.appids) == 5
         assert result.total_found == 50
+        # Phase 5: Games list also capped by limit
+        assert len(result.games) == 5
+        assert len(result.games) == len(result.appids)
 
 
 class TestSteamStoreClient:
@@ -122,6 +131,15 @@ class TestSteamStoreClient:
         assert result.description == "A deckbuilder roguelike"
         assert isinstance(result.fetched_at, datetime)
         assert result.cache_age_seconds == 0
+        # Phase 5: New fields should have defaults when not in API response
+        assert result.price is None  # No price_overview in mock data
+        assert result.is_free_to_play is False
+        assert result.platforms == {"windows": False, "mac": False, "linux": False}
+        assert result.release_date is None
+        assert result.metacritic_score is None
+        assert result.screenshots == []
+        assert result.movies == []
+        assert result.dlc == []
 
     @pytest.mark.asyncio
     async def test_get_app_details_not_found(self, mock_http):
@@ -152,6 +170,18 @@ class TestSteamStoreClient:
         assert result.developer == ""
         assert result.description == ""
         assert isinstance(result.fetched_at, datetime)
+        # Phase 5: All new fields should have safe defaults
+        assert result.price is None
+        assert result.is_free_to_play is False
+        assert result.platforms == {"windows": False, "mac": False, "linux": False}
+        assert result.release_date is None
+        assert result.metacritic_score is None
+        assert result.screenshots == []
+        assert result.movies == []
+        assert result.dlc == []
+        assert result.publisher == ""
+        assert result.short_description == ""
+        assert result.detailed_description == ""
 
     @pytest.mark.asyncio
     async def test_get_app_details_http_error(self, mock_http):
