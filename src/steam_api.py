@@ -825,20 +825,142 @@ class SteamStoreClient:
                 )
 
             details = app_data.get("data", {})
-            # Extract tags from genres (Steam Store API uses genres, not tags)
+
+            # Existing fields (unchanged for backward compat)
             tags = [g.get("description", "") for g in details.get("genres", [])]
-            # Get first developer or empty string
             developers = details.get("developers", [])
             developer = developers[0] if developers else ""
+
+            # Initialize new fields with defaults in case parsing fails
+            new_fields = {
+                "publisher": "",
+                "short_description": "",
+                "detailed_description": "",
+                "header_image": "",
+                "price": None,
+                "is_free_to_play": False,
+                "platforms": {},
+                "release_date": None,
+                "release_date_raw": "",
+                "metacritic_score": None,
+                "metacritic_url": "",
+                "categories": [],
+                "genres": [],
+                "recommendations": 0,
+                "screenshots": [],
+                "screenshots_count": 0,
+                "movies": [],
+                "movies_count": 0,
+                "dlc": [],
+                "dlc_count": 0,
+                "content_descriptors": [],
+                "supported_languages_count": 0,
+                "supported_languages_raw": ""
+            }
+
+            # Parse new fields with defensive try/except to prevent individual field failures from crashing
+            try:
+                # Publisher
+                publishers = details.get("publishers", [])
+                new_fields["publisher"] = publishers[0] if publishers else ""
+
+                # Descriptions
+                new_fields["short_description"] = details.get("short_description", "")
+                new_fields["detailed_description"] = strip_html(details.get("detailed_description", ""))
+
+                # Visual assets
+                new_fields["header_image"] = details.get("header_image", "")
+
+                # Price
+                new_fields["is_free_to_play"] = details.get("is_free", False)
+                price_overview = details.get("price_overview")
+                if price_overview:
+                    try:
+                        new_fields["price"] = price_overview.get("final", 0) / 100.0
+                    except (TypeError, ValueError):
+                        new_fields["price"] = None
+                elif new_fields["is_free_to_play"]:
+                    new_fields["price"] = 0.0
+
+                # Platforms
+                platforms_data = details.get("platforms", {})
+                new_fields["platforms"] = {
+                    "windows": platforms_data.get("windows", False),
+                    "mac": platforms_data.get("mac", False),
+                    "linux": platforms_data.get("linux", False)
+                }
+
+                # Release date
+                release_date_data = details.get("release_date", {})
+                new_fields["release_date_raw"] = release_date_data.get("date", "")
+                new_fields["release_date"] = parse_steam_date(new_fields["release_date_raw"])
+
+                # Metacritic
+                metacritic_data = details.get("metacritic")
+                if metacritic_data:
+                    new_fields["metacritic_score"] = metacritic_data.get("score")
+                    new_fields["metacritic_url"] = metacritic_data.get("url", "")
+
+                # Categories & Genres
+                new_fields["categories"] = [c.get("description", "") for c in details.get("categories", [])]
+                new_fields["genres"] = [g.get("description", "") for g in details.get("genres", [])]
+
+                # Recommendations
+                recommendations_data = details.get("recommendations", {})
+                new_fields["recommendations"] = recommendations_data.get("total", 0) if recommendations_data else 0
+
+                # Screenshots
+                screenshots_data = details.get("screenshots", [])
+                new_fields["screenshots"] = [s.get("path_full", "") for s in screenshots_data if s.get("path_full")]
+                new_fields["screenshots_count"] = len(new_fields["screenshots"])
+
+                # Movies (trailers)
+                movies_data = details.get("movies", [])
+                movies = []
+                for m in movies_data:
+                    webm_data = m.get("webm", {}) or {}
+                    mp4_data = m.get("mp4", {}) or {}
+                    movie_entry = {
+                        "name": m.get("name", ""),
+                        "thumbnail": m.get("thumbnail", ""),
+                        "webm_url": webm_data.get("max", ""),
+                        "mp4_url": mp4_data.get("max", "")
+                    }
+                    movies.append(movie_entry)
+                new_fields["movies"] = movies
+                new_fields["movies_count"] = len(movies)
+
+                # DLC
+                dlc_data = details.get("dlc", [])
+                new_fields["dlc"] = dlc_data  # List of AppIDs
+                new_fields["dlc_count"] = len(dlc_data)
+
+                # Content descriptors
+                content_descriptors_data = details.get("content_descriptors", {})
+                notes = content_descriptors_data.get("notes", "") if content_descriptors_data else ""
+                if notes:
+                    new_fields["content_descriptors"] = [cd.strip() for cd in notes.split("\n") if cd.strip()]
+
+                # Languages
+                languages_raw = details.get("supported_languages", "")
+                new_fields["supported_languages_raw"] = languages_raw
+                if languages_raw:
+                    languages_clean = strip_html(languages_raw)
+                    new_fields["supported_languages_count"] = len([l.strip() for l in languages_clean.split(",") if l.strip()]) if languages_clean else 0
+
+            except Exception as e:
+                # Log the error but continue with defaults - old fields must still be returned
+                logger.warning(f"Failed to parse extended fields for AppID {appid}: {e}. Returning with defaults.")
 
             return GameMetadata(
                 appid=appid,
                 name=details.get("name", "Unknown"),
                 tags=tags,
                 developer=developer,
-                description=details.get("short_description", ""),
+                description=details.get("short_description", ""),  # Backward compat
                 fetched_at=fetched_at,
-                cache_age_seconds=cache_age
+                cache_age_seconds=cache_age,
+                **new_fields
             )
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
