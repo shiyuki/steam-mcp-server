@@ -64,8 +64,6 @@ def normalize_tag(tag: str) -> str:
 # These are empirically verified AppIDs from SteamSpy's actual bowling fallback response
 BOWLING_FALLBACK_APPIDS = {901583, 12210, 2990, 891040, 22230}
 
-# Maximum number of games to validate via appdetails for tag cross-validation
-TAG_VALIDATION_LIMIT = 100
 # Tags with fewer games than this threshold get cross-validated via appdetails;
 # broad tags (>=5000) use bulk data as-is for coverage
 TAG_CROSSVAL_THRESHOLD = 5000
@@ -426,8 +424,8 @@ class SteamSpyClient:
                         bulk_games.append(parsed)
                     bulk_games.sort(key=lambda g: g["owners_midpoint"], reverse=True)
 
-                    # Validate top N candidates via appdetails (which includes per-game tags)
-                    candidates = bulk_games[:TAG_VALIDATION_LIMIT]
+                    # Validate all candidates via appdetails (which includes per-game tags)
+                    candidates = bulk_games
                     candidate_appids = [g["appid"] for g in candidates]
 
                     # Fetch appdetails concurrently for tag validation
