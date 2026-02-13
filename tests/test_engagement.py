@@ -1504,8 +1504,7 @@ class TestTagCrossValidation:
 
     @pytest.mark.asyncio
     async def test_aggregate_tag_validation_bounded(self, mock_http):
-        """Tag validation fetches at most TAG_VALIDATION_LIMIT appdetails."""
-        from src.steam_api import TAG_VALIDATION_LIMIT
+        """Tag validation fetches appdetails for all bulk results."""
 
         # Bulk endpoint returns 200 games (more than limit)
         bulk_response = {
@@ -1555,8 +1554,8 @@ class TestTagCrossValidation:
         client = SteamSpyClient(mock_http)
         result = await client.aggregate_engagement(tag="Indie")
 
-        # Should validate at most TAG_VALIDATION_LIMIT games
-        assert appdetails_call_count <= TAG_VALIDATION_LIMIT
+        # Should validate all 200 bulk games (no cap)
+        assert appdetails_call_count == 200
         assert isinstance(result, AggregateEngagementData)
 
     @pytest.mark.asyncio
