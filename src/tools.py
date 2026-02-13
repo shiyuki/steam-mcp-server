@@ -34,15 +34,22 @@ def register_tools(mcp: FastMCP):
     logger.info("Initializing MCP tools with per-host rate limiting and TTL cache")
 
     @mcp.tool()
-    async def search_genre(genre: str, limit: int = 10) -> str:
-        """Search Steam games by genre/tag and return AppIDs.
+    async def search_genre(genre: str, limit: int = 10, sort_by: str = "owners") -> str:
+        """Search Steam games by genre/tag and return enriched per-game summaries.
+
+        Returns per-game data (name, owners, CCU, price, review score, playtime) alongside AppIDs.
+        Fields come from SteamSpy bulk endpoint - for per-game tag weights, use fetch_engagement(appid).
+
+        For niche tags (<5000 games), applies cross-validation to filter false positives.
+        For broad tags (>=5000 games), uses bulk data as-is for coverage.
 
         Args:
             genre: Steam tag to search (e.g., "Roguelike", "Action", "RPG")
-            limit: Maximum number of results (1-10000, default 10). Use 0 to return all matching AppIDs.
+            limit: Maximum number of results (1-10000, default 10). Use 0 to return all matching games.
+            sort_by: Sort field - "owners" (default), "ccu", "price", "review_score"
 
         Returns:
-            JSON string with list of Steam AppIDs matching the genre
+            JSON string with enriched game summaries (games list) and AppIDs (for backward compatibility)
         """
         # Input validation
         if not genre or not genre.strip():
@@ -50,16 +57,21 @@ def register_tools(mcp: FastMCP):
 
         # Handle 0 as "return all"
         return_all = (limit == 0)
-        
+
         # Validate limit if not returning all
         if not return_all and not 1 <= limit <= 10000:
             return json.dumps({"error": "limit must be between 1 and 10000, or 0 for all results", "error_type": "validation"})
-        
+
+        # Validate sort_by
+        valid_sort_fields = ["owners", "ccu", "price", "review_score"]
+        if sort_by not in valid_sort_fields:
+            return json.dumps({"error": f"sort_by must be one of: {', '.join(valid_sort_fields)}", "error_type": "validation"})
+
         limit_value = None if return_all else limit
 
         limit_str = "all" if return_all else str(limit)
-        logger.info("Searching for genre: %s, limit: %s", genre, limit_str)
-        result = await _steamspy.search_by_tag(genre.strip(), limit_value)
+        logger.info("Searching for genre: %s, limit: %s, sort_by: %s", genre, limit_str, sort_by)
+        result = await _steamspy.search_by_tag(genre.strip(), limit_value, sort_by)
 
         if isinstance(result, APIError):
             return json.dumps(result.model_dump())

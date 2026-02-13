@@ -106,17 +106,23 @@ class SteamSpyClient:
         bowling_matches = len(BOWLING_FALLBACK_APPIDS & appids_in_response)
         return bowling_matches >= 2
 
-    async def search_by_tag(self, tag: str, limit: int | None = 10) -> SearchResult | APIError:
-        """Search for games by tag using SteamSpy API.
+    async def search_by_tag(self, tag: str, limit: int | None = 10, sort_by: str = "owners") -> SearchResult | APIError:
+        """Search for games by tag using SteamSpy API with enriched per-game summaries.
+
+        Returns per-game summary data (name, owners, CCU, price, reviews, playtime) from
+        SteamSpy bulk endpoint. For niche tags (<5000 games), cross-validates via appdetails
+        to filter false positives. For per-game tag weights, use fetch_engagement(appid).
 
         Args:
             tag: Tag to search for (e.g., "roguelike", "indie")
-            limit: Maximum number of AppIDs to return (default: 10). Use None to return all results.
+            limit: Maximum number of games to return (default: 10). Use None to return all results.
+            sort_by: Sort field - "owners" (default), "ccu", "price", "review_score"
 
         Returns:
-            SearchResult with AppID list, or APIError on failure
+            SearchResult with enriched game summaries, or APIError on failure
         """
         # Normalize tag before API call
+        original_tag = tag
         tag = normalize_tag(tag)
 
         try:
@@ -136,14 +142,87 @@ class SteamSpyClient:
                     message=f"Tag '{tag}' not recognized by SteamSpy. The API returned default results instead of matching games. Try a different tag name or check Steam's tag list."
                 )
 
-            # SteamSpy returns {appid: {game_data}, ...}
-            all_appids = [int(appid) for appid in data.keys()]
-            # If limit is None, return all AppIDs; otherwise slice to limit
-            appids = all_appids if limit is None else all_appids[:limit]
+            # Import GameSummary here to avoid circular import at module level
+            from src.schemas import GameSummary
+
+            games_list = []
+
+            # Cross-validation for niche tags (<5000 games) to filter false positives
+            if len(data) < TAG_CROSSVAL_THRESHOLD:
+                logger.info(f"Niche tag '{tag}': {len(data)} games - applying cross-validation")
+
+                # Parse bulk data first (this is the data source for GameSummary)
+                bulk_games = []
+                for game_data in data.values():
+                    parsed = self._parse_game_data(game_data)
+                    bulk_games.append(parsed)
+
+                # Sort by owners before validation (prioritize high-value games)
+                bulk_games.sort(key=lambda g: g["owners_midpoint"], reverse=True)
+
+                # Validate ALL candidates via appdetails (which includes per-game tags)
+                candidate_appids = [g["appid"] for g in bulk_games]
+
+                # Fetch appdetails concurrently for tag validation
+                detail_tasks = [self.get_engagement_data(appid) for appid in candidate_appids]
+                results = await asyncio.gather(*detail_tasks, return_exceptions=True)
+
+                # Filter to games where searched tag is in their tag dict (case-insensitive)
+                # IMPORTANT: Build GameSummary from BULK PARSE DATA, not from appdetails
+                # Fallback: if appdetails fetch fails OR has no tags, INCLUDE the game (can't verify)
+                tag_lower = tag.lower()
+                for bulk_game, result in zip(bulk_games, results):
+                    if isinstance(result, EngagementData):
+                        # Successfully fetched appdetails
+                        if not result.tags:
+                            # No tags in response - can't validate, include the game
+                            games_list.append(GameSummary(**bulk_game))
+                        else:
+                            # Check if searched tag is in the game's tag list
+                            game_tag_names_lower = {t.lower() for t in result.tags.keys()}
+                            if tag_lower in game_tag_names_lower:
+                                # Tag confirmed - use bulk-parsed data for GameSummary (consistent field richness)
+                                games_list.append(GameSummary(**bulk_game))
+                            # else: Tag NOT found - this is a false positive, exclude it
+                    else:
+                        # Failed to fetch appdetails (APIError or Exception) - include game anyway
+                        # Can't verify it's a false positive, so err on the side of inclusion
+                        games_list.append(GameSummary(**bulk_game))
+
+                logger.info(f"Tag validation: {len(games_list)}/{len(bulk_games)} games confirmed with tag '{tag}'")
+            else:
+                # Broad tag: use bulk data as-is (no cross-validation for API efficiency)
+                logger.info(f"Broad tag '{tag}': {len(data)} games from bulk endpoint (>={TAG_CROSSVAL_THRESHOLD}, skipping cross-validation)")
+                for game_data in data.values():
+                    parsed = self._parse_game_data(game_data)
+                    games_list.append(GameSummary(**parsed))
+
+            # Sort by specified field
+            sort_key_map = {
+                "owners": lambda g: g.owners_midpoint,
+                "ccu": lambda g: g.ccu,
+                "price": lambda g: g.price,
+                "review_score": lambda g: g.review_score or 0
+            }
+            sort_key = sort_key_map.get(sort_by, sort_key_map["owners"])
+            games_list.sort(key=sort_key, reverse=True)
+
+            # Apply limit AFTER sorting (limit gets top-N by sort criteria)
+            limited_games = games_list if limit is None else games_list[:limit]
+
+            # Warn on large responses (>5000 games)
+            warning = None
+            if len(data) > 5000:
+                warning = f"Large result: {len(data)} games. Consider using a more specific tag or a lower limit."
+
             return SearchResult(
-                appids=appids,
+                appids=[g.appid for g in limited_games],  # Backward compat
+                games=limited_games,  # New enriched field
                 tag=tag,
                 total_found=len(data),
+                sort_by=sort_by,
+                result_size_warning=warning,
+                normalized_tag=tag if tag != original_tag else None,
                 fetched_at=fetched_at,
                 cache_age_seconds=cache_age
             )
@@ -329,9 +408,11 @@ class SteamSpyClient:
         positive = data.get("positive", 0)
         negative = data.get("negative", 0)
 
-        # Convert playtime from minutes to hours
+        # Convert playtime from minutes to hours (all 4 playtime fields)
         average_forever = data.get("average_forever", 0) / 60.0
         average_2weeks = data.get("average_2weeks", 0) / 60.0
+        median_forever = data.get("median_forever", 0) / 60.0
+        median_2weeks = data.get("median_2weeks", 0) / 60.0
 
         # Convert price from cents to dollars
         price_str = data.get("price", "0")
@@ -347,14 +428,20 @@ class SteamSpyClient:
         return {
             "appid": int(data.get("appid", 0)),
             "name": data.get("name", ""),
+            "developer": data.get("developer", ""),
+            "publisher": data.get("publisher", ""),
             "ccu": ccu,
             "owners_midpoint": owners_midpoint,
-            "average_forever": average_forever,
+            "average_playtime": average_forever,
+            "median_playtime": median_forever,
             "average_2weeks": average_2weeks,
+            "median_2weeks": median_2weeks,
             "positive": positive,
             "negative": negative,
             "review_score": review_score,
-            "price": price
+            "price": price,
+            "score_rank": data.get("score_rank", ""),
+            "userscore": data.get("userscore", 0)
         }
 
     async def aggregate_engagement(

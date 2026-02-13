@@ -170,7 +170,8 @@ class TestPerHostIsolation:
             mock_response.status_code = 200
 
             if "steamspy.com" in url:
-                mock_response.json.return_value = {"646570": {"name": "Game1"}}
+                # Return 5000+ games to bypass cross-validation (for timing accuracy)
+                mock_response.json.return_value = {str(i): {"name": f"Game{i}"} for i in range(5000)}
             else:
                 mock_response.json.return_value = {
                     "646570": {"success": True, "data": {"name": "Game2"}}

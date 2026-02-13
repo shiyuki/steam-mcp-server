@@ -1375,7 +1375,7 @@ class TestBowlingFallbackDetection:
     @pytest.mark.asyncio
     async def test_tag_normalization_applied_in_search(self, mock_http):
         """Test tag normalization is applied before API call in search_by_tag."""
-        # Return valid data
+        # Return valid data (2 games triggers cross-validation <5000 threshold)
         valid_data = {
             "646570": {"name": "Slay the Spire"},
             "2379780": {"name": "Balatro"},
@@ -1389,10 +1389,11 @@ class TestBowlingFallbackDetection:
         client = SteamSpyClient(mock_http)
         result = await client.search_by_tag("Roguelike")
 
-        # Verify the API was called with normalized tag
-        mock_http.get_with_metadata.assert_called_once()
-        call_args = mock_http.get_with_metadata.call_args
-        assert call_args[1]["params"]["tag"] == "Rogue-like"
+        # Verify the FIRST API call (bulk tag search) used normalized tag
+        # Note: Cross-validation for niche tags makes additional appdetails calls
+        assert mock_http.get_with_metadata.call_count >= 1
+        first_call_args = mock_http.get_with_metadata.call_args_list[0]
+        assert first_call_args[1]["params"]["tag"] == "Rogue-like"
 
     @pytest.mark.asyncio
     async def test_tag_normalization_applied_in_aggregation(self, mock_http):
