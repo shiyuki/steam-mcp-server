@@ -127,6 +127,7 @@ class GameEngagementSummary(BaseModel):
     negative: int = 0
     review_score: float | None = None
     price: float = 0
+    tags: dict[str, int] = Field(default_factory=dict)  # Tag name -> weight (from appdetails validation)
 
 
 class AggregateEngagementData(CachedResponse):
