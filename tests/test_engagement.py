@@ -1170,8 +1170,8 @@ class TestTagNormalization:
 def _create_bowling_fallback_data() -> dict:
     """Helper to generate mock bowling fallback data (~70 games with known bowling AppIDs)."""
     data = {}
-    # Add known bowling AppIDs (fingerprint)
-    bowling_appids = [436590, 212370, 340170]
+    # Add known bowling AppIDs (fingerprint) - real AppIDs from SteamSpy's bowling fallback
+    bowling_appids = [901583, 12210, 2990, 891040, 22230]
     for appid in bowling_appids:
         data[str(appid)] = {
             "appid": str(appid),
@@ -1186,7 +1186,7 @@ def _create_bowling_fallback_data() -> dict:
         }
 
     # Add filler games to reach ~70 total
-    for i in range(100000, 100067):
+    for i in range(100000, 100065):
         data[str(i)] = {
             "appid": str(i),
             "name": f"Game {i}",
@@ -1256,9 +1256,9 @@ class TestBowlingFallbackDetection:
     @pytest.mark.asyncio
     async def test_large_result_set_not_flagged(self, mock_http):
         """Test large result set (500+ games) not flagged even if bowling AppIDs present."""
-        # Create 500 games including bowling AppIDs
+        # Create 500 games including bowling AppIDs (real AppIDs from SteamSpy's bowling fallback)
         large_data = {}
-        bowling_appids = [436590, 212370, 340170]
+        bowling_appids = [901583, 12210, 2990, 891040, 22230]
         for appid in bowling_appids:
             large_data[str(appid)] = {
                 "appid": str(appid),
@@ -1272,7 +1272,7 @@ class TestBowlingFallbackDetection:
                 "price": "999"
             }
 
-        for i in range(300000, 300497):
+        for i in range(300000, 300495):
             large_data[str(i)] = {
                 "appid": str(i),
                 "name": f"Game {i}",

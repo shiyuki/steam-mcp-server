@@ -61,7 +61,8 @@ def normalize_tag(tag: str) -> str:
 
 
 # Bowling fallback detection: Known AppIDs in SteamSpy's default fallback set
-BOWLING_FALLBACK_APPIDS = {436590, 212370, 340170}
+# These are empirically verified AppIDs from SteamSpy's actual bowling fallback response
+BOWLING_FALLBACK_APPIDS = {901583, 12210, 2990, 891040, 22230}
 
 
 class SteamSpyClient:
