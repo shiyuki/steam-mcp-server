@@ -94,8 +94,8 @@ class GameSummary(BaseModel):
     review_score: float | None = None  # Percentage (positive / total * 100)
     positive: int = 0
     negative: int = 0
-    average_playtime: float = 0  # Hours, converted from API minutes
-    median_playtime: float = 0  # Hours, converted from API minutes
+    average_forever: float = 0  # Hours, converted from API minutes
+    median_forever: float = 0  # Hours, converted from API minutes
     average_2weeks: float = 0  # Hours, converted from API minutes
     median_2weeks: float = 0  # Hours, converted from API minutes
     score_rank: str = ""

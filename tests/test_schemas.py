@@ -81,8 +81,8 @@ class TestGameSummary:
             review_score=95.5,
             positive=50000,
             negative=2000,
-            average_playtime=25.5,
-            median_playtime=12.0
+            average_forever=25.5,
+            median_forever=12.0
         )
         assert summary.appid == 646570
         assert summary.name == "Slay the Spire"
@@ -102,8 +102,8 @@ class TestGameSummary:
         assert summary.review_score is None
         assert summary.positive == 0
         assert summary.negative == 0
-        assert summary.average_playtime == 0
-        assert summary.median_playtime == 0
+        assert summary.average_forever == 0
+        assert summary.median_forever == 0
 
     def test_ignores_extra_fields(self):
         summary = GameSummary(

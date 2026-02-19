@@ -136,8 +136,8 @@ class TestSearchGenreEnrichment:
         assert game1.positive == 50000
         assert game1.negative == 2000
         assert game1.review_score == pytest.approx(96.15, abs=0.1)  # positive/(positive+negative)*100
-        assert game1.average_playtime == pytest.approx(25.5, abs=0.1)  # hours
-        assert game1.median_playtime == pytest.approx(12.0, abs=0.1)  # hours
+        assert game1.average_forever == pytest.approx(25.5, abs=0.1)  # hours
+        assert game1.median_forever == pytest.approx(12.0, abs=0.1)  # hours
 
     @pytest.mark.asyncio
     async def test_sort_by_ccu(self):

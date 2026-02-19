@@ -135,7 +135,7 @@ def register_tools(mcp: FastMCP):
         Derived metrics (numeric ratios, Claude interprets significance):
         - ccu_ratio: CCU / owners_midpoint * 100 (% of owners currently playing; <1% low engagement, >5% cult following)
         - review_score: positive / total_reviews * 100 (% positive reviews)
-        - playtime_engagement: median_playtime / average_playtime (distribution skew; <1 means long-tail outliers inflate average)
+        - playtime_engagement: median_forever / average_forever (distribution skew; <1 means long-tail outliers inflate average)
         - activity_ratio: average_2weeks / average_forever * 100 (% of lifetime playtime happening recently; high = still active)
 
         Quality flags per ambiguous numeric field: "available" = real measurement, "zero_uncertain" = likely no data.
