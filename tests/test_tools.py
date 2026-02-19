@@ -13,10 +13,11 @@ def _make_search_genre(steamspy_mock):
     async def search_genre(genre: str, limit: int = 10) -> str:
         if not genre or not genre.strip():
             return json.dumps({"error": "genre is required", "error_type": "validation"})
-        if not 1 <= limit <= 100:
-            return json.dumps({"error": "limit must be between 1 and 100", "error_type": "validation"})
+        return_all = (limit == 0)
+        if not return_all and not 1 <= limit <= 10000:
+            return json.dumps({"error": "limit must be between 1 and 10000, or 0 for all results", "error_type": "validation"})
 
-        result = await steamspy_mock.search_by_tag(genre.strip(), limit)
+        result = await steamspy_mock.search_by_tag(genre.strip(), None if return_all else limit)
         if isinstance(result, APIError):
             return json.dumps(result.model_dump())
         # Use model_dump with mode='json' to serialize datetime
@@ -55,16 +56,27 @@ class TestSearchGenreValidation:
         assert result["error_type"] == "validation"
 
     @pytest.mark.asyncio
-    async def test_limit_zero_returns_error(self):
-        fn = _make_search_genre(AsyncMock())
+    async def test_limit_zero_returns_all_results(self):
+        """limit=0 means 'return all' in production — should succeed, not error."""
+        mock = AsyncMock()
+        mock.search_by_tag.return_value = SearchResult(
+            appids=[1, 2, 3],
+            tag="Action",
+            total_found=3,
+            fetched_at=datetime.now(timezone.utc),
+            games=[]
+        )
+        fn = _make_search_genre(mock)
         result = json.loads(await fn("Action", limit=0))
-        assert result["error_type"] == "validation"
-        assert "limit must be between 1 and 100" in result["error"]
+        assert "error_type" not in result
+        assert result["tag"] == "Action"
+        # Verify None passed as limit (means return all)
+        mock.search_by_tag.assert_called_once_with("Action", None)
 
     @pytest.mark.asyncio
-    async def test_limit_over_100_returns_error(self):
+    async def test_limit_over_10000_returns_error(self):
         fn = _make_search_genre(AsyncMock())
-        result = json.loads(await fn("Action", limit=101))
+        result = json.loads(await fn("Action", limit=10001))
         assert result["error_type"] == "validation"
 
     @pytest.mark.asyncio
