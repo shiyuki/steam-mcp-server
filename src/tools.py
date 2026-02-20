@@ -1,13 +1,15 @@
 """MCP tool definitions for Steam API."""
 
+import asyncio
 import json
+from datetime import datetime, timezone
 from mcp.server.fastmcp import FastMCP
 
 from src.http_client import CachedAPIClient
 from src.cache import TTLCache
 from src.rate_limiter import HostRateLimiter
 from src.steam_api import SteamSpyClient, SteamStoreClient, GamalyticClient
-from src.schemas import APIError
+from src.schemas import APIError, SearchResult, GameSummary, EngagementData
 from src.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -32,6 +34,110 @@ def register_tools(mcp: FastMCP):
     _gamalytic = GamalyticClient(_http_client)
 
     logger.info("Initializing MCP tools with per-host rate limiting and TTL cache")
+
+    # Sort key functions for GameSummary objects
+    _sort_keys = {
+        "owners": lambda g: g.owners_midpoint,
+        "ccu": lambda g: g.ccu,
+        "price": lambda g: g.price,
+        "review_score": lambda g: (g.review_score if g.review_score is not None else 0),
+    }
+
+    async def _steam_store_fallback_search(
+        genre: str, limit: int | None, sort_by: str
+    ) -> SearchResult | APIError:
+        """Fall back to Steam Store tag search when SteamSpy tag search fails.
+
+        Resolves tag name to Steam tag ID, searches Steam Store for AppIDs,
+        then enriches each with SteamSpy per-game data.
+
+        Args:
+            genre: Tag name to search
+            limit: Max results (None for all)
+            sort_by: Sort field
+
+        Returns:
+            SearchResult with enriched games, or APIError
+        """
+        # Step 1: Resolve tag name to tag ID
+        tag_map = await _steam_store.get_tag_map()
+        if isinstance(tag_map, APIError):
+            return tag_map
+
+        tag_id = tag_map.get(genre.lower())
+        if tag_id is None:
+            return APIError(
+                error_code=404,
+                error_type="tag_not_found",
+                message=f"Tag '{genre}' not found in Steam's tag registry ({len(tag_map)} tags available)"
+            )
+
+        # Step 2: Search Steam Store for AppIDs
+        # Request more than limit to account for enrichment failures
+        request_count = min((limit or 50) * 2, 100)
+        search_result = await _steam_store.search_by_tag_ids([tag_id], count=request_count)
+        if isinstance(search_result, APIError):
+            return search_result
+
+        total_count, appids = search_result
+        if not appids:
+            return SearchResult(
+                fetched_at=datetime.now(timezone.utc),
+                cache_age_seconds=0,
+                appids=[],
+                tag=genre,
+                total_found=0,
+                games=[],
+                sort_by=sort_by,
+                normalized_tag=genre,
+            )
+
+        # Step 3: Enrich with SteamSpy per-game data (concurrent, rate-limited)
+        logger.info(f"Steam Store fallback: enriching {len(appids)} games for tag '{genre}'")
+        tasks = [_steamspy.get_engagement_data(appid) for appid in appids]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Step 4: Build GameSummary from EngagementData
+        games = []
+        enriched_appids = []
+        for result in results:
+            if isinstance(result, EngagementData):
+                games.append(GameSummary(
+                    appid=result.appid,
+                    name=result.name,
+                    developer=result.developer,
+                    publisher=result.publisher,
+                    owners_midpoint=result.owners_midpoint,
+                    ccu=result.ccu,
+                    price=result.price,
+                    review_score=result.review_score,
+                    positive=result.positive,
+                    negative=result.negative,
+                    average_forever=result.average_forever,
+                    median_forever=result.median_forever,
+                    average_2weeks=result.average_2weeks,
+                    median_2weeks=result.median_2weeks,
+                    score_rank=result.score_rank,
+                ))
+                enriched_appids.append(result.appid)
+
+        # Step 5: Sort and limit
+        sort_key = _sort_keys.get(sort_by, _sort_keys["owners"])
+        games.sort(key=sort_key, reverse=True)
+        if limit is not None:
+            games = games[:limit]
+            enriched_appids = [g.appid for g in games]
+
+        return SearchResult(
+            fetched_at=datetime.now(timezone.utc),
+            cache_age_seconds=0,
+            appids=enriched_appids,
+            tag=genre,
+            total_found=total_count,
+            games=games,
+            sort_by=sort_by,
+            normalized_tag=genre,
+        )
 
     @mcp.tool()
     async def search_genre(genre: str, limit: int = 10, sort_by: str = "owners") -> str:
@@ -72,6 +178,17 @@ def register_tools(mcp: FastMCP):
         limit_str = "all" if return_all else str(limit)
         logger.info("Searching for genre: %s, limit: %s, sort_by: %s", genre, limit_str, sort_by)
         result = await _steamspy.search_by_tag(genre.strip(), limit_value, sort_by)
+
+        # Fallback to Steam Store if SteamSpy fails or returns empty
+        needs_fallback = False
+        if isinstance(result, APIError):
+            needs_fallback = True
+        elif isinstance(result, SearchResult) and result.total_found == 0 and len(result.games) == 0:
+            needs_fallback = True
+
+        if needs_fallback:
+            logger.info(f"SteamSpy tag search failed for '{genre}', falling back to Steam Store")
+            result = await _steam_store_fallback_search(genre.strip(), limit_value, sort_by)
 
         if isinstance(result, APIError):
             return json.dumps(result.model_dump())
@@ -204,6 +321,24 @@ def register_tools(mcp: FastMCP):
             appids=appid_list,
             sort_by=sort_by
         )
+
+        # Fallback to Steam Store for tag-based aggregation when SteamSpy fails
+        if isinstance(result, APIError) and tag:
+            logger.info(f"SteamSpy aggregation failed for tag '{tag}', falling back to Steam Store")
+            tag_map = await _steam_store.get_tag_map()
+            if not isinstance(tag_map, APIError):
+                tag_id = tag_map.get(tag.lower())
+                if tag_id is not None:
+                    # Get a sample of AppIDs from Steam Store for aggregation
+                    search_result = await _steam_store.search_by_tag_ids([tag_id], count=50)
+                    if not isinstance(search_result, APIError):
+                        total_count, fallback_appids = search_result
+                        if fallback_appids:
+                            logger.info(f"Steam Store fallback: aggregating {len(fallback_appids)} games for tag '{tag}' (of {total_count} total)")
+                            result = await _steamspy.aggregate_engagement(
+                                appids=fallback_appids,
+                                sort_by=sort_by
+                            )
 
         if isinstance(result, APIError):
             return json.dumps(result.model_dump())

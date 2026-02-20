@@ -52,12 +52,13 @@ class CachedAPIClient:
         wait=wait_exponential(multiplier=1.5, min=1, max=10),
         retry=retry_if_exception_type((httpx.HTTPError, asyncio.TimeoutError)),
     )
-    async def _fetch(self, url: str, params: dict = None) -> dict:
+    async def _fetch(self, url: str, params: dict = None, headers: dict = None) -> dict:
         """Make a rate-limited GET request with retry. No caching.
 
         Args:
             url: The URL to request
             params: Optional query parameters
+            headers: Optional extra headers for the request
 
         Returns:
             dict: Parsed JSON response
@@ -68,24 +69,25 @@ class CachedAPIClient:
         """
         host = self._extract_host(url)
         await self.rate_limiter.acquire(host)
-        response = await self.client.get(url, params=params)
+        response = await self.client.get(url, params=params, headers=headers)
         response.raise_for_status()
         return response.json()
 
-    async def get(self, url: str, params: dict = None, cache_ttl: float = None) -> dict:
+    async def get(self, url: str, params: dict = None, cache_ttl: float = None, headers: dict = None) -> dict:
         """Make a cached, rate-limited GET request.
 
         Args:
             url: The URL to request
             params: Optional query parameters
             cache_ttl: Cache TTL in seconds. None uses cache default. 0 bypasses cache.
+            headers: Optional extra headers for the request
 
         Returns:
             dict: Parsed JSON response
         """
         if cache_ttl == 0:
             # Bypass cache, just fetch with rate limiting
-            return await self._fetch(url, params)
+            return await self._fetch(url, params, headers)
 
         host = self._extract_host(url)
         endpoint = url.split(host)[-1] if host else url
@@ -93,12 +95,12 @@ class CachedAPIClient:
 
         entry = await self.cache.get_or_fetch(
             key=cache_key,
-            fetch_func=lambda: self._fetch(url, params),
+            fetch_func=lambda: self._fetch(url, params, headers),
             ttl=cache_ttl,
         )
         return entry.value
 
-    async def get_with_metadata(self, url: str, params: dict = None, cache_ttl: float = None) -> tuple[dict, datetime, int]:
+    async def get_with_metadata(self, url: str, params: dict = None, cache_ttl: float = None, headers: dict = None) -> tuple[dict, datetime, int]:
         """Like get(), but also returns (data, fetched_at, cache_age_seconds).
 
         Use this when the caller needs freshness metadata for the response.
@@ -107,12 +109,13 @@ class CachedAPIClient:
             url: The URL to request
             params: Optional query parameters
             cache_ttl: Cache TTL in seconds. None uses cache default. 0 bypasses cache.
+            headers: Optional extra headers for the request
 
         Returns:
             Tuple of (data dict, fetched_at datetime, cache_age_seconds int)
         """
         if cache_ttl == 0:
-            data = await self._fetch(url, params)
+            data = await self._fetch(url, params, headers)
             return data, datetime.now(timezone.utc), 0
 
         host = self._extract_host(url)
@@ -121,7 +124,7 @@ class CachedAPIClient:
 
         entry = await self.cache.get_or_fetch(
             key=cache_key,
-            fetch_func=lambda: self._fetch(url, params),
+            fetch_func=lambda: self._fetch(url, params, headers),
             ttl=cache_ttl,
         )
         cache_age = int(time.monotonic() - entry.created_at)

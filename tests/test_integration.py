@@ -65,7 +65,7 @@ class TestCacheIntegration:
         api_client = CachedAPIClient(cache=cache, rate_limiter=rate_limiter)
 
         # Mock responses for two different AppIDs
-        async def mock_get(url, params=None):
+        async def mock_get(url, params=None, headers=None):
             mock_response = MagicMock()
             mock_response.status_code = 200
 
@@ -163,7 +163,7 @@ class TestPerHostIsolation:
         api_client = CachedAPIClient(cache=cache, rate_limiter=rate_limiter)
 
         # Mock responses
-        async def mock_get(url, params=None):
+        async def mock_get(url, params=None, headers=None):
             # Simulate network delay
             await asyncio.sleep(0.1)
             mock_response = MagicMock()
@@ -212,7 +212,7 @@ class TestErrorBehavior:
 
         call_count = 0
 
-        async def mock_get(url, params=None):
+        async def mock_get(url, params=None, headers=None):
             nonlocal call_count
             call_count += 1
 
@@ -265,7 +265,7 @@ class TestErrorBehavior:
         api_client = CachedAPIClient(cache=cache, rate_limiter=rate_limiter)
 
         # Mock that always fails
-        async def mock_get_error(url, params=None):
+        async def mock_get_error(url, params=None, headers=None):
             response = httpx.Response(
                 500,
                 request=httpx.Request("GET", url)

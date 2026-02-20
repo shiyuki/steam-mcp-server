@@ -1,6 +1,7 @@
 """Steam API clients for SteamSpy and Steam Store."""
 
 import asyncio
+import re
 import httpx
 from datetime import datetime, timezone
 from statistics import mean, median, quantiles
@@ -406,9 +407,9 @@ class SteamSpyClient:
                 negative=negative,
                 total_reviews=total_reviews,
                 price=price,
-                score_rank=data.get("score_rank", ""),
-                genre=data.get("genre", ""),
-                languages=data.get("languages", ""),
+                score_rank=str(data.get("score_rank", "")),
+                genre=data.get("genre", "") or "",
+                languages=data.get("languages", "") or "",
                 tags=tags,
                 ccu_ratio=ccu_ratio,
                 review_score=review_score,
@@ -499,7 +500,7 @@ class SteamSpyClient:
             "negative": negative,
             "review_score": review_score,
             "price": price,
-            "score_rank": data.get("score_rank", ""),
+            "score_rank": str(data.get("score_rank", "")),
             "userscore": data.get("userscore", 0)
         }
 
@@ -976,6 +977,89 @@ class SteamStoreClient:
                 error_code=502,
                 error_type="api_error",
                 message=str(e)
+            )
+
+    async def get_tag_map(self) -> dict[str, int] | APIError:
+        """Fetch Steam's tag registry and return a case-insensitive name→ID mapping.
+
+        Uses Steam Store's populartags endpoint which returns all ~446 tags.
+        Cached for 24 hours since tags rarely change.
+
+        Returns:
+            Dict mapping lowercase tag names to tag IDs, or APIError on failure
+        """
+        try:
+            data, fetched_at, cache_age = await self.http.get_with_metadata(
+                "https://store.steampowered.com/tagdata/populartags/english",
+                cache_ttl=86400  # 24 hour cache — tags rarely change
+            )
+            # Response: [{"tagid": 492, "name": "Indie"}, ...]
+            if not isinstance(data, list):
+                return APIError(
+                    error_code=502,
+                    error_type="api_error",
+                    message="Unexpected tag registry response format"
+                )
+            tag_map = {}
+            for entry in data:
+                name = entry.get("name", "")
+                tag_id = entry.get("tagid")
+                if name and tag_id is not None:
+                    tag_map[name.lower()] = int(tag_id)
+            return tag_map
+        except Exception as e:
+            logger.error(f"Failed to fetch Steam tag registry: {e}")
+            return APIError(
+                error_code=502,
+                error_type="api_error",
+                message=f"Failed to fetch Steam tag registry: {e}"
+            )
+
+    async def search_by_tag_ids(
+        self, tag_ids: list[int], start: int = 0, count: int = 50
+    ) -> tuple[int, list[int]] | APIError:
+        """Search Steam Store for games matching tag IDs.
+
+        Uses Steam Store's AJAX search endpoint. Supports multi-tag intersection
+        (games must have ALL specified tags). Returns total count and AppIDs.
+
+        Args:
+            tag_ids: List of Steam tag IDs to search (intersection if multiple)
+            start: Pagination offset (default 0)
+            count: Number of results per page (default 50, max ~50 per page)
+
+        Returns:
+            Tuple of (total_count, appid_list), or APIError on failure
+        """
+        try:
+            tags_param = ",".join(str(tid) for tid in tag_ids)
+            data, fetched_at, cache_age = await self.http.get_with_metadata(
+                "https://store.steampowered.com/search/results/",
+                params={
+                    "query": "",
+                    "start": str(start),
+                    "count": str(count),
+                    "tags": tags_param,
+                    "sort_by": "Reviews_DESC",
+                    "infinite": "1",
+                },
+                cache_ttl=3600,  # 1 hour cache
+                headers={"X-Requested-With": "XMLHttpRequest"},
+            )
+
+            total_count = data.get("total_count", 0)
+            results_html = data.get("results_html", "")
+
+            # Extract AppIDs from HTML: data-ds-appid="12345"
+            appids = [int(aid) for aid in re.findall(r'data-ds-appid="(\d+)"', results_html)]
+
+            return total_count, appids
+        except Exception as e:
+            logger.error(f"Steam Store search error: {e}")
+            return APIError(
+                error_code=502,
+                error_type="api_error",
+                message=f"Steam Store search error: {e}"
             )
 
 
