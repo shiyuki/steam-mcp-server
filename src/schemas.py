@@ -113,6 +113,7 @@ class SearchResult(CachedResponse):
     sort_by: str = "owners"  # Sort field applied to games list
     result_size_warning: str | None = None  # Warning for large result sets (>5000 games)
     normalized_tag: str | None = None  # Tag after normalization (shows what was actually queried)
+    data_source: str | None = None  # "steamspy" or "steam_store" — indicates which API provided the results
 
 
 class CommercialData(CachedResponse):
@@ -213,6 +214,7 @@ class AggregateEngagementData(CachedResponse):
     # Input identification
     tag: str | None = None  # If tag-based query
     appids_requested: list[int] | None = None  # If AppID-list query
+    data_source: str | None = None  # "steamspy" or "steam_store" — indicates which API provided the game list
 
     # Coverage metrics
     games_total: int  # Total games found/requested

@@ -90,6 +90,7 @@ def register_tools(mcp: FastMCP):
                 games=[],
                 sort_by=sort_by,
                 normalized_tag=genre,
+                data_source="steam_store",
             )
 
         # Step 3: Enrich with SteamSpy per-game data (concurrent, rate-limited)
@@ -137,6 +138,114 @@ def register_tools(mcp: FastMCP):
             games=games,
             sort_by=sort_by,
             normalized_tag=genre,
+            data_source="steam_store",
+        )
+
+    async def _multi_tag_search(
+        tags: list[str], limit: int | None, sort_by: str
+    ) -> SearchResult | APIError:
+        """Search for games matching ALL specified tags (intersection).
+
+        Resolves each tag name to a Steam tag ID, then uses Steam Store's
+        multi-tag search endpoint. Enriches results with SteamSpy per-game data.
+
+        Args:
+            tags: List of tag names (at least 2)
+            limit: Max results (None for all)
+            sort_by: Sort field
+
+        Returns:
+            SearchResult with data_source="steam_store", or APIError
+        """
+        # Step 1: Resolve all tag names to IDs
+        tag_map = await _steam_store.get_tag_map()
+        if isinstance(tag_map, APIError):
+            return tag_map
+
+        tag_ids = []
+        missing_tags = []
+        for tag in tags:
+            tag_id = tag_map.get(tag.lower())
+            if tag_id is None:
+                missing_tags.append(tag)
+            else:
+                tag_ids.append(tag_id)
+
+        if missing_tags:
+            return APIError(
+                error_code=404,
+                error_type="tag_not_found",
+                message=f"Tag(s) not found: {', '.join(missing_tags)} ({len(tag_map)} tags available)"
+            )
+
+        # Step 2: Search Steam Store with all tag IDs (intersection)
+        request_count = min((limit or 50) * 2, 100)
+        search_result = await _steam_store.search_by_tag_ids(tag_ids, count=request_count)
+        if isinstance(search_result, APIError):
+            return search_result
+
+        total_count, appids = search_result
+        combined_tag = ", ".join(tags)
+
+        if not appids:
+            return SearchResult(
+                fetched_at=datetime.now(timezone.utc),
+                cache_age_seconds=0,
+                appids=[],
+                tag=combined_tag,
+                total_found=0,
+                games=[],
+                sort_by=sort_by,
+                normalized_tag=combined_tag,
+                data_source="steam_store",
+            )
+
+        # Step 3: Enrich with SteamSpy per-game data
+        logger.info(f"Multi-tag search: enriching {len(appids)} games for tags {tags}")
+        tasks = [_steamspy.get_engagement_data(appid) for appid in appids]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Step 4: Build GameSummary from EngagementData
+        games = []
+        enriched_appids = []
+        for result in results:
+            if isinstance(result, EngagementData):
+                games.append(GameSummary(
+                    appid=result.appid,
+                    name=result.name,
+                    developer=result.developer,
+                    publisher=result.publisher,
+                    owners_midpoint=result.owners_midpoint,
+                    ccu=result.ccu,
+                    price=result.price,
+                    review_score=result.review_score,
+                    positive=result.positive,
+                    negative=result.negative,
+                    average_forever=result.average_forever,
+                    median_forever=result.median_forever,
+                    average_2weeks=result.average_2weeks,
+                    median_2weeks=result.median_2weeks,
+                    score_rank=result.score_rank,
+                ))
+                enriched_appids.append(result.appid)
+
+        # Step 5: Sort and limit
+        sort_key = _sort_keys.get(sort_by, _sort_keys["owners"])
+        games.sort(key=sort_key, reverse=True)
+        if limit is not None:
+            games = games[:limit]
+            enriched_appids = [g.appid for g in games]
+
+        return SearchResult(
+            fetched_at=datetime.now(timezone.utc),
+            cache_age_seconds=0,
+            appids=enriched_appids,
+            tag=combined_tag,
+            total_found=total_count,
+            games=games,
+            sort_by=sort_by,
+            normalized_tag=combined_tag,
+            data_source="steam_store",
         )
 
     @mcp.tool()
@@ -151,6 +260,8 @@ def register_tools(mcp: FastMCP):
 
         Args:
             genre: Steam tag to search (e.g., "Roguelike", "Action", "RPG")
+                   Supports comma-separated tags for intersection search (e.g., "Visual Novel, Choices Matter")
+                   Multi-tag searches use Steam Store and return games matching ALL specified tags.
             limit: Maximum number of results (1-10000, default 10). Use 0 to return all matching games.
             sort_by: Sort field - "owners" (default), "ccu", "price", "review_score"
 
@@ -175,6 +286,20 @@ def register_tools(mcp: FastMCP):
 
         limit_value = None if return_all else limit
 
+        # Parse tags — comma-separated for multi-tag intersection
+        tags = [t.strip() for t in genre.split(",") if t.strip()]
+        if not tags:
+            return json.dumps({"error": "genre is required", "error_type": "validation"})
+
+        # Multi-tag: always use Steam Store (SteamSpy doesn't support intersection)
+        if len(tags) > 1:
+            logger.info("Multi-tag search: %s, limit: %s, sort_by: %s", tags, limit_value or "all", sort_by)
+            result = await _multi_tag_search(tags, limit_value, sort_by)
+            if isinstance(result, APIError):
+                return json.dumps(result.model_dump())
+            return json.dumps(result.model_dump())
+
+        # Single tag: try SteamSpy first, then fallback
         limit_str = "all" if return_all else str(limit)
         logger.info("Searching for genre: %s, limit: %s, sort_by: %s", genre, limit_str, sort_by)
         result = await _steamspy.search_by_tag(genre.strip(), limit_value, sort_by)
@@ -192,6 +317,10 @@ def register_tools(mcp: FastMCP):
 
         if isinstance(result, APIError):
             return json.dumps(result.model_dump())
+
+        # Set data_source if not already set (fallback sets it, SteamSpy path doesn't)
+        if result.data_source is None:
+            result.data_source = "steamspy"
 
         return json.dumps(result.model_dump())
 
@@ -323,6 +452,7 @@ def register_tools(mcp: FastMCP):
         )
 
         # Fallback to Steam Store for tag-based aggregation when SteamSpy fails
+        used_fallback = False
         if isinstance(result, APIError) and tag:
             logger.info(f"SteamSpy aggregation failed for tag '{tag}', falling back to Steam Store")
             tag_map = await _steam_store.get_tag_map()
@@ -339,8 +469,11 @@ def register_tools(mcp: FastMCP):
                                 appids=fallback_appids,
                                 sort_by=sort_by
                             )
+                            used_fallback = True
 
         if isinstance(result, APIError):
             return json.dumps(result.model_dump())
+
+        result.data_source = "steam_store" if used_fallback else "steamspy"
 
         return json.dumps(result.model_dump())
