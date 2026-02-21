@@ -919,3 +919,140 @@ def compute_release_timing(games: list[dict]) -> ReleaseTimingResult | None:
         ),
     )
     return ReleaseTimingResult(quarterly=quarterly, monthly=monthly, meta=meta)
+
+
+def compute_sub_genres(
+    games: list[dict],
+    primary_tags: set[str] | None = None,
+    top_n: int = 20,
+) -> SubGenreResult | None:
+    """
+    ANALYTICS-09: Sub-genre breakdown by tag frequency.
+
+    Returns SubGenreResult with entries sorted by game_count descending.
+    Returns None if no games are provided.
+
+    Note: Sub-genres use the SAME tags as tag multipliers but are sorted by
+    frequency (game_count) rather than revenue correlation. This gives a
+    different view of the tag landscape — what's common vs what earns most.
+    """
+    if not games:
+        return None
+
+    tag_counts: dict[str, int] = defaultdict(int)
+    tag_revenues: dict[str, list[float]] = defaultdict(list)
+
+    for g in games:
+        top_tags = _get_top_tags(g.get("tags", {}), top_n=20)
+        revenue = g.get("revenue")
+        for tag in top_tags:
+            if primary_tags and tag in primary_tags:
+                continue
+            tag_counts[tag] += 1
+            if revenue is not None:
+                tag_revenues[tag].append(revenue)
+
+    if not tag_counts:
+        return None
+
+    # Dynamic minimum to avoid noise
+    min_games = max(3, len(games) // 20)
+
+    entries: list[SubGenreEntry] = []
+    for tag, count in tag_counts.items():
+        if count < min_games:
+            continue
+        revs = tag_revenues[tag]
+        success_count = sum(1 for r in revs if r >= SUCCESS_THRESHOLD)
+        success_rate = round(success_count / len(revs) * 100, 2) if revs else None
+        entries.append(SubGenreEntry(
+            tag=tag,
+            game_count=count,
+            avg_revenue=_safe_mean(revs),
+            median_revenue=_safe_median(revs),
+            success_rate=success_rate,
+        ))
+
+    # Sort by frequency descending (not revenue — that's tag_multipliers' job)
+    entries.sort(key=lambda e: e.game_count, reverse=True)
+    entries = entries[:top_n]
+
+    confidence = _confidence_level(len(games), high_threshold=100, medium_threshold=50)
+    meta = ConfidenceMeta(
+        confidence=confidence,
+        sample_size=len(games),
+        methodology=(
+            f"Tags sorted by frequency (game_count descending). "
+            f"Primary tags excluded. Min {min_games} games per tag required. "
+            f"Top {top_n} sub-genres returned."
+        ),
+    )
+    return SubGenreResult(sub_genres=entries, meta=meta)
+
+
+def compute_competitive_density(games: list[dict]) -> CompetitiveDensityResult | None:
+    """
+    ANALYTICS-10: Competitive density (game count and revenue trends) by year.
+
+    Returns CompetitiveDensityResult with yearly periods sorted ascending.
+    Returns None if no games have valid release dates.
+    """
+    if not games:
+        return None
+
+    today = date.today()
+    current_year = today.year
+
+    yearly_games: dict[int, list[dict]] = defaultdict(list)
+    pipeline_count = 0
+
+    for g in games:
+        release_date = g.get("release_date")
+        yq = _extract_year_quarter(release_date)
+        if yq is None:
+            continue
+        year, _ = yq
+        # Count pipeline: future-dated games
+        if year > current_year:
+            pipeline_count += 1
+        elif year == current_year:
+            # Check actual date to see if it's in the future
+            try:
+                release_dt = datetime.strptime(release_date, "%Y-%m-%d").date()
+                if release_dt > today:
+                    pipeline_count += 1
+            except (ValueError, TypeError):
+                pass
+        yearly_games[year].append(g)
+
+    if not yearly_games:
+        return None
+
+    periods: list[DensityPeriod] = []
+    for year, year_games in sorted(yearly_games.items()):
+        revenues = [g["revenue"] for g in year_games if g.get("revenue") is not None]
+        total_rev = sum(revenues) if revenues else 0
+        success_count = sum(1 for r in revenues if r >= SUCCESS_THRESHOLD)
+        success_rate = round(success_count / len(revenues) * 100, 2) if revenues else None
+        revenue_per_game_trend = round(total_rev / len(year_games), 2) if revenues else None
+        periods.append(DensityPeriod(
+            year=year,
+            game_count=len(year_games),
+            avg_revenue=_safe_mean(revenues),
+            revenue_per_game_trend=revenue_per_game_trend,
+            success_rate=success_rate,
+            partial=_is_partial_period(year, quarter=None, today=today),
+        ))
+
+    total_with_dates = sum(p.game_count for p in periods)
+    confidence = _confidence_level(total_with_dates, high_threshold=100, medium_threshold=50)
+    meta = ConfidenceMeta(
+        confidence=confidence,
+        sample_size=total_with_dates,
+        methodology=(
+            "Game count and revenue trends by release year. "
+            "Partial flag set for current and future years. "
+            "Pipeline = games with future release dates."
+        ),
+    )
+    return CompetitiveDensityResult(periods=periods, pipeline_count=pipeline_count, meta=meta)
