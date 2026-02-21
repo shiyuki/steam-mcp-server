@@ -7,7 +7,20 @@ from collections import defaultdict
 from datetime import date, datetime
 from math import floor
 
-from src.schemas import MethodologyNote
+from src.schemas import (
+    BracketStats,
+    ConfidenceMeta,
+    ConcentrationResult,
+    PriceBracketResult,
+    RevenueTier,
+    SuccessRateResult,
+    TagMultiplierEntry,
+    TagMultiplierResult,
+    TemporalPeriod,
+    TemporalTrendsResult,
+    TopNShare,
+    MethodologyNote,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -342,3 +355,197 @@ def _build_methodology(data_sources: list[str], skipped: list[str]) -> Methodolo
         data_sources=list(data_sources),
         skipped_metrics=list(skipped),
     )
+
+
+def _confidence_level(sample_size: int, high_threshold: int = 100, medium_threshold: int = 20) -> str:
+    """Returns 'high', 'medium', or 'low' based on sample size."""
+    if sample_size >= high_threshold:
+        return "high"
+    if sample_size >= medium_threshold:
+        return "medium"
+    return "low"
+
+
+# ---------------------------------------------------------------------------
+# Public compute functions (ANALYTICS-01 through ANALYTICS-05)
+# ---------------------------------------------------------------------------
+
+
+def compute_concentration(games: list[dict]) -> ConcentrationResult | None:
+    """
+    ANALYTICS-01: Revenue concentration metrics.
+
+    Returns ConcentrationResult with Gini coefficient, top-N revenue shares,
+    and revenue tier distribution. Returns None if no games have revenue data.
+    """
+    revenues = [g["revenue"] for g in games if g.get("revenue") is not None]
+    if not revenues:
+        return None
+
+    sorted_rev = sorted(revenues, reverse=True)
+    total = sum(sorted_rev)
+
+    # Build top-N shares
+    top_shares: dict[str, TopNShare] = {}
+    for n, key in [(10, "top_10"), (25, "top_25"), (50, "top_50"), (100, "top_100")]:
+        actual_count = min(n, len(sorted_rev))
+        top_sum = sum(sorted_rev[:actual_count])
+        share_pct = round(top_sum / total * 100, 2) if total > 0 else 0.0
+        top_shares[key] = TopNShare(count=actual_count, share_pct=share_pct)
+
+    # Compute Gini
+    gini = _gini_coefficient(revenues)
+
+    # Build revenue tier distribution
+    tier_buckets: dict[str, list[float]] = {label: [] for label, _, _ in REVENUE_TIERS}
+    for rev in revenues:
+        tier_label = _assign_revenue_tier(rev)
+        if tier_label is not None:
+            tier_buckets[tier_label].append(rev)
+
+    tiers: list[RevenueTier] = []
+    for label, min_r, max_r in REVENUE_TIERS:
+        bucket = tier_buckets[label]
+        tiers.append(RevenueTier(
+            label=label,
+            min_revenue=float(min_r),
+            max_revenue=float(max_r) if max_r is not None else None,
+            count=len(bucket),
+            total_revenue=sum(bucket),
+            no_data=(len(bucket) == 0),
+        ))
+
+    confidence = _confidence_level(len(revenues))
+    meta = ConfidenceMeta(
+        confidence=confidence,
+        sample_size=len(revenues),
+        methodology=(
+            "Revenue-based concentration. Revenue estimates from Gamalytic "
+            "with +/-20-50% variance."
+        ),
+    )
+    return ConcentrationResult(gini=gini, top_shares=top_shares, revenue_tiers=tiers, meta=meta)
+
+
+def compute_temporal_trends(games: list[dict]) -> TemporalTrendsResult | None:
+    """
+    ANALYTICS-02: Trends over time (yearly and quarterly).
+
+    Returns TemporalTrendsResult with per-year and per-quarter breakdowns.
+    Returns None if no games have valid release dates.
+    """
+    # Group by year and (year, quarter)
+    yearly_games: dict[int, list[dict]] = defaultdict(list)
+    quarterly_games: dict[tuple[int, int], list[dict]] = defaultdict(list)
+
+    for g in games:
+        yq = _extract_year_quarter(g.get("release_date"))
+        if yq is None:
+            continue
+        year, quarter = yq
+        yearly_games[year].append(g)
+        quarterly_games[(year, quarter)].append(g)
+
+    if not yearly_games:
+        return None
+
+    SUCCESS_THRESHOLD = 100_000
+
+    def _build_period_stats(period_games: list[dict], year: int, quarter: int | None) -> TemporalPeriod:
+        revenues = [g["revenue"] for g in period_games if g.get("revenue") is not None]
+        scores = [g["review_score"] for g in period_games if g.get("review_score") is not None]
+        total_rev = sum(revenues)
+        success_count = sum(1 for r in revenues if r >= SUCCESS_THRESHOLD)
+        success_rate = round(success_count / len(revenues) * 100, 2) if revenues else None
+        events = _get_quarter_events(quarter) if quarter is not None else []
+        return TemporalPeriod(
+            year=year,
+            quarter=quarter,
+            game_count=len(period_games),
+            avg_revenue=_safe_mean(revenues),
+            median_revenue=_safe_median(revenues),
+            avg_score=_safe_mean(scores),
+            total_revenue=total_rev,
+            success_rate=success_rate,
+            partial=_is_partial_period(year, quarter),
+            no_data=(len(period_games) == 0),
+            events=events,
+        )
+
+    yearly_list = sorted(
+        [_build_period_stats(gs, yr, None) for yr, gs in yearly_games.items()],
+        key=lambda p: p.year,
+    )
+    quarterly_list = sorted(
+        [_build_period_stats(gs, yr, q) for (yr, q), gs in quarterly_games.items()],
+        key=lambda p: (p.year, p.quarter),
+    )
+
+    total_games = sum(len(gs) for gs in yearly_games.values())
+    confidence = _confidence_level(total_games, high_threshold=100, medium_threshold=50)
+    meta = ConfidenceMeta(
+        confidence=confidence,
+        sample_size=total_games,
+        methodology="Year/quarter aggregations of release dates. Partial-period flag set for current and future periods.",
+    )
+    return TemporalTrendsResult(yearly=yearly_list, quarterly=quarterly_list, meta=meta)
+
+
+def compute_price_brackets(games: list[dict]) -> PriceBracketResult | None:
+    """
+    ANALYTICS-03: Revenue analysis by price bracket.
+
+    Returns PriceBracketResult with all 7 brackets. Brackets with no games
+    have no_data=True. Returns None if no games have price data.
+    """
+    SUCCESS_THRESHOLD = 100_000
+
+    # Collect per-bracket data
+    bracket_revenues: dict[str, list[float]] = {label: [] for label, _, _ in PRICE_BRACKETS}
+    bracket_scores: dict[str, list[float]] = {label: [] for label, _, _ in PRICE_BRACKETS}
+    bracket_counts: dict[str, int] = {label: 0 for label, _, _ in PRICE_BRACKETS}
+
+    total_with_price = 0
+    for g in games:
+        price = g.get("price")
+        if price is None:
+            continue
+        bracket_label = _assign_price_bracket(price)
+        if bracket_label is None:
+            continue
+        total_with_price += 1
+        bracket_counts[bracket_label] += 1
+        revenue = g.get("revenue")
+        if revenue is not None:
+            bracket_revenues[bracket_label].append(revenue)
+        score = g.get("review_score")
+        if score is not None:
+            bracket_scores[bracket_label].append(score)
+
+    if total_with_price == 0:
+        return None
+
+    brackets: list[BracketStats] = []
+    for label, _, _ in PRICE_BRACKETS:
+        count = bracket_counts[label]
+        revenues = bracket_revenues[label]
+        scores = bracket_scores[label]
+        success_count = sum(1 for r in revenues if r >= SUCCESS_THRESHOLD)
+        success_rate = round(success_count / len(revenues) * 100, 2) if revenues else None
+        brackets.append(BracketStats(
+            label=label,
+            count=count,
+            avg_revenue=_safe_mean(revenues),
+            median_revenue=_safe_median(revenues),
+            success_rate=success_rate,
+            avg_score=_safe_mean(scores),
+            no_data=(count == 0),
+        ))
+
+    confidence = _confidence_level(total_with_price, high_threshold=50, medium_threshold=20)
+    meta = ConfidenceMeta(
+        confidence=confidence,
+        sample_size=total_with_price,
+        methodology="Revenue grouped by price tier. Success = revenue >= $100K.",
+    )
+    return PriceBracketResult(brackets=brackets, meta=meta)
