@@ -549,3 +549,130 @@ def compute_price_brackets(games: list[dict]) -> PriceBracketResult | None:
         methodology="Revenue grouped by price tier. Success = revenue >= $100K.",
     )
     return PriceBracketResult(brackets=brackets, meta=meta)
+
+
+def _format_threshold_label(value: int) -> str:
+    """Convert integer threshold to compact label: 100000 -> '100k', 1000000 -> '1m', 10000000 -> '10m'."""
+    if value >= 1_000_000:
+        millions = value // 1_000_000
+        remainder = (value % 1_000_000) // 100_000
+        if remainder == 0:
+            return f"{millions}m"
+        return f"{millions}.{remainder}m"
+    if value >= 1_000:
+        thousands = value // 1_000
+        remainder = (value % 1_000) // 100
+        if remainder == 0:
+            return f"{thousands}k"
+        return f"{thousands}.{remainder}k"
+    return str(value)
+
+
+def compute_success_rates(
+    games: list[dict],
+    thresholds: list[int] | None = None,
+) -> SuccessRateResult | None:
+    """
+    ANALYTICS-04: Success rate tiers.
+
+    Returns SuccessRateResult with percentage of games above each revenue
+    threshold. Returns None if no games have revenue data.
+    """
+    if thresholds is None:
+        thresholds = DEFAULT_SUCCESS_THRESHOLDS
+
+    revenues = [g["revenue"] for g in games if g.get("revenue") is not None]
+    if not revenues:
+        return None
+
+    result: dict[str, float] = {}
+    for threshold in thresholds:
+        count_above = sum(1 for r in revenues if r >= threshold)
+        pct = round(count_above / len(revenues) * 100, 2)
+        label = _format_threshold_label(threshold)
+        result[label] = pct
+
+    confidence = _confidence_level(len(revenues))
+    meta = ConfidenceMeta(
+        confidence=confidence,
+        sample_size=len(revenues),
+        methodology="Percentage of games meeting revenue thresholds. Revenue estimates from Gamalytic.",
+    )
+    return SuccessRateResult(
+        thresholds=result,
+        total_with_revenue=len(revenues),
+        meta=meta,
+    )
+
+
+def compute_tag_multipliers(
+    games: list[dict],
+    primary_tags: set[str] | None = None,
+    top_n: int = 10,
+) -> TagMultiplierResult | None:
+    """
+    ANALYTICS-05: Tag co-occurrence revenue multipliers vs genre baseline.
+
+    Returns TagMultiplierResult with top-N booster and penalty tags.
+    Returns None if no games have revenue data or genre avg revenue is 0.
+    """
+    revenue_games = [(g, g["revenue"]) for g in games if g.get("revenue") is not None]
+    if not revenue_games:
+        return None
+
+    all_revenues = [rev for _, rev in revenue_games]
+    genre_avg = _safe_mean(all_revenues)
+    genre_median = _safe_median(all_revenues)
+
+    if not genre_avg:
+        return None
+
+    min_games = max(5, len(revenue_games) // 20)
+
+    # Accumulate per-tag revenues
+    tag_revenues: dict[str, list[float]] = defaultdict(list)
+    for g, rev in revenue_games:
+        top_tags = _get_top_tags(g.get("tags", {}), top_n=20)
+        for tag in top_tags:
+            if primary_tags and tag in primary_tags:
+                continue
+            tag_revenues[tag].append(rev)
+
+    # Build multiplier entries for tags with enough games
+    multipliers: list[TagMultiplierEntry] = []
+    for tag, tag_revs in tag_revenues.items():
+        if len(tag_revs) < min_games:
+            continue
+        mean_mult = round(statistics.mean(tag_revs) / genre_avg, 3)
+        median_mult = round(statistics.median(tag_revs) / genre_median, 3) if genre_median else 0.0
+        multipliers.append(TagMultiplierEntry(
+            tag=tag,
+            mean_multiplier=mean_mult,
+            median_multiplier=median_mult,
+            game_count=len(tag_revs),
+        ))
+
+    # Sort descending by mean multiplier
+    multipliers.sort(key=lambda e: e.mean_multiplier, reverse=True)
+
+    boosters = multipliers[:top_n]
+    # Penalties = bottom top_n, reversed so worst-penalty is first
+    penalties = list(reversed(multipliers[-top_n:])) if len(multipliers) >= top_n else list(reversed(multipliers))
+
+    confidence = _confidence_level(len(revenue_games), high_threshold=100, medium_threshold=50)
+    meta = ConfidenceMeta(
+        confidence=confidence,
+        sample_size=len(revenue_games),
+        methodology=(
+            f"Tag revenue multipliers vs genre baseline. "
+            f"Min {min_games} games per tag required. Primary tags excluded from comparison."
+        ),
+    )
+    return TagMultiplierResult(
+        boosters=boosters,
+        penalties=penalties,
+        genre_avg_revenue=genre_avg,
+        genre_median_revenue=genre_median,
+        min_games_threshold=min_games,
+        meta=meta,
+    )
