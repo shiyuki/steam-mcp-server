@@ -9,10 +9,19 @@ from math import floor
 
 from src.schemas import (
     BracketStats,
+    CompetitiveDensityResult,
     ConfidenceMeta,
     ConcentrationResult,
+    DensityPeriod,
     PriceBracketResult,
+    PublisherAnalysisResult,
+    PublisherGroup,
+    ReleaseTimingResult,
     RevenueTier,
+    ScoreRevenueBucket,
+    ScoreRevenueResult,
+    SubGenreEntry,
+    SubGenreResult,
     SuccessRateResult,
     TagMultiplierEntry,
     TagMultiplierResult,
@@ -676,3 +685,237 @@ def compute_tag_multipliers(
         min_games_threshold=min_games,
         meta=meta,
     )
+
+
+# ---------------------------------------------------------------------------
+# Public compute functions (ANALYTICS-06 through ANALYTICS-10)
+# ---------------------------------------------------------------------------
+
+_MONTH_LABELS: dict[int, str] = {
+    1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr",
+    5: "May", 6: "Jun", 7: "Jul", 8: "Aug",
+    9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec",
+}
+
+SUCCESS_THRESHOLD = 100_000
+
+
+def compute_score_revenue(games: list[dict]) -> ScoreRevenueResult | None:
+    """
+    ANALYTICS-06: Score-revenue correlation.
+
+    Returns ScoreRevenueResult with all 7 score range buckets and a
+    Pearson correlation coefficient. Returns None if no games have both
+    review_score and revenue data.
+    """
+    if not games:
+        return None
+
+    # Pre-initialize all 7 buckets keyed by label
+    bucket_revenues: dict[str, list[float]] = {label: [] for label, _, _ in SCORE_RANGES}
+
+    # Correlation data
+    corr_scores: list[float] = []
+    corr_revenues: list[float] = []
+
+    for g in games:
+        score = g.get("review_score")
+        revenue = g.get("revenue")
+        if score is None or revenue is None:
+            continue
+        label = _assign_score_range(score)
+        if label is not None:
+            bucket_revenues[label].append(revenue)
+        corr_scores.append(float(score))
+        corr_revenues.append(float(revenue))
+
+    if not corr_scores:
+        return None
+
+    # Build buckets
+    buckets: list[ScoreRevenueBucket] = []
+    for label, _, _ in SCORE_RANGES:
+        revs = bucket_revenues[label]
+        count = len(revs)
+        buckets.append(ScoreRevenueBucket(
+            label=label,
+            count=count,
+            avg_revenue=_safe_mean(revs),
+            median_revenue=_safe_median(revs),
+            no_data=(count == 0),
+        ))
+
+    # Correlation coefficient
+    correlation: float | None = None
+    if len(corr_scores) >= 2:
+        try:
+            correlation = round(statistics.correlation(corr_scores, corr_revenues), 4)
+        except statistics.StatisticsError:
+            correlation = None
+
+    confidence = _confidence_level(len(corr_scores), high_threshold=100, medium_threshold=20)
+    meta = ConfidenceMeta(
+        confidence=confidence,
+        sample_size=len(corr_scores),
+        methodology=(
+            "Pearson correlation between review score and revenue. "
+            "7 score range buckets: below_70, 70-74, 75-79, 80-84, 85-89, 90-94, 95-100."
+        ),
+    )
+    return ScoreRevenueResult(buckets=buckets, correlation=correlation, meta=meta)
+
+
+def compute_publisher_analysis(games: list[dict]) -> PublisherAnalysisResult | None:
+    """
+    ANALYTICS-07: Self-published vs third-party publisher breakdown.
+
+    Returns PublisherAnalysisResult with 3 groups. Returns None if no games
+    are provided.
+    """
+    if not games:
+        return None
+
+    group_revenues: dict[str, list[float]] = {
+        "self_published": [],
+        "third_party": [],
+        "unknown": [],
+    }
+    group_counts: dict[str, int] = {
+        "self_published": 0,
+        "third_party": 0,
+        "unknown": 0,
+    }
+
+    for g in games:
+        classification = _classify_publisher(
+            g.get("developer", "") or "",
+            g.get("publisher", "") or "",
+        )
+        group_counts[classification] += 1
+        revenue = g.get("revenue")
+        if revenue is not None:
+            group_revenues[classification].append(revenue)
+
+    total_games = sum(group_counts.values())
+    if total_games == 0:
+        return None
+
+    groups: list[PublisherGroup] = []
+    for label in ("self_published", "third_party", "unknown"):
+        count = group_counts[label]
+        revs = group_revenues[label]
+        success_count = sum(1 for r in revs if r >= SUCCESS_THRESHOLD)
+        success_rate = round(success_count / len(revs) * 100, 2) if revs else None
+        groups.append(PublisherGroup(
+            label=label,
+            count=count,
+            avg_revenue=_safe_mean(revs),
+            median_revenue=_safe_median(revs),
+            success_rate=success_rate,
+            no_data=(count == 0),
+        ))
+
+    confidence = _confidence_level(total_games, high_threshold=50, medium_threshold=20)
+    meta = ConfidenceMeta(
+        confidence=confidence,
+        sample_size=total_games,
+        methodology=(
+            "Self-published = developer matches publisher. "
+            "Third-party = field mismatch or on known publisher list. "
+            "Success = revenue >= $100K."
+        ),
+    )
+    return PublisherAnalysisResult(groups=groups, meta=meta)
+
+
+def compute_release_timing(games: list[dict]) -> ReleaseTimingResult | None:
+    """
+    ANALYTICS-08: Revenue analysis by release timing (quarterly and monthly).
+
+    Returns ReleaseTimingResult with Q1-Q4 and 12-month breakdowns.
+    Returns None if no games have valid release dates.
+    """
+    if not games:
+        return None
+
+    # Pre-initialize quarterly (1-4) and monthly (1-12) groups
+    quarterly_revenues: dict[int, list[float]] = {q: [] for q in range(1, 5)}
+    quarterly_scores: dict[int, list[float]] = {q: [] for q in range(1, 5)}
+    quarterly_counts: dict[int, int] = {q: 0 for q in range(1, 5)}
+
+    monthly_revenues: dict[int, list[float]] = {m: [] for m in range(1, 13)}
+    monthly_scores: dict[int, list[float]] = {m: [] for m in range(1, 13)}
+    monthly_counts: dict[int, int] = {m: 0 for m in range(1, 13)}
+
+    total_with_dates = 0
+
+    for g in games:
+        release_date = g.get("release_date")
+        yq = _extract_year_quarter(release_date)
+        month = _extract_month(release_date)
+        if yq is None or month is None:
+            continue
+        _, quarter = yq
+        total_with_dates += 1
+
+        quarterly_counts[quarter] += 1
+        revenue = g.get("revenue")
+        score = g.get("review_score")
+        if revenue is not None:
+            quarterly_revenues[quarter].append(revenue)
+            monthly_revenues[month].append(revenue)
+        if score is not None:
+            quarterly_scores[quarter].append(score)
+            monthly_scores[month].append(score)
+        monthly_counts[month] += 1
+
+    if total_with_dates == 0:
+        return None
+
+    # Build quarterly BracketStats
+    quarterly: list[BracketStats] = []
+    for q in range(1, 5):
+        count = quarterly_counts[q]
+        revs = quarterly_revenues[q]
+        scores = quarterly_scores[q]
+        success_count = sum(1 for r in revs if r >= SUCCESS_THRESHOLD)
+        success_rate = round(success_count / len(revs) * 100, 2) if revs else None
+        quarterly.append(BracketStats(
+            label=f"Q{q}",
+            count=count,
+            avg_revenue=_safe_mean(revs),
+            median_revenue=_safe_median(revs),
+            success_rate=success_rate,
+            avg_score=_safe_mean(scores),
+            no_data=(count == 0),
+        ))
+
+    # Build monthly BracketStats
+    monthly: list[BracketStats] = []
+    for m in range(1, 13):
+        count = monthly_counts[m]
+        revs = monthly_revenues[m]
+        scores = monthly_scores[m]
+        success_count = sum(1 for r in revs if r >= SUCCESS_THRESHOLD)
+        success_rate = round(success_count / len(revs) * 100, 2) if revs else None
+        monthly.append(BracketStats(
+            label=_MONTH_LABELS[m],
+            count=count,
+            avg_revenue=_safe_mean(revs),
+            median_revenue=_safe_median(revs),
+            success_rate=success_rate,
+            avg_score=_safe_mean(scores),
+            no_data=(count == 0),
+        ))
+
+    confidence = _confidence_level(total_with_dates, high_threshold=100, medium_threshold=50)
+    meta = ConfidenceMeta(
+        confidence=confidence,
+        sample_size=total_with_dates,
+        methodology=(
+            "Revenue grouped by release quarter and month. "
+            "Steam events: Next Fest (Feb/Jun/Oct), Summer Sale (Jun), Winter Sale (Dec). "
+            "Success = revenue >= $100K."
+        ),
+    )
+    return ReleaseTimingResult(quarterly=quarterly, monthly=monthly, meta=meta)
