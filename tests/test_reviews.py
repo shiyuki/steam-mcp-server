@@ -465,34 +465,43 @@ class TestHistogram:
         self.client = SteamReviewClient(self.mock_http)
 
     def test_histogram_all_buckets(self):
-        """Reviews spanning all 6 buckets should populate each bucket."""
+        """Reviews spanning all 7 buckets should populate each bucket."""
         reviews = [
-            make_raw_review(review_id="1", playtime_at_review=30),    # 0.5 hrs -> 0_2hr
-            make_raw_review(review_id="2", playtime_at_review=180),   # 3 hrs -> 2_5hr
-            make_raw_review(review_id="3", playtime_at_review=420),   # 7 hrs -> 5_10hr
-            make_raw_review(review_id="4", playtime_at_review=900),   # 15 hrs -> 10_20hr
-            make_raw_review(review_id="5", playtime_at_review=1800),  # 30 hrs -> 20_50hr
-            make_raw_review(review_id="6", playtime_at_review=3600),  # 60 hrs -> 50hr_plus
+            make_raw_review(review_id="1", playtime_at_review=30),    # 0.5 hrs -> 0_1hr
+            make_raw_review(review_id="2", playtime_at_review=90),    # 1.5 hrs -> 1_2hr
+            make_raw_review(review_id="3", playtime_at_review=180),   # 3 hrs -> 2_5hr
+            make_raw_review(review_id="4", playtime_at_review=420),   # 7 hrs -> 5_10hr
+            make_raw_review(review_id="5", playtime_at_review=900),   # 15 hrs -> 10_20hr
+            make_raw_review(review_id="6", playtime_at_review=1800),  # 30 hrs -> 20_50hr
+            make_raw_review(review_id="7", playtime_at_review=3600),  # 60 hrs -> 50hr_plus
         ]
         buckets = self.client._compute_histogram(reviews)
-        assert len(buckets) == 6
+        assert len(buckets) == 7
         assert all(b.count == 1 for b in buckets)
 
     def test_histogram_zero_playtime(self):
-        """Review with 0 playtime falls in 0_2hr bucket."""
+        """Review with 0 playtime falls in 0_1hr bucket."""
         reviews = [make_raw_review(review_id="1", playtime_at_review=0)]
         buckets = self.client._compute_histogram(reviews)
-        bucket_0_2 = next(b for b in buckets if b.label == "0_2hr")
-        assert bucket_0_2.count == 1
+        bucket_0_1 = next(b for b in buckets if b.label == "0_1hr")
+        assert bucket_0_1.count == 1
 
     def test_histogram_boundary_values(self):
         """Playtime exactly at boundary falls in the higher bucket (min <= x < max)."""
-        # 2.0 hours exactly -> 2_5hr (not 0_2hr, since 0_2hr is [0, 2))
-        reviews = [make_raw_review(review_id="1", playtime_at_review=120)]  # exactly 2 hrs
-        buckets = self.client._compute_histogram(reviews)
-        bucket_0_2 = next(b for b in buckets if b.label == "0_2hr")
-        bucket_2_5 = next(b for b in buckets if b.label == "2_5hr")
-        assert bucket_0_2.count == 0
+        # 1.0 hours exactly -> 1_2hr (not 0_1hr, since 0_1hr is [0, 1))
+        reviews_1hr = [make_raw_review(review_id="1", playtime_at_review=60)]  # exactly 1 hr
+        buckets_1hr = self.client._compute_histogram(reviews_1hr)
+        bucket_0_1 = next(b for b in buckets_1hr if b.label == "0_1hr")
+        bucket_1_2 = next(b for b in buckets_1hr if b.label == "1_2hr")
+        assert bucket_0_1.count == 0
+        assert bucket_1_2.count == 1
+
+        # 2.0 hours exactly -> 2_5hr (not 1_2hr, since 1_2hr is [1, 2))
+        reviews_2hr = [make_raw_review(review_id="2", playtime_at_review=120)]  # exactly 2 hrs
+        buckets_2hr = self.client._compute_histogram(reviews_2hr)
+        bucket_1_2_check = next(b for b in buckets_2hr if b.label == "1_2hr")
+        bucket_2_5 = next(b for b in buckets_2hr if b.label == "2_5hr")
+        assert bucket_1_2_check.count == 0
         assert bucket_2_5.count == 1
 
     def test_histogram_50_plus(self):
@@ -503,25 +512,35 @@ class TestHistogram:
         assert bucket_50_plus.count == 1
 
     def test_histogram_empty_reviews(self):
-        """Empty review list returns all-zero buckets."""
+        """Empty review list returns all-zero buckets (7 total)."""
         buckets = self.client._compute_histogram([])
-        assert len(buckets) == 6
+        assert len(buckets) == 7
         assert all(b.count == 0 for b in buckets)
         assert all(b.positive_count == 0 for b in buckets)
         assert all(b.negative_count == 0 for b in buckets)
 
     def test_histogram_positive_negative_split(self):
-        """Reviews with different voted_up values tracked per bucket."""
+        """Reviews with different voted_up values tracked per bucket.
+
+        30min=0.5hr -> 0_1hr (positive), 60min=1.0hr -> 1_2hr (positive),
+        90min=1.5hr -> 1_2hr (negative).
+        """
         reviews = [
             make_raw_review(review_id="1", playtime_at_review=60, voted_up=True),
             make_raw_review(review_id="2", playtime_at_review=90, voted_up=False),
             make_raw_review(review_id="3", playtime_at_review=30, voted_up=True),
         ]
         buckets = self.client._compute_histogram(reviews)
-        bucket_0_2 = next(b for b in buckets if b.label == "0_2hr")
-        assert bucket_0_2.count == 3
-        assert bucket_0_2.positive_count == 2
-        assert bucket_0_2.negative_count == 1
+        # 30min=0.5hr lands in 0_1hr (positive only)
+        bucket_0_1 = next(b for b in buckets if b.label == "0_1hr")
+        assert bucket_0_1.count == 1
+        assert bucket_0_1.positive_count == 1
+        assert bucket_0_1.negative_count == 0
+        # 60min=1.0hr and 90min=1.5hr land in 1_2hr (1 positive, 1 negative)
+        bucket_1_2 = next(b for b in buckets if b.label == "1_2hr")
+        assert bucket_1_2.count == 2
+        assert bucket_1_2.positive_count == 1
+        assert bucket_1_2.negative_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -843,11 +862,13 @@ class TestCompactMode:
         assert len(result.snippets) > 0
 
     @pytest.mark.asyncio
-    async def test_compact_three_perspectives(self):
-        """Compact mode produces perspective-labeled snippets: top_positive, top_negative, most_helpful.
+    async def test_compact_top2_positive_top1_negative(self):
+        """Compact mode returns exactly top 2 positive + top 1 negative snippets.
 
-        Note: dedup means most_helpful is omitted when it equals top_positive or top_negative.
-        With both positive and negative reviews, at minimum 2 distinct perspectives are returned.
+        With 3 reviews (id=1 pos votes=100, id=2 neg votes=50, id=3 pos votes=200):
+        - top_positive_1: review id=3 (200 votes, highest positive)
+        - top_positive_2: review id=1 (100 votes, second highest positive)
+        - top_negative: review id=2 (50 votes, only negative)
         """
         reviews = [
             make_raw_review(review_id="1", voted_up=True, votes_up=100),
@@ -857,13 +878,18 @@ class TestCompactMode:
         self.mock_http.get_with_metadata.side_effect = self._make_fetch_reviews_mocks(reviews)
 
         result = await self.client.fetch_reviews(appid=12345, detail_level="compact")
+        assert len(result.snippets) == 3
         perspectives = {s.perspective for s in result.snippets}
-        # top_positive and top_negative are always distinct (different sentiment)
-        assert "top_positive" in perspectives
+        assert "top_positive_1" in perspectives
+        assert "top_positive_2" in perspectives
         assert "top_negative" in perspectives
-        # All snippet perspectives must be valid values
-        valid_perspectives = {"top_positive", "top_negative", "most_helpful"}
-        assert perspectives.issubset(valid_perspectives)
+
+        # Verify ranking: top_positive_1 should have highest votes_up among positives
+        top_pos_1 = next(s for s in result.snippets if s.perspective == "top_positive_1")
+        top_pos_2 = next(s for s in result.snippets if s.perspective == "top_positive_2")
+        assert top_pos_1.votes_up >= top_pos_2.votes_up
+        assert top_pos_1.review_id == "3"  # 200 votes
+        assert top_pos_2.review_id == "1"  # 100 votes
 
     @pytest.mark.asyncio
     async def test_compact_snippet_length(self):
@@ -890,6 +916,39 @@ class TestCompactMode:
         assert result.meta is not None
         assert result.meta.detail_level == "compact"
         # The stats_limit for compact is 1000 (not 5000) — confirmed by meta detail_level
+
+    @pytest.mark.asyncio
+    async def test_compact_only_positive_reviews(self):
+        """Compact mode with all-positive reviews: at most 2 snippets, no top_negative."""
+        reviews = [
+            make_raw_review(review_id="1", voted_up=True, votes_up=100),
+            make_raw_review(review_id="2", voted_up=True, votes_up=200),
+            make_raw_review(review_id="3", voted_up=True, votes_up=50),
+        ]
+        self.mock_http.get_with_metadata.side_effect = self._make_fetch_reviews_mocks(reviews)
+
+        result = await self.client.fetch_reviews(appid=12345, detail_level="compact")
+        assert len(result.snippets) == 2  # Only 2 positive snippets, no negative
+        perspectives = {s.perspective for s in result.snippets}
+        assert "top_positive_1" in perspectives
+        assert "top_positive_2" in perspectives
+        assert "top_negative" not in perspectives
+
+    @pytest.mark.asyncio
+    async def test_compact_single_positive_one_negative(self):
+        """Compact mode with 1 positive + 1 negative: 2 snippets total."""
+        reviews = [
+            make_raw_review(review_id="1", voted_up=True, votes_up=100),
+            make_raw_review(review_id="2", voted_up=False, votes_up=50),
+        ]
+        self.mock_http.get_with_metadata.side_effect = self._make_fetch_reviews_mocks(reviews)
+
+        result = await self.client.fetch_reviews(appid=12345, detail_level="compact")
+        assert len(result.snippets) == 2
+        perspectives = {s.perspective for s in result.snippets}
+        assert "top_positive_1" in perspectives
+        assert "top_negative" in perspectives
+        assert "top_positive_2" not in perspectives  # Only 1 positive, no second slot
 
 
 # ---------------------------------------------------------------------------

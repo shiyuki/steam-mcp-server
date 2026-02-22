@@ -1341,7 +1341,8 @@ class SteamReviewClient:
 
     # Histogram bucket definitions: (label, min_hours, max_hours_exclusive_or_None)
     HISTOGRAM_BUCKETS = [
-        ("0_2hr", 0, 2),
+        ("0_1hr", 0, 1),
+        ("1_2hr", 1, 2),
         ("2_5hr", 2, 5),
         ("5_10hr", 5, 10),
         ("10_20hr", 10, 20),
@@ -2115,31 +2116,33 @@ class SteamReviewClient:
             fetched_at=fetched_at,
         )
 
-        # Compact mode: extract snippets
+        # Compact mode: top 2 positive + top 1 negative snippets
         snippets: list[ReviewSnippet] = []
         if detail_level == "compact":
             positive_reviews = [r for r in parsed_reviews if r.voted_up]
             negative_reviews = [r for r in parsed_reviews if not r.voted_up]
 
-            top_positive = max(positive_reviews, key=lambda r: r.votes_up, default=None)
-            top_negative = max(negative_reviews, key=lambda r: r.votes_up, default=None)
-            most_helpful = max(parsed_reviews, key=lambda r: r.votes_up, default=None)
+            # Sort by votes_up descending, take top N
+            positive_reviews.sort(key=lambda r: r.votes_up, reverse=True)
+            negative_reviews.sort(key=lambda r: r.votes_up, reverse=True)
 
-            seen_snippet_ids: set[str] = set()
-            for review, perspective in [
-                (top_positive, "top_positive"),
-                (top_negative, "top_negative"),
-                (most_helpful, "most_helpful"),
-            ]:
-                if review and review.review_id not in seen_snippet_ids:
-                    seen_snippet_ids.add(review.review_id)
-                    snippets.append(ReviewSnippet(
-                        review_id=review.review_id,
-                        text=review.text[:200],
-                        voted_up=review.voted_up,
-                        votes_up=review.votes_up,
-                        perspective=perspective,
-                    ))
+            for i, review in enumerate(positive_reviews[:2]):
+                snippets.append(ReviewSnippet(
+                    review_id=review.review_id,
+                    text=review.text[:200],
+                    voted_up=review.voted_up,
+                    votes_up=review.votes_up,
+                    perspective=f"top_positive_{i+1}",
+                ))
+
+            for review in negative_reviews[:1]:
+                snippets.append(ReviewSnippet(
+                    review_id=review.review_id,
+                    text=review.text[:200],
+                    voted_up=review.voted_up,
+                    votes_up=review.votes_up,
+                    perspective="top_negative",
+                ))
 
         # Assemble ReviewsData
         if detail_level == "compact":
