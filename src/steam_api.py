@@ -10,7 +10,9 @@ from html import unescape
 from src.http_client import CachedAPIClient
 from src.schemas import (
     GameMetadata, SearchResult, CommercialData, EngagementData, APIError,
-    AggregateEngagementData, MetricStats, GameEngagementSummary
+    AggregateEngagementData, MetricStats, GameEngagementSummary,
+    ReviewItem, ReviewsData, ReviewAggregates, PlaytimeBucket, SentimentPeriod,
+    ReviewsMeta, QueryParams, ReviewSnippet, EADateInfo,
 )
 from src.logging_config import get_logger
 
@@ -1328,3 +1330,242 @@ class GamalyticClient:
             )
             commercial_data.steamspy_implied_revenue = steamspy_implied_revenue
             commercial_data.gamalytic_revenue = gamalytic_midpoint
+
+
+class SteamReviewClient:
+    """Client for Steam Review API with cursor pagination and stats computation."""
+
+    REVIEW_URL = "https://store.steampowered.com/appreviews/{appid}"
+    GAMALYTIC_URL = "https://api.gamalytic.com/game/{appid}"
+    APPDETAILS_URL = "https://store.steampowered.com/api/appdetails"
+
+    # Histogram bucket definitions: (label, min_hours, max_hours_exclusive_or_None)
+    HISTOGRAM_BUCKETS = [
+        ("0_2hr", 0, 2),
+        ("2_5hr", 2, 5),
+        ("5_10hr", 5, 10),
+        ("10_20hr", 10, 20),
+        ("20_50hr", 20, 50),
+        ("50hr_plus", 50, None),
+    ]
+
+    # Steam review score descriptions (score 1-9)
+    SCORE_DESCRIPTIONS = {
+        1: "Overwhelmingly Negative",
+        2: "Very Negative",
+        3: "Negative",
+        4: "Mostly Negative",
+        5: "Mixed",
+        6: "Mostly Positive",
+        7: "Positive",
+        8: "Very Positive",
+        9: "Overwhelmingly Positive",
+    }
+
+    def __init__(self, http_client: CachedAPIClient):
+        self.http = http_client
+
+    # ---------------------------------------------------------------------------
+    # Low-level page fetching
+    # ---------------------------------------------------------------------------
+
+    async def _fetch_review_page(
+        self, appid: int, cursor: str, params: dict
+    ) -> tuple[dict, str]:
+        """Fetch a single page of reviews from the Steam Review API.
+
+        Args:
+            appid: Steam AppID
+            cursor: Pagination cursor ("*" for first page)
+            params: Base filter params to include
+
+        Returns:
+            Tuple of (response_data_dict, new_cursor_string)
+        """
+        full_params = {
+            "json": "1",
+            "num_per_page": "100",
+            "cursor": cursor,
+            **params,
+        }
+        data, _, _ = await self.http.get_with_metadata(
+            self.REVIEW_URL.format(appid=appid),
+            params=full_params,
+            cache_ttl=900,  # 15 minutes
+        )
+        new_cursor = data.get("cursor", "")
+        return (data, new_cursor)
+
+    async def _fetch_review_text(
+        self,
+        appid: int,
+        limit: int,
+        language: str,
+        review_type: str,
+        purchase_type: str,
+        filter_offtopic: bool,
+        day_range: int | None,
+        platform: str,
+        sort: str,
+    ) -> tuple[list[dict], dict | None, str, int]:
+        """Paginate the review text sequence (helpful-sort or recent-sort).
+
+        Args:
+            appid: Steam AppID
+            limit: Maximum number of reviews to return
+            language: Language filter (e.g. "english")
+            review_type: "all", "positive", or "negative"
+            purchase_type: "all", "steam", or "non_steam_purchase"
+            filter_offtopic: Whether to filter offtopic activity
+            day_range: Day range for recent reviews (Steam API param, None to omit)
+            platform: Platform filter ("all", "win", "mac", "linux") — local filter only
+            sort: "helpful" or "recent"
+
+        Returns:
+            Tuple of (raw_reviews_list, query_summary_or_None, last_cursor, pages_fetched)
+        """
+        base_params: dict = {
+            "filter": "all" if sort != "recent" else "recent",
+            "language": language,
+            "review_type": review_type,
+            "purchase_type": purchase_type,
+            "filter_offtopic_activity": "1" if filter_offtopic else "0",
+        }
+        if day_range is not None:
+            base_params["day_range"] = str(day_range)
+
+        cursor = "*"
+        seen_ids: set[str] = set()
+        all_reviews: list[dict] = []
+        pages_fetched = 0
+        max_pages = 50
+        query_summary: dict | None = None
+        partial = False
+
+        while pages_fetched < max_pages:
+            try:
+                data, cursor_new = await self._fetch_review_page(appid, cursor, base_params)
+            except Exception as e:
+                logger.warning(
+                    f"Review text pagination error for AppID {appid} at page {pages_fetched}: {e}"
+                )
+                partial = True
+                break
+
+            # Capture query_summary only on first page (cursor="*")
+            if pages_fetched == 0:
+                query_summary = data.get("query_summary", {})
+
+            page_reviews = data.get("reviews", [])
+
+            # Empty page signals exhaustion
+            if not page_reviews:
+                break
+
+            # Unchanged cursor signals exhaustion
+            if cursor_new == cursor and pages_fetched > 0:
+                break
+
+            # Dedup by recommendationid
+            for review in page_reviews:
+                rid = str(review.get("recommendationid", ""))
+                if rid and rid not in seen_ids:
+                    seen_ids.add(rid)
+                    all_reviews.append(review)
+
+            cursor = cursor_new
+            pages_fetched += 1
+
+            if len(all_reviews) >= limit:
+                break
+
+            await asyncio.sleep(0.1)  # 100ms inter-page delay
+
+        return (all_reviews[:limit], query_summary, cursor, pages_fetched)
+
+    # ---------------------------------------------------------------------------
+    # Review parsing and aggregation
+    # ---------------------------------------------------------------------------
+
+    def _parse_review(self, raw: dict) -> ReviewItem:
+        """Map a raw Steam review API dict to a ReviewItem schema object.
+
+        Args:
+            raw: Raw review dict from Steam API
+
+        Returns:
+            ReviewItem with all fields populated
+        """
+        author = raw.get("author", {})
+        raw_text = raw.get("review", "")
+        stripped = _strip_bbcode(raw_text)
+        text, truncated, full_length = _truncate_text(stripped, max_chars=1000)
+
+        # Convert playtime from minutes to hours
+        playtime_at_review = author.get("playtime_at_review", 0) / 60
+        playtime_total = author.get("playtime_forever", 0) / 60
+
+        dev_response = raw.get("developer_response")
+
+        return ReviewItem(
+            review_id=str(raw.get("recommendationid", "")),
+            text=text,
+            truncated=truncated,
+            full_length=full_length,
+            voted_up=raw.get("voted_up", False),
+            votes_up=raw.get("votes_up", 0),
+            votes_funny=raw.get("votes_funny", 0),
+            playtime_at_review=playtime_at_review,
+            playtime_total=playtime_total,
+            timestamp_created=raw.get("timestamp_created", 0),
+            timestamp_updated=raw.get("timestamp_updated", 0),
+            written_during_early_access=raw.get("written_during_early_access", False),
+            received_for_free=raw.get("received_for_free", False),
+            language=raw.get("language", "english"),
+            author_steamid=author.get("steamid", ""),
+            author_num_games_owned=author.get("num_games_owned", 0),
+            author_num_reviews=author.get("num_reviews", 0),
+            developer_response=dev_response if dev_response else None,
+        )
+
+    def _build_aggregates(
+        self, query_summary: dict, reviews: list[ReviewItem]
+    ) -> ReviewAggregates:
+        """Build ReviewAggregates from query_summary (covers ALL reviews, not just fetched).
+
+        Args:
+            query_summary: query_summary dict from Steam API first page
+            reviews: Fetched ReviewItem list (used for weighted ratio computation)
+
+        Returns:
+            ReviewAggregates with all fields populated
+        """
+        total_positive = query_summary.get("total_positive", 0)
+        total_negative = query_summary.get("total_negative", 0)
+        total_reviews = query_summary.get("total_reviews", 0)
+        review_score = query_summary.get("review_score", 0)
+        review_score_desc = self.SCORE_DESCRIPTIONS.get(review_score, "")
+        positive_ratio = (
+            (total_positive / total_reviews * 100) if total_reviews > 0 else None
+        )
+
+        # Helpfulness-weighted positive ratio from fetched reviews
+        total_votes_up_positive = sum(
+            r.votes_up for r in reviews if r.voted_up
+        )
+        total_votes_up_all = sum(r.votes_up for r in reviews)
+        weighted_positive_ratio = (
+            (total_votes_up_positive / total_votes_up_all * 100)
+            if total_votes_up_all > 0
+            else None
+        )
+
+        return ReviewAggregates(
+            total_positive=total_positive,
+            total_negative=total_negative,
+            total_reviews=total_reviews,
+            review_score=review_score,
+            review_score_desc=review_score_desc,
+            positive_ratio=positive_ratio,
+            weighted_positive_ratio=weighted_positive_ratio,
+        )
