@@ -72,8 +72,13 @@ def make_page_response(reviews, cursor="NEXT_CURSOR", query_summary=None):
     return resp
 
 
-def make_query_summary(total_positive=70000, total_negative=2000, total_reviews=72000, review_score=9):
-    """Create a query_summary dict."""
+def make_query_summary(total_positive=4000, total_negative=1000, total_reviews=5000, review_score=9):
+    """Create a query_summary dict.
+
+    Default total_reviews=5000 (below EA scan threshold of 10000) so tests
+    that use this helper don't accidentally trigger the EA-period scan.
+    Tests that specifically test EA-period behavior must pass total_reviews=90000+.
+    """
     return {
         "num_reviews": total_reviews,
         "review_score": review_score,
@@ -816,19 +821,25 @@ class TestCompactMode:
         1. text_page1 (first _fetch_review_page call in text_task)
         2. stats_page1 (first _fetch_review_page call in stats_task)
         3. gamalytic (_resolve_ea_dates single call)
-        4. lang_page (_fetch_language_distribution single call)
+        4. lang_page1 (lang_task 1st await, cursor="LANG_C1")
         5. text_page_empty (second call after asyncio.sleep in text_task)
         6. stats_empty (second call after asyncio.sleep in stats_task)
+        7. lang_page_empty (lang_task 2nd await, cursor="LANG_C1", reviews=[])
         """
         qs = make_query_summary()
         page1 = make_page_response(reviews, cursor="C1", query_summary=qs)
         page_empty = make_page_response([], cursor="C1")
         stats_page1 = make_page_response(reviews, cursor="S1")
         stats_empty = make_page_response([], cursor="S1")
-        lang_page = {
+        lang_page1 = {
             "success": 1,
-            "cursor": "*",
+            "cursor": "LANG_C1",
             "reviews": [make_raw_review(review_id=str(i)) for i in range(3)]
+        }
+        lang_page_empty = {
+            "success": 1,
+            "cursor": "LANG_C1",
+            "reviews": [],
         }
         gamalytic_data = {
             "EAReleaseDate": None,
@@ -838,12 +849,13 @@ class TestCompactMode:
             "earlyAccess": False,
         }
         return [
-            (page1, datetime.now(timezone.utc), 0),          # text page1
-            (stats_page1, datetime.now(timezone.utc), 0),    # stats page1
-            (gamalytic_data, datetime.now(timezone.utc), 0), # ea gamalytic
-            (lang_page, datetime.now(timezone.utc), 0),      # lang distribution
-            (page_empty, datetime.now(timezone.utc), 0),     # text page_empty
-            (stats_empty, datetime.now(timezone.utc), 0),    # stats empty
+            (page1, datetime.now(timezone.utc), 0),           # text page1
+            (stats_page1, datetime.now(timezone.utc), 0),     # stats page1
+            (gamalytic_data, datetime.now(timezone.utc), 0),  # ea gamalytic
+            (lang_page1, datetime.now(timezone.utc), 0),      # lang dist page1 (cursor=LANG_C1)
+            (page_empty, datetime.now(timezone.utc), 0),      # text page_empty
+            (stats_empty, datetime.now(timezone.utc), 0),     # stats empty
+            (lang_page_empty, datetime.now(timezone.utc), 0), # lang dist page2 (empty, stops)
         ]
 
     @pytest.mark.asyncio
@@ -968,8 +980,9 @@ class TestFetchReviews:
         """Standard side_effect list for 4-parallel API calls in fetch_reviews.
 
         asyncio.gather(text_task, stats_task, ea_task, lang_task) interleaving order:
-        1. text_page1, 2. stats_page1, 3. gamalytic, 4. lang_page,
-        5. text_page_empty (after sleep), 6. stats_empty (after sleep)
+        1. text_page1, 2. stats_page1, 3. gamalytic, 4. lang_page1 (cursor=LANG_C1),
+        5. text_page_empty (after sleep), 6. stats_empty (after sleep),
+        7. lang_page_empty (lang 2nd await, reviews=[] stops pagination)
         """
         if query_summary is None:
             query_summary = make_query_summary()
@@ -986,15 +999,17 @@ class TestFetchReviews:
         page_empty = make_page_response([], cursor="C1")
         stats_page1 = make_page_response(reviews, cursor="S1")
         stats_empty = make_page_response([], cursor="S1")
-        lang_page = {"success": 1, "cursor": "*", "reviews": lang_reviews}
+        lang_page1 = {"success": 1, "cursor": "LANG_C1", "reviews": lang_reviews}
+        lang_page_empty = {"success": 1, "cursor": "LANG_C1", "reviews": []}
 
         return [
-            (page1, datetime.now(timezone.utc), 0),          # text page1
-            (stats_page1, datetime.now(timezone.utc), 0),    # stats page1
-            (gamalytic_data, datetime.now(timezone.utc), 0), # ea gamalytic
-            (lang_page, datetime.now(timezone.utc), 0),      # lang distribution
-            (page_empty, datetime.now(timezone.utc), 0),     # text page_empty
-            (stats_empty, datetime.now(timezone.utc), 0),    # stats empty
+            (page1, datetime.now(timezone.utc), 0),             # text page1
+            (stats_page1, datetime.now(timezone.utc), 0),       # stats page1
+            (gamalytic_data, datetime.now(timezone.utc), 0),    # ea gamalytic
+            (lang_page1, datetime.now(timezone.utc), 0),        # lang dist page1 (cursor=LANG_C1)
+            (page_empty, datetime.now(timezone.utc), 0),        # text page_empty
+            (stats_empty, datetime.now(timezone.utc), 0),       # stats empty
+            (lang_page_empty, datetime.now(timezone.utc), 0),   # lang dist page2 (empty, stops)
         ]
 
     @pytest.mark.asyncio
@@ -1043,8 +1058,9 @@ class TestFetchReviews:
         """First page OK, second page throws → partial result with partial data.
 
         asyncio.gather interleaving:
-        1. text page1 (OK), 2. stats page1 (OK), 3. gamalytic, 4. lang_page,
-        5. text page2 (HTTP ERROR → caught, loop breaks), 6. stats empty
+        1. text page1 (OK), 2. stats page1 (OK), 3. gamalytic, 4. lang_page1 (cursor=LANG_C1),
+        5. text page2 (HTTP ERROR → caught, loop breaks), 6. stats empty,
+        7. lang_page_empty (lang 2nd await, reviews=[] stops pagination)
         """
         import httpx
         reviews_page1 = [make_raw_review(review_id=str(i)) for i in range(5)]
@@ -1061,15 +1077,17 @@ class TestFetchReviews:
         }
         stats_page1 = make_page_response(reviews_page1, cursor="S1")
         stats_empty = make_page_response([], cursor="S1")
-        lang_page = {"success": 1, "cursor": "*", "reviews": reviews_page1}
+        lang_page1 = {"success": 1, "cursor": "LANG_C1", "reviews": reviews_page1}
+        lang_page_empty = {"success": 1, "cursor": "LANG_C1", "reviews": []}
 
         self.mock_http.get_with_metadata.side_effect = [
-            (page1, datetime.now(timezone.utc), 0),           # text page1
-            (stats_page1, datetime.now(timezone.utc), 0),     # stats page1
-            (gamalytic_data, datetime.now(timezone.utc), 0),  # gamalytic
-            (lang_page, datetime.now(timezone.utc), 0),       # lang dist
+            (page1, datetime.now(timezone.utc), 0),             # text page1
+            (stats_page1, datetime.now(timezone.utc), 0),       # stats page1
+            (gamalytic_data, datetime.now(timezone.utc), 0),    # gamalytic
+            (lang_page1, datetime.now(timezone.utc), 0),        # lang dist page1 (cursor=LANG_C1)
             httpx.HTTPStatusError("Server Error", request=req, response=resp),  # text page2 error
-            (stats_empty, datetime.now(timezone.utc), 0),     # stats empty
+            (stats_empty, datetime.now(timezone.utc), 0),       # stats empty
+            (lang_page_empty, datetime.now(timezone.utc), 0),   # lang dist page2 (empty, stops)
         ]
 
         result = await self.client.fetch_reviews(appid=12345, limit=1000)
@@ -1095,7 +1113,7 @@ class TestFetchReviews:
 
     @pytest.mark.asyncio
     async def test_language_distribution_populated(self):
-        """Language distribution dict populated from API."""
+        """Language distribution dict populated from API (paginated, 2 pages consumed)."""
         reviews = [
             make_raw_review(review_id="1", language="english"),
             make_raw_review(review_id="2", language="english"),
@@ -1109,16 +1127,18 @@ class TestFetchReviews:
         page_empty = make_page_response([], cursor="C1")
         stats_page1 = make_page_response(reviews, cursor="S1")
         stats_empty = make_page_response([], cursor="S1")
-        lang_page = {"success": 1, "cursor": "*", "reviews": reviews}
+        lang_page1 = {"success": 1, "cursor": "LANG_C1", "reviews": reviews}
+        lang_page_empty = {"success": 1, "cursor": "LANG_C1", "reviews": []}
 
-        # Correct order: text_page1, stats_page1, gamalytic, lang_page, text_empty, stats_empty
+        # Correct order: text_page1, stats_page1, gamalytic, lang_page1, text_empty, stats_empty, lang_page_empty
         self.mock_http.get_with_metadata.side_effect = [
-            (page1, datetime.now(timezone.utc), 0),           # text page1
-            (stats_page1, datetime.now(timezone.utc), 0),     # stats page1
-            (gamalytic_data, datetime.now(timezone.utc), 0),  # gamalytic
-            (lang_page, datetime.now(timezone.utc), 0),       # lang dist (with multi-lang reviews)
-            (page_empty, datetime.now(timezone.utc), 0),      # text empty
-            (stats_empty, datetime.now(timezone.utc), 0),     # stats empty
+            (page1, datetime.now(timezone.utc), 0),             # text page1
+            (stats_page1, datetime.now(timezone.utc), 0),       # stats page1
+            (gamalytic_data, datetime.now(timezone.utc), 0),    # gamalytic
+            (lang_page1, datetime.now(timezone.utc), 0),        # lang dist page1 (cursor=LANG_C1)
+            (page_empty, datetime.now(timezone.utc), 0),        # text empty
+            (stats_empty, datetime.now(timezone.utc), 0),       # stats empty
+            (lang_page_empty, datetime.now(timezone.utc), 0),   # lang dist page2 (empty, stops)
         ]
 
         result = await self.client.fetch_reviews(appid=12345)
@@ -1127,8 +1147,13 @@ class TestFetchReviews:
 
     @pytest.mark.asyncio
     async def test_aggregates_from_query_summary(self):
-        """Aggregates match query_summary values."""
-        qs = make_query_summary(total_positive=70000, total_negative=2000, total_reviews=72000, review_score=9)
+        """Aggregates match query_summary values.
+
+        Uses total_reviews=5000 (below EA scan threshold) to avoid triggering
+        the EA-period scan which would require additional mock entries.
+        The test is about aggregate structure, not specific review count values.
+        """
+        qs = make_query_summary(total_positive=4000, total_negative=1000, total_reviews=5000, review_score=9)
         reviews = [make_raw_review(review_id=str(i)) for i in range(3)]
         self.mock_http.get_with_metadata.side_effect = self._make_side_effects(
             reviews, query_summary=qs
@@ -1136,9 +1161,9 @@ class TestFetchReviews:
 
         result = await self.client.fetch_reviews(appid=12345)
         assert result.aggregates is not None
-        assert result.aggregates.total_positive == 70000
-        assert result.aggregates.total_negative == 2000
-        assert result.aggregates.total_reviews == 72000
+        assert result.aggregates.total_positive == 4000
+        assert result.aggregates.total_negative == 1000
+        assert result.aggregates.total_reviews == 5000
         assert result.aggregates.review_score == 9
 
     @pytest.mark.asyncio
@@ -1288,3 +1313,191 @@ class TestFetchReviewsTool:
         result = json.loads(await fn(appid=12345, limit=20000))
         assert result.get("error_type") == "validation"
         assert "limit" in result.get("error", "")
+
+
+# ---------------------------------------------------------------------------
+# TestEAPeriodScan
+# ---------------------------------------------------------------------------
+
+class TestEAPeriodScan:
+    """Tests for SteamReviewClient._fetch_ea_period_scan (best-effort EA coverage)."""
+
+    def setup_method(self):
+        self.mock_http = AsyncMock()
+        self.client = SteamReviewClient(self.mock_http)
+
+    def _make_ea_dates(self, ea_release_date=None, full_release_date=None):
+        return EADateInfo(
+            ea_release_date=ea_release_date,
+            full_release_date=full_release_date,
+            currently_ea=False,
+            date_source="gamalytic",
+        )
+
+    @pytest.mark.asyncio
+    async def test_ea_scan_returns_reviews_in_period(self):
+        """Only reviews with timestamps within EA period are returned."""
+        # Anchor: 2020-01-01 UTC = 1577836800
+        # EA period: 1577836800 to 1577836800 + 365*86400 = 1609372800 (2021-01-01)
+        anchor_ts = 1577836800
+        ea_end_ts = anchor_ts + 365 * 86400
+
+        in_period_review = make_raw_review(
+            review_id="100",
+            timestamp_created=anchor_ts + 30 * 86400,  # 30 days into EA period
+        )
+        out_of_period_review = make_raw_review(
+            review_id="200",
+            timestamp_created=ea_end_ts + 100 * 86400,  # well past EA period
+        )
+        before_period_review = make_raw_review(
+            review_id="300",
+            timestamp_created=anchor_ts - 10 * 86400,  # before EA start
+        )
+
+        page_data = {"reviews": [in_period_review, out_of_period_review, before_period_review]}
+        page_empty = {"reviews": []}
+
+        # Mock _fetch_review_page to return one page then stop
+        with patch.object(self.client, "_fetch_review_page") as mock_fetch:
+            mock_fetch.side_effect = [
+                (page_data, "C1"),   # page 1: 3 reviews (1 in period)
+                (page_empty, "C1"),  # page 2: empty, stops
+            ]
+            ea_dates = self._make_ea_dates(ea_release_date="2020-01-01")
+            result = await self.client._fetch_ea_period_scan(12345, "english", ea_dates)
+
+        assert len(result) == 1
+        assert result[0]["recommendationid"] == "100"
+
+    @pytest.mark.asyncio
+    async def test_ea_scan_skips_recent_games(self):
+        """Games released less than 1 year ago return empty list (main scan covers EA)."""
+        # Release date 6 months ago — within 365 days
+        from datetime import timedelta
+        six_months_ago = (datetime.now(tz=timezone.utc) - timedelta(days=180)).strftime("%Y-%m-%d")
+        ea_dates = self._make_ea_dates(ea_release_date=six_months_ago)
+
+        # _fetch_review_page should NOT be called (game too recent)
+        with patch.object(self.client, "_fetch_review_page") as mock_fetch:
+            result = await self.client._fetch_ea_period_scan(12345, "english", ea_dates)
+            mock_fetch.assert_not_called()
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_ea_scan_no_dates_returns_empty(self):
+        """EADateInfo with no dates → returns empty list immediately."""
+        ea_dates = self._make_ea_dates()  # no ea_release_date, no full_release_date
+
+        with patch.object(self.client, "_fetch_review_page") as mock_fetch:
+            result = await self.client._fetch_ea_period_scan(12345, "english", ea_dates)
+            mock_fetch.assert_not_called()
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_ea_scan_best_effort_logging(self):
+        """After scanning, logger.info emits count of found reviews (best-effort reporting)."""
+        anchor_ts = 1577836800  # 2020-01-01
+        ea_dates = self._make_ea_dates(ea_release_date="2020-01-01")
+
+        in_period = make_raw_review(
+            review_id="1",
+            timestamp_created=anchor_ts + 10 * 86400,
+        )
+        page_data = {"reviews": [in_period]}
+        page_empty = {"reviews": []}
+
+        with patch.object(self.client, "_fetch_review_page") as mock_fetch:
+            mock_fetch.side_effect = [
+                (page_data, "C1"),
+                (page_empty, "C1"),
+            ]
+            with patch("src.steam_api.logger") as mock_logger:
+                result = await self.client._fetch_ea_period_scan(12345, "english", ea_dates)
+                # Verify logger.info was called with best-effort count message
+                mock_logger.info.assert_called_once()
+                call_args = mock_logger.info.call_args[0][0]
+                assert "best-effort" in call_args
+                assert "1" in call_args  # found 1 review
+
+
+# ---------------------------------------------------------------------------
+# TestLanguageDistribution
+# ---------------------------------------------------------------------------
+
+class TestLanguageDistribution:
+    """Tests for SteamReviewClient._fetch_language_distribution (paginated, up to 5 pages)."""
+
+    def setup_method(self):
+        self.mock_http = AsyncMock()
+        self.client = SteamReviewClient(self.mock_http)
+
+    def _make_lang_page(self, lang_counts: dict[str, int], cursor: str) -> tuple:
+        """Create a language page response with specified language distribution."""
+        reviews = []
+        for lang, count in lang_counts.items():
+            for i in range(count):
+                reviews.append({"language": lang})
+        return ({"reviews": reviews, "cursor": cursor}, datetime.now(timezone.utc), 0)
+
+    @pytest.mark.asyncio
+    async def test_lang_dist_paginates_multiple_pages(self):
+        """Language distribution aggregates counts across multiple pages."""
+        page1 = ({"reviews": [{"language": "english"}] * 3, "cursor": "C1"}, datetime.now(timezone.utc), 0)
+        page2 = ({"reviews": [{"language": "russian"}] * 2, "cursor": "C2"}, datetime.now(timezone.utc), 0)
+        page3 = ({"reviews": [{"language": "schinese"}] * 1, "cursor": "C3"}, datetime.now(timezone.utc), 0)
+        page4 = ({"reviews": [], "cursor": "C3"}, datetime.now(timezone.utc), 0)
+
+        self.mock_http.get_with_metadata.side_effect = [page1, page2, page3, page4]
+
+        result = await self.client._fetch_language_distribution(99999)
+        assert result["english"] == 3
+        assert result["russian"] == 2
+        assert result["schinese"] == 1
+
+    @pytest.mark.asyncio
+    async def test_lang_dist_stops_on_empty_page(self):
+        """Pagination stops when reviews list is empty."""
+        page1 = ({"reviews": [{"language": "english"}] * 5, "cursor": "C1"}, datetime.now(timezone.utc), 0)
+        page2 = ({"reviews": [], "cursor": "C1"}, datetime.now(timezone.utc), 0)
+
+        self.mock_http.get_with_metadata.side_effect = [page1, page2]
+
+        result = await self.client._fetch_language_distribution(99999)
+        # Only page1 counted
+        assert result["english"] == 5
+        # get_with_metadata called exactly 2 times (page1 + page2 empty → stops)
+        assert self.mock_http.get_with_metadata.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_lang_dist_stops_at_5_pages(self):
+        """Pagination stops at 5 pages maximum even if more pages available."""
+        pages = []
+        for i in range(6):
+            cursor = f"C{i+1}"
+            page = ({"reviews": [{"language": "english"}] * 10, "cursor": cursor}, datetime.now(timezone.utc), 0)
+            pages.append(page)
+
+        self.mock_http.get_with_metadata.side_effect = pages
+
+        result = await self.client._fetch_language_distribution(99999)
+        # Should stop after 5 pages (lang_max_pages=5), counting 50 reviews
+        assert result["english"] == 50
+        assert self.mock_http.get_with_metadata.call_count == 5
+
+    @pytest.mark.asyncio
+    async def test_lang_dist_stops_on_same_cursor(self):
+        """Pagination stops when cursor doesn't change (API pagination exhausted)."""
+        page1 = ({"reviews": [{"language": "english"}] * 5, "cursor": "C1"}, datetime.now(timezone.utc), 0)
+        # Page 2 has same cursor "C1" and non-empty reviews → same-cursor guard triggers
+        page2 = ({"reviews": [{"language": "russian"}] * 5, "cursor": "C1"}, datetime.now(timezone.utc), 0)
+
+        self.mock_http.get_with_metadata.side_effect = [page1, page2]
+
+        result = await self.client._fetch_language_distribution(99999)
+        # Stops after page1 (page2 cursor == page1 cursor and pages_fetched > 0)
+        assert result["english"] == 5
+        assert "russian" not in result
+        assert self.mock_http.get_with_metadata.call_count == 2
