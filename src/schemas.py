@@ -475,3 +475,131 @@ class MarketAnalysis(BaseModel):
 
     # Methodology documentation (always present)
     methodology: MethodologyNote | None = None
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: Review Intelligence schemas (additive — existing schemas unchanged)
+# ---------------------------------------------------------------------------
+
+class ReviewItem(BaseModel):
+    """Per-review data for a single Steam user review."""
+    review_id: str
+    text: str  # BBCode-stripped, truncated review text
+    truncated: bool = False  # whether text was truncated at 1000 chars
+    full_length: int = 0  # original text length before truncation
+    voted_up: bool
+    votes_up: int = 0  # helpfulness upvotes
+    votes_funny: int = 0
+    playtime_at_review: float = 0  # hours (converted from API minutes)
+    playtime_total: float = 0  # hours (author's current total)
+    timestamp_created: int = 0  # Unix timestamp
+    timestamp_updated: int = 0  # Unix timestamp
+    written_during_early_access: bool = False
+    received_for_free: bool = False
+    language: str = "english"
+    author_steamid: str = ""
+    author_num_games_owned: int = 0
+    author_num_reviews: int = 0
+    developer_response: str | None = None  # only present when developer responded
+
+
+class ReviewSnippet(BaseModel):
+    """Compact review entry for summary/compact detail level."""
+    review_id: str
+    text: str  # first 200 chars
+    voted_up: bool
+    votes_up: int = 0
+    perspective: str = ""  # "top_positive", "top_negative", or "most_helpful"
+
+
+class ReviewAggregates(BaseModel):
+    """Steam query_summary aggregates — covers ALL reviews, not just fetched pages."""
+    total_positive: int = 0
+    total_negative: int = 0
+    total_reviews: int = 0
+    review_score: int = 0  # Steam's 1-9 score
+    review_score_desc: str = ""  # e.g. "Overwhelmingly Positive"
+    positive_ratio: float | None = None  # total_positive / total_reviews * 100
+    weighted_positive_ratio: float | None = None  # helpfulness-weighted ratio
+
+
+class PlaytimeBucket(BaseModel):
+    """Single playtime histogram bucket."""
+    label: str  # e.g. "0_2hr", "2_5hr", "50hr_plus"
+    count: int = 0
+    positive_count: int = 0
+    negative_count: int = 0
+
+
+class SentimentPeriod(BaseModel):
+    """Sentiment metrics for a single time period."""
+    period: str  # e.g. "first_30d", "last_90d", "2024"
+    positive_count: int = 0
+    negative_count: int = 0
+    total_count: int = 0
+    positive_ratio: float | None = None
+    weighted_ratio: float | None = None  # helpfulness-weighted ratio
+    avg_playtime_at_review: float | None = None  # hours
+    avg_helpfulness: float | None = None
+    avg_reviews_per_day: float | None = None
+    review_count: int = 0  # same as total_count (for confidence assessment readability)
+
+
+class EADateInfo(BaseModel):
+    """Early Access date metadata with source provenance."""
+    ea_release_date: str | None = None  # ISO date
+    full_release_date: str | None = None  # ISO date
+    currently_ea: bool = False
+    date_source: str = ""  # "gamalytic", "steam_api", or "review_derived"
+
+
+class ReviewsMeta(BaseModel):
+    """Response metadata for review fetch operations."""
+    appid: int
+    name: str = ""
+    schema_version: str = "1.0"
+    total_fetched: int = 0
+    total_available: int = 0
+    pages_fetched: int = 0
+    partial: bool = False  # True if pagination failed mid-way
+    cursor: str | None = None  # for multi-call pagination
+    ea_dates: EADateInfo | None = None
+    detail_level: str = "full"  # "full" or "compact"
+    status: str = "ok"  # "ok", "no_reviews", "reviews_disabled", or error message
+    delisted: bool = False
+    fetched_at: datetime
+    cache_age_seconds: int = 0
+
+    @field_serializer('fetched_at')
+    def serialize_datetime(self, dt: datetime, _info) -> str:
+        """Serialize datetime to ISO format string for JSON compatibility."""
+        return dt.isoformat()
+
+
+class QueryParams(BaseModel):
+    """Echo of request parameters for audit/reproducibility."""
+    appid: int
+    language: str = "english"
+    review_type: str = "all"
+    purchase_type: str = "all"
+    limit: int = 200
+    detail_level: str = "full"
+    filter_offtopic: bool = True
+    min_playtime: float | None = None  # hours
+    date_range: str | None = None
+    platform: str = "all"
+    sort: str = "helpful"  # "helpful" or "recent"
+
+
+class ReviewsData(BaseModel):
+    """Top-level response for fetch_reviews — full review intelligence output."""
+    reviews: list[ReviewItem] = Field(default_factory=list)  # full detail level only
+    snippets: list[ReviewSnippet] = Field(default_factory=list)  # compact detail level only
+    aggregates: ReviewAggregates | None = None
+    histogram: list[PlaytimeBucket] = Field(default_factory=list)
+    sentiment: list[SentimentPeriod] = Field(default_factory=list)  # fixed + rolling periods
+    yearly: list[SentimentPeriod] = Field(default_factory=list)  # calendar year breakdown
+    ratio_timeline: list[list] = Field(default_factory=list)  # [[period, ratio], ...]
+    language_distribution: dict[str, int] = Field(default_factory=dict)  # language -> count
+    meta: ReviewsMeta | None = None
+    query_params: QueryParams | None = None
