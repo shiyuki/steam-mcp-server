@@ -8,7 +8,7 @@ from mcp.server.fastmcp import FastMCP
 from src.http_client import CachedAPIClient
 from src.cache import TTLCache
 from src.rate_limiter import HostRateLimiter
-from src.steam_api import SteamSpyClient, SteamStoreClient, GamalyticClient
+from src.steam_api import SteamSpyClient, SteamStoreClient, GamalyticClient, SteamReviewClient
 from src.schemas import APIError, SearchResult, GameSummary, EngagementData
 from src.logging_config import get_logger
 
@@ -19,11 +19,45 @@ _http_client: CachedAPIClient | None = None
 _steamspy: SteamSpyClient | None = None
 _steam_store: SteamStoreClient | None = None
 _gamalytic: GamalyticClient | None = None
+_review_client: SteamReviewClient | None = None
+
+# Semaphore for review fetching concurrency control
+_review_semaphore = asyncio.Semaphore(5)
+
+
+def _validate_game_tags(
+    searched_tags: list[str], game_tags: dict[str, int], top_n: int = 20
+) -> tuple[bool | None, list[str]]:
+    """Cross-validate searched tags against a game's SteamSpy tag weights.
+
+    Args:
+        searched_tags: Tags the user searched for
+        game_tags: Tag name -> vote weight from SteamSpy per-game data
+        top_n: Number of top tags to consider (by weight descending)
+
+    Returns:
+        (tag_matches, tags_missing):
+        - (None, []) if no tag data available
+        - (True, []) if all searched tags found in top N
+        - (False, [missing_tags]) if some searched tags not in top N
+    """
+    if not game_tags:
+        return (None, [])
+
+    # Sort tags by weight descending, take top N
+    sorted_tags = sorted(game_tags.keys(), key=lambda t: game_tags[t], reverse=True)
+    top_tags_lower = {t.lower() for t in sorted_tags[:top_n]}
+
+    missing = [tag for tag in searched_tags if tag.lower() not in top_tags_lower]
+
+    if missing:
+        return (False, missing)
+    return (True, [])
 
 
 def register_tools(mcp: FastMCP):
     """Register all MCP tools with the server."""
-    global _http_client, _steamspy, _steam_store, _gamalytic
+    global _http_client, _steamspy, _steam_store, _gamalytic, _review_client
 
     # Initialize shared infrastructure with per-host rate limiting and TTL cache
     cache = TTLCache(default_ttl=3600)  # 1 hour default
@@ -32,6 +66,7 @@ def register_tools(mcp: FastMCP):
     _steamspy = SteamSpyClient(_http_client)
     _steam_store = SteamStoreClient(_http_client)
     _gamalytic = GamalyticClient(_http_client)
+    _review_client = SteamReviewClient(_http_client)
 
     logger.info("Initializing MCP tools with per-host rate limiting and TTL cache")
 
@@ -98,16 +133,20 @@ def register_tools(mcp: FastMCP):
         tasks = [_steamspy.get_engagement_data(appid) for appid in appids]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Step 4: Build GameSummary from EngagementData
+        # Step 4: Build GameSummary from EngagementData with tag cross-validation
+        searched_tags = [genre]
         games = []
         enriched_appids = []
         for result in results:
             if isinstance(result, EngagementData):
+                tag_matches, tags_missing = _validate_game_tags(searched_tags, result.tags)
                 games.append(GameSummary(
                     appid=result.appid,
                     name=result.name,
                     developer=result.developer,
                     publisher=result.publisher,
+                    owners_min=result.owners_min,
+                    owners_max=result.owners_max,
                     owners_midpoint=result.owners_midpoint,
                     ccu=result.ccu,
                     price=result.price,
@@ -119,6 +158,8 @@ def register_tools(mcp: FastMCP):
                     average_2weeks=result.average_2weeks,
                     median_2weeks=result.median_2weeks,
                     score_rank=result.score_rank,
+                    tag_matches=tag_matches,
+                    tags_missing=tags_missing,
                 ))
                 enriched_appids.append(result.appid)
 
@@ -128,6 +169,19 @@ def register_tools(mcp: FastMCP):
         if limit is not None:
             games = games[:limit]
             enriched_appids = [g.appid for g in games]
+
+        # Step 6: Build cross-validation summary
+        validated = sum(1 for g in games if g.tag_matches is not None)
+        matched = sum(1 for g in games if g.tag_matches is True)
+        flagged = sum(1 for g in games if g.tag_matches is False)
+        no_data = sum(1 for g in games if g.tag_matches is None)
+        cross_validation = {
+            "validated": validated,
+            "matched": matched,
+            "flagged": flagged,
+            "no_data": no_data,
+            "searched_tags": searched_tags,
+        }
 
         return SearchResult(
             fetched_at=datetime.now(timezone.utc),
@@ -139,6 +193,7 @@ def register_tools(mcp: FastMCP):
             sort_by=sort_by,
             normalized_tag=genre,
             data_source="steam_store",
+            cross_validation=cross_validation,
         )
 
     async def _multi_tag_search(
@@ -205,16 +260,19 @@ def register_tools(mcp: FastMCP):
         tasks = [_steamspy.get_engagement_data(appid) for appid in appids]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Step 4: Build GameSummary from EngagementData
+        # Step 4: Build GameSummary from EngagementData with tag cross-validation
         games = []
         enriched_appids = []
         for result in results:
             if isinstance(result, EngagementData):
+                tag_matches, tags_missing = _validate_game_tags(tags, result.tags)
                 games.append(GameSummary(
                     appid=result.appid,
                     name=result.name,
                     developer=result.developer,
                     publisher=result.publisher,
+                    owners_min=result.owners_min,
+                    owners_max=result.owners_max,
                     owners_midpoint=result.owners_midpoint,
                     ccu=result.ccu,
                     price=result.price,
@@ -226,6 +284,8 @@ def register_tools(mcp: FastMCP):
                     average_2weeks=result.average_2weeks,
                     median_2weeks=result.median_2weeks,
                     score_rank=result.score_rank,
+                    tag_matches=tag_matches,
+                    tags_missing=tags_missing,
                 ))
                 enriched_appids.append(result.appid)
 
@@ -235,6 +295,19 @@ def register_tools(mcp: FastMCP):
         if limit is not None:
             games = games[:limit]
             enriched_appids = [g.appid for g in games]
+
+        # Step 6: Build cross-validation summary
+        validated = sum(1 for g in games if g.tag_matches is not None)
+        matched = sum(1 for g in games if g.tag_matches is True)
+        flagged = sum(1 for g in games if g.tag_matches is False)
+        no_data = sum(1 for g in games if g.tag_matches is None)
+        cross_validation = {
+            "validated": validated,
+            "matched": matched,
+            "flagged": flagged,
+            "no_data": no_data,
+            "searched_tags": tags,
+        }
 
         return SearchResult(
             fetched_at=datetime.now(timezone.utc),
@@ -246,6 +319,7 @@ def register_tools(mcp: FastMCP):
             sort_by=sort_by,
             normalized_tag=combined_tag,
             data_source="steam_store",
+            cross_validation=cross_validation,
         )
 
     @mcp.tool()
@@ -477,3 +551,89 @@ def register_tools(mcp: FastMCP):
         result.data_source = "steam_store" if used_fallback else "steamspy"
 
         return json.dumps(result.model_dump())
+
+    @mcp.tool()
+    async def fetch_reviews(
+        appid: int,
+        limit: int = 200,
+        language: str = "english",
+        review_type: str = "all",
+        purchase_type: str = "all",
+        detail_level: str = "full",
+        filter_offtopic: bool = True,
+        min_playtime: float = 0,
+        date_range: str = "",
+        platform: str = "all",
+        sort: str = "helpful",
+        cursor: str = "",
+    ) -> str:
+        """Fetch Steam review text with metadata and playtime distribution for any game.
+
+        Returns individual reviews with sentiment, playtime, helpfulness scores, plus
+        aggregate stats, playtime histogram, and sentiment timeline. Two detail levels:
+        full (200 reviews + all stats) or compact (3 snippets + stats only).
+
+        Reviews are sorted by helpfulness (most helpful first) by default.
+        Stats (histogram, sentiment) are computed from a separate recent-sort scan
+        for statistical accuracy regardless of the review text sort/filter.
+
+        Args:
+            appid: Steam AppID (e.g., 646570 for Slay the Spire)
+            limit: Number of reviews to fetch (default 200, max 10000). Only affects review text, not stats.
+            language: Language filter (default "english"). Use "all" for all languages.
+                      Codes: english, schinese, tchinese, japanese, koreana, russian, german, french, spanish, etc.
+            review_type: Filter by sentiment: "all" (default), "positive", "negative"
+            purchase_type: Filter by purchase: "all" (default), "steam", "non_steam"
+            detail_level: "full" (default) = reviews + all stats; "compact" = 3 snippets + stats only
+            filter_offtopic: Filter review bombs (default True). Set False to include off-topic review activity.
+            min_playtime: Minimum playtime at review in hours (default 0 = no filter)
+            date_range: Date filter. Relative: "30d", "6m", "1y". Absolute: "2024-01-01,2024-06-30". Empty = no filter.
+            platform: Platform filter: "all" (default), "windows", "mac", "linux", "steam_deck"
+            sort: Sort order: "helpful" (default) or "recent"
+            cursor: Pagination cursor from previous call. Pass cursor from meta.cursor to get next batch.
+
+        Returns:
+            JSON with sections: reviews/snippets, aggregates, histogram, sentiment, yearly, meta, query_params.
+            On first call: all sections populated. On cursor continuation: reviews only (no aggregates/stats).
+        """
+        # Input validation
+        if appid <= 0:
+            return json.dumps({"error": "appid must be positive", "error_type": "validation"})
+
+        if limit < 1 or limit > 10000:
+            return json.dumps({"error": "limit must be between 1 and 10000", "error_type": "validation"})
+
+        if detail_level not in ("full", "compact"):
+            return json.dumps({"error": "detail_level must be 'full' or 'compact'", "error_type": "validation"})
+
+        if review_type not in ("all", "positive", "negative"):
+            return json.dumps({"error": "review_type must be 'all', 'positive', or 'negative'", "error_type": "validation"})
+
+        if purchase_type not in ("all", "steam", "non_steam"):
+            return json.dumps({"error": "purchase_type must be 'all', 'steam', or 'non_steam'", "error_type": "validation"})
+
+        if sort not in ("helpful", "recent"):
+            return json.dumps({"error": "sort must be 'helpful' or 'recent'", "error_type": "validation"})
+
+        valid_platforms = ("all", "windows", "mac", "linux", "steam_deck")
+        if platform not in valid_platforms:
+            return json.dumps({"error": f"platform must be one of: {', '.join(valid_platforms)}", "error_type": "validation"})
+
+        logger.info("Fetching reviews for AppID: %d, limit: %d, language: %s, detail: %s", appid, limit, language, detail_level)
+
+        async with _review_semaphore:
+            result = await _review_client.fetch_reviews(
+                appid=appid,
+                limit=limit,
+                language=language,
+                review_type=review_type,
+                purchase_type=purchase_type,
+                detail_level=detail_level,
+                filter_offtopic=filter_offtopic,
+                min_playtime=min_playtime if min_playtime > 0 else None,
+                date_range=date_range if date_range else None,
+                platform=platform,
+                sort=sort,
+            )
+
+        return json.dumps(result.model_dump(), default=str)

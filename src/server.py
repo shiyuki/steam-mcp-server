@@ -28,7 +28,7 @@ mcp = FastMCP("steam-server")
 # Register tools (imports mcp from this module)
 from src.tools import register_tools
 register_tools(mcp)
-logger.info("Registered tools: search_genre, fetch_metadata, fetch_commercial, fetch_engagement, aggregate_engagement")
+logger.info("Registered tools: search_genre, fetch_metadata, fetch_commercial, fetch_engagement, aggregate_engagement, fetch_reviews")
 
 
 if __name__ == "__main__":
