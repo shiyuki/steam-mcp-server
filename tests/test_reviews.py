@@ -1417,3 +1417,432 @@ class TestLanguageDistribution:
         assert result["english"] == 5
         assert "russian" not in result
         assert self.mock_http.get_with_metadata.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_lang_dist_returns_empty_on_exception(self):
+        """HTTP error during language distribution fetch returns empty dict."""
+        import httpx
+        req = httpx.Request("GET", "https://store.steampowered.com/appreviews/99999")
+        resp = httpx.Response(500, request=req)
+        self.mock_http.get_with_metadata.side_effect = httpx.HTTPStatusError(
+            "Server Error", request=req, response=resp
+        )
+
+        result = await self.client._fetch_language_distribution(99999)
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# TestDualStatsScanMerge
+# ---------------------------------------------------------------------------
+
+class TestDualStatsScanMerge:
+    """Tests for the dual stats scan merge/dedup logic in fetch_reviews."""
+
+    def setup_method(self):
+        self.mock_http = AsyncMock()
+        self.client = SteamReviewClient(self.mock_http)
+
+    def _make_side_effects_with_separate_stats(
+        self, text_reviews, helpful_reviews, recent_reviews,
+        query_summary=None, gamalytic_data=None,
+    ):
+        """Build side_effects with distinct helpful vs recent stats reviews.
+
+        Same 9-entry interleaving as standard helpers but allows different
+        review sets for the two stats scans.
+        """
+        if query_summary is None:
+            query_summary = make_query_summary()
+        if gamalytic_data is None:
+            gamalytic_data = {
+                "EAReleaseDate": None, "earlyAccessExitDate": None,
+                "firstReleaseDate": 1509494400000, "releaseDate": 1509494400000,
+                "earlyAccess": False,
+            }
+
+        text_page1 = make_page_response(text_reviews, cursor="C1", query_summary=query_summary)
+        text_empty = make_page_response([], cursor="C1")
+        stats_helpful_page1 = make_page_response(helpful_reviews, cursor="SH1")
+        stats_helpful_empty = make_page_response([], cursor="SH1")
+        stats_recent_page1 = make_page_response(recent_reviews, cursor="SR1")
+        stats_recent_empty = make_page_response([], cursor="SR1")
+        lang_page1 = {"success": 1, "cursor": "LANG_C1", "reviews": text_reviews[:3]}
+        lang_page_empty = {"success": 1, "cursor": "LANG_C1", "reviews": []}
+
+        return [
+            (text_page1, datetime.now(timezone.utc), 0),
+            (stats_helpful_page1, datetime.now(timezone.utc), 0),
+            (stats_recent_page1, datetime.now(timezone.utc), 0),
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (lang_page1, datetime.now(timezone.utc), 0),
+            (text_empty, datetime.now(timezone.utc), 0),
+            (stats_helpful_empty, datetime.now(timezone.utc), 0),
+            (stats_recent_empty, datetime.now(timezone.utc), 0),
+            (lang_page_empty, datetime.now(timezone.utc), 0),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_overlapping_reviews_deduped(self):
+        """Reviews appearing in both helpful and recent scans are deduplicated."""
+        helpful = [
+            make_raw_review(review_id="A", playtime_at_review=600),
+            make_raw_review(review_id="B", playtime_at_review=1200),
+        ]
+        recent = [
+            make_raw_review(review_id="B", playtime_at_review=1200),  # duplicate
+            make_raw_review(review_id="C", playtime_at_review=1800),
+        ]
+        text_reviews = [make_raw_review(review_id="1")]
+        self.mock_http.get_with_metadata.side_effect = \
+            self._make_side_effects_with_separate_stats(text_reviews, helpful, recent)
+
+        result = await self.client.fetch_reviews(appid=12345)
+        # Histogram should reflect 3 unique stats reviews (A, B, C), not 4
+        total_histogram = sum(b.count for b in result.histogram)
+        assert total_histogram == 3
+
+    @pytest.mark.asyncio
+    async def test_no_overlap_all_preserved(self):
+        """When scans have no overlap, all reviews are preserved."""
+        helpful = [
+            make_raw_review(review_id="A", playtime_at_review=600),
+            make_raw_review(review_id="B", playtime_at_review=1200),
+        ]
+        recent = [
+            make_raw_review(review_id="C", playtime_at_review=1800),
+            make_raw_review(review_id="D", playtime_at_review=2400),
+        ]
+        text_reviews = [make_raw_review(review_id="1")]
+        self.mock_http.get_with_metadata.side_effect = \
+            self._make_side_effects_with_separate_stats(text_reviews, helpful, recent)
+
+        result = await self.client.fetch_reviews(appid=12345)
+        total_histogram = sum(b.count for b in result.histogram)
+        assert total_histogram == 4
+
+    @pytest.mark.asyncio
+    async def test_full_overlap_deduped_to_one_set(self):
+        """When both scans return identical reviews, merged count equals single scan."""
+        shared = [
+            make_raw_review(review_id="X", playtime_at_review=600),
+            make_raw_review(review_id="Y", playtime_at_review=1200),
+        ]
+        text_reviews = [make_raw_review(review_id="1")]
+        self.mock_http.get_with_metadata.side_effect = \
+            self._make_side_effects_with_separate_stats(text_reviews, shared, list(shared))
+
+        result = await self.client.fetch_reviews(appid=12345)
+        total_histogram = sum(b.count for b in result.histogram)
+        assert total_histogram == 2  # Only 2 unique, not 4
+
+
+# ---------------------------------------------------------------------------
+# TestStatsScanFilterMode
+# ---------------------------------------------------------------------------
+
+class TestStatsScanFilterMode:
+    """Tests for _fetch_stats_scan filter_mode parameter propagation."""
+
+    def setup_method(self):
+        self.mock_http = AsyncMock()
+        self.client = SteamReviewClient(self.mock_http)
+
+    @pytest.mark.asyncio
+    async def test_filter_mode_all_propagates(self):
+        """filter_mode='all' passes filter='all' to Steam API params."""
+        page1 = make_page_response([make_raw_review()], cursor="C1")
+        page_empty = make_page_response([], cursor="C1")
+        self.mock_http.get_with_metadata.side_effect = [
+            (page1, datetime.now(timezone.utc), 0),
+            (page_empty, datetime.now(timezone.utc), 0),
+        ]
+
+        await self.client._fetch_stats_scan(12345, "english", 100, filter_mode="all")
+
+        # First call's params should contain filter="all"
+        first_call_kwargs = self.mock_http.get_with_metadata.call_args_list[0]
+        params = first_call_kwargs.kwargs.get("params", {})
+        assert params["filter"] == "all"
+
+    @pytest.mark.asyncio
+    async def test_filter_mode_recent_propagates(self):
+        """filter_mode='recent' passes filter='recent' to Steam API params."""
+        page1 = make_page_response([make_raw_review()], cursor="C1")
+        page_empty = make_page_response([], cursor="C1")
+        self.mock_http.get_with_metadata.side_effect = [
+            (page1, datetime.now(timezone.utc), 0),
+            (page_empty, datetime.now(timezone.utc), 0),
+        ]
+
+        await self.client._fetch_stats_scan(12345, "english", 100, filter_mode="recent")
+
+        first_call_kwargs = self.mock_http.get_with_metadata.call_args_list[0]
+        params = first_call_kwargs.kwargs.get("params", {})
+        assert params["filter"] == "recent"
+
+    @pytest.mark.asyncio
+    async def test_default_filter_mode_is_recent(self):
+        """Default filter_mode is 'recent' when not specified."""
+        page1 = make_page_response([make_raw_review()], cursor="C1")
+        page_empty = make_page_response([], cursor="C1")
+        self.mock_http.get_with_metadata.side_effect = [
+            (page1, datetime.now(timezone.utc), 0),
+            (page_empty, datetime.now(timezone.utc), 0),
+        ]
+
+        await self.client._fetch_stats_scan(12345, "english", 100)
+
+        first_call_kwargs = self.mock_http.get_with_metadata.call_args_list[0]
+        params = first_call_kwargs.kwargs.get("params", {})
+        assert params["filter"] == "recent"
+
+    @pytest.mark.asyncio
+    async def test_stats_scan_error_returns_partial(self):
+        """Exception during stats scan pagination returns reviews collected before error."""
+        import httpx
+        page1 = make_page_response(
+            [make_raw_review(review_id="1"), make_raw_review(review_id="2")],
+            cursor="C1",
+        )
+        req = httpx.Request("GET", "https://store.steampowered.com/appreviews/12345")
+        resp = httpx.Response(500, request=req)
+
+        self.mock_http.get_with_metadata.side_effect = [
+            (page1, datetime.now(timezone.utc), 0),
+            httpx.HTTPStatusError("Server Error", request=req, response=resp),
+        ]
+
+        result = await self.client._fetch_stats_scan(12345, "english", 1000)
+        # Should return the 2 reviews from page1 despite page2 error
+        assert len(result) == 2
+
+    @pytest.mark.asyncio
+    async def test_stats_scan_error_on_first_page_returns_empty(self):
+        """Exception on first page of stats scan returns empty list."""
+        import httpx
+        req = httpx.Request("GET", "https://store.steampowered.com/appreviews/12345")
+        resp = httpx.Response(500, request=req)
+
+        self.mock_http.get_with_metadata.side_effect = [
+            httpx.HTTPStatusError("Server Error", request=req, response=resp),
+        ]
+
+        result = await self.client._fetch_stats_scan(12345, "english", 1000)
+        assert len(result) == 0
+
+
+# ---------------------------------------------------------------------------
+# TestDateRangeParsing
+# ---------------------------------------------------------------------------
+
+class TestDateRangeParsing:
+    """Tests for date_range parameter parsing in fetch_reviews."""
+
+    def setup_method(self):
+        self.mock_http = AsyncMock()
+        self.client = SteamReviewClient(self.mock_http)
+
+    def _make_standard_side_effects(self, reviews=None):
+        """Standard 9-entry side_effects for fetch_reviews calls."""
+        if reviews is None:
+            reviews = [make_raw_review(review_id="1")]
+        qs = make_query_summary()
+        gamalytic_data = {
+            "EAReleaseDate": None, "earlyAccessExitDate": None,
+            "firstReleaseDate": 1509494400000, "releaseDate": 1509494400000,
+            "earlyAccess": False,
+        }
+        page1 = make_page_response(reviews, cursor="C1", query_summary=qs)
+        page_empty = make_page_response([], cursor="C1")
+        stats_helpful_page1 = make_page_response(reviews, cursor="SH1")
+        stats_helpful_empty = make_page_response([], cursor="SH1")
+        stats_recent_page1 = make_page_response(reviews, cursor="SR1")
+        stats_recent_empty = make_page_response([], cursor="SR1")
+        lang_page1 = {"success": 1, "cursor": "LANG_C1", "reviews": reviews[:3]}
+        lang_page_empty = {"success": 1, "cursor": "LANG_C1", "reviews": []}
+
+        return [
+            (page1, datetime.now(timezone.utc), 0),
+            (stats_helpful_page1, datetime.now(timezone.utc), 0),
+            (stats_recent_page1, datetime.now(timezone.utc), 0),
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (lang_page1, datetime.now(timezone.utc), 0),
+            (page_empty, datetime.now(timezone.utc), 0),
+            (stats_helpful_empty, datetime.now(timezone.utc), 0),
+            (stats_recent_empty, datetime.now(timezone.utc), 0),
+            (lang_page_empty, datetime.now(timezone.utc), 0),
+        ]
+
+    def _get_text_call_params(self):
+        """Extract params from the first HTTP call (text_task's first page fetch)."""
+        return self.mock_http.get_with_metadata.call_args_list[0].kwargs.get("params", {})
+
+    @pytest.mark.asyncio
+    async def test_relative_30d(self):
+        """date_range='30d' passes day_range=30 to text fetch."""
+        self.mock_http.get_with_metadata.side_effect = self._make_standard_side_effects()
+        await self.client.fetch_reviews(appid=12345, date_range="30d")
+        params = self._get_text_call_params()
+        assert params.get("day_range") == "30"
+
+    @pytest.mark.asyncio
+    async def test_relative_6m(self):
+        """date_range='6m' passes day_range=180 to text fetch."""
+        self.mock_http.get_with_metadata.side_effect = self._make_standard_side_effects()
+        await self.client.fetch_reviews(appid=12345, date_range="6m")
+        params = self._get_text_call_params()
+        assert params.get("day_range") == "180"
+
+    @pytest.mark.asyncio
+    async def test_relative_1y_capped_at_365(self):
+        """date_range='1y' passes day_range=365 (Steam API cap)."""
+        self.mock_http.get_with_metadata.side_effect = self._make_standard_side_effects()
+        await self.client.fetch_reviews(appid=12345, date_range="1y")
+        params = self._get_text_call_params()
+        assert params.get("day_range") == "365"
+
+    @pytest.mark.asyncio
+    async def test_relative_2y_capped_at_365(self):
+        """date_range='2y' caps at day_range=365 (Steam max)."""
+        self.mock_http.get_with_metadata.side_effect = self._make_standard_side_effects()
+        await self.client.fetch_reviews(appid=12345, date_range="2y")
+        params = self._get_text_call_params()
+        assert params.get("day_range") == "365"
+
+    @pytest.mark.asyncio
+    async def test_no_date_range_no_day_range(self):
+        """No date_range → no day_range param in text fetch."""
+        self.mock_http.get_with_metadata.side_effect = self._make_standard_side_effects()
+        await self.client.fetch_reviews(appid=12345)
+        params = self._get_text_call_params()
+        assert "day_range" not in params
+
+    @pytest.mark.asyncio
+    async def test_invalid_date_range_ignored(self):
+        """Invalid date_range format silently ignored (no day_range param)."""
+        self.mock_http.get_with_metadata.side_effect = self._make_standard_side_effects()
+        await self.client.fetch_reviews(appid=12345, date_range="invalid")
+        params = self._get_text_call_params()
+        assert "day_range" not in params
+
+
+# ---------------------------------------------------------------------------
+# TestCompactSnippetEdgeCases
+# ---------------------------------------------------------------------------
+
+class TestCompactSnippetEdgeCases:
+    """Edge case tests for compact mode snippet selection."""
+
+    def setup_method(self):
+        self.mock_http = AsyncMock()
+        self.client = SteamReviewClient(self.mock_http)
+
+    def _make_fetch_reviews_mocks(self, reviews):
+        """Build mock side effects for fetch_reviews (same as TestCompactMode)."""
+        qs = make_query_summary()
+        page1 = make_page_response(reviews, cursor="C1", query_summary=qs)
+        page_empty = make_page_response([], cursor="C1")
+        stats_helpful_page1 = make_page_response(reviews, cursor="SH1")
+        stats_helpful_empty = make_page_response([], cursor="SH1")
+        stats_recent_page1 = make_page_response(reviews, cursor="SR1")
+        stats_recent_empty = make_page_response([], cursor="SR1")
+        lang_page1 = {"success": 1, "cursor": "LANG_C1", "reviews": reviews[:3]}
+        lang_page_empty = {"success": 1, "cursor": "LANG_C1", "reviews": []}
+        gamalytic_data = {
+            "EAReleaseDate": None, "earlyAccessExitDate": None,
+            "firstReleaseDate": 1509494400000, "releaseDate": 1509494400000,
+            "earlyAccess": False,
+        }
+        return [
+            (page1, datetime.now(timezone.utc), 0),
+            (stats_helpful_page1, datetime.now(timezone.utc), 0),
+            (stats_recent_page1, datetime.now(timezone.utc), 0),
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (lang_page1, datetime.now(timezone.utc), 0),
+            (page_empty, datetime.now(timezone.utc), 0),
+            (stats_helpful_empty, datetime.now(timezone.utc), 0),
+            (stats_recent_empty, datetime.now(timezone.utc), 0),
+            (lang_page_empty, datetime.now(timezone.utc), 0),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_compact_all_negative_reviews(self):
+        """Compact mode with all-negative reviews: only top_negative snippet."""
+        reviews = [
+            make_raw_review(review_id="1", voted_up=False, votes_up=30),
+            make_raw_review(review_id="2", voted_up=False, votes_up=50),
+            make_raw_review(review_id="3", voted_up=False, votes_up=10),
+        ]
+        self.mock_http.get_with_metadata.side_effect = self._make_fetch_reviews_mocks(reviews)
+
+        result = await self.client.fetch_reviews(appid=12345, detail_level="compact")
+        assert len(result.snippets) == 1
+        assert result.snippets[0].perspective == "top_negative"
+        assert result.snippets[0].review_id == "2"  # highest votes_up
+
+    @pytest.mark.asyncio
+    async def test_compact_empty_reviews(self):
+        """Compact mode with no reviews: empty snippets list."""
+        qs = make_query_summary(total_positive=0, total_negative=0, total_reviews=0)
+        reviews = []
+        gamalytic_data = {
+            "EAReleaseDate": None, "earlyAccessExitDate": None,
+            "firstReleaseDate": None, "releaseDate": None,
+            "earlyAccess": False,
+        }
+        page1 = make_page_response(reviews, cursor="C1", query_summary=qs)
+        stats_page = make_page_response([], cursor="S1")
+        lang_page = {"success": 1, "cursor": "*", "reviews": []}
+
+        self.mock_http.get_with_metadata.side_effect = [
+            (page1, datetime.now(timezone.utc), 0),
+            (stats_page, datetime.now(timezone.utc), 0),
+            (stats_page, datetime.now(timezone.utc), 0),
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (lang_page, datetime.now(timezone.utc), 0),
+        ]
+
+        result = await self.client.fetch_reviews(appid=12345, detail_level="compact")
+        assert len(result.snippets) == 0
+
+
+# ---------------------------------------------------------------------------
+# TestHistogramEdgeCases
+# ---------------------------------------------------------------------------
+
+class TestHistogramEdgeCases:
+    """Additional histogram boundary tests."""
+
+    def setup_method(self):
+        self.mock_http = AsyncMock()
+        self.client = SteamReviewClient(self.mock_http)
+
+    def test_histogram_exact_50_hour_boundary(self):
+        """Playtime exactly 50.0 hours falls in 50hr_plus bucket (20_50hr is [20, 50))."""
+        reviews = [make_raw_review(review_id="1", playtime_at_review=3000)]  # 3000 min = 50 hrs
+        buckets = self.client._compute_histogram(reviews)
+        bucket_20_50 = next(b for b in buckets if b.label == "20_50hr")
+        bucket_50_plus = next(b for b in buckets if b.label == "50hr_plus")
+        assert bucket_20_50.count == 0
+        assert bucket_50_plus.count == 1
+
+    def test_histogram_very_high_playtime(self):
+        """Review with 1000+ hours lands in 50hr_plus bucket."""
+        reviews = [make_raw_review(review_id="1", playtime_at_review=72000)]  # 72000 min = 1200 hrs
+        buckets = self.client._compute_histogram(reviews)
+        bucket_50_plus = next(b for b in buckets if b.label == "50hr_plus")
+        assert bucket_50_plus.count == 1
+
+    def test_histogram_partial_bucket_coverage(self):
+        """Some buckets populated, others empty — zero buckets still present."""
+        reviews = [
+            make_raw_review(review_id="1", playtime_at_review=30),    # 0.5 hrs → 0_1hr
+            make_raw_review(review_id="2", playtime_at_review=6000),  # 100 hrs → 50hr_plus
+        ]
+        buckets = self.client._compute_histogram(reviews)
+        assert len(buckets) == 7  # All 7 buckets always present
+        populated = [b for b in buckets if b.count > 0]
+        empty = [b for b in buckets if b.count == 0]
+        assert len(populated) == 2
+        assert len(empty) == 5
