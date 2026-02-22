@@ -1600,3 +1600,424 @@ class TestTagCrossValidation:
             assert isinstance(game.tags, dict)
             assert len(game.tags) > 0
             assert "Indie" in game.tags or "indie" in {k.lower() for k in game.tags.keys()}
+
+
+# ---------------------------------------------------------------------------
+# Helper for aggregate tests with tag path mock
+# ---------------------------------------------------------------------------
+
+def _make_tag_mock_side_effect(tag_data, tag_name="Test"):
+    """Create a mock_side_effect function for tag-based aggregate tests.
+
+    Args:
+        tag_data: Dict of appid_str -> game data for the bulk endpoint
+        tag_name: Tag name that should appear in appdetails tags
+    """
+    def mock_side_effect(*args, **kwargs):
+        params = kwargs.get("params", {})
+        if params.get("request") == "tag":
+            return (tag_data, datetime.now(timezone.utc), 0)
+        elif params.get("request") == "appdetails":
+            appid = params.get("appid")
+            game_data = tag_data.get(appid, {})
+            game_with_tags = dict(game_data)
+            game_with_tags["tags"] = {tag_name: 100}
+            return (game_with_tags, datetime.now(timezone.utc), 0)
+    return mock_side_effect
+
+
+def _make_game(appid, owners="100,000 .. 200,000", ccu=100, positive=500,
+               negative=50, average_forever=600, average_2weeks=60, price="999"):
+    """Create a minimal game data dict for tag_data."""
+    return {
+        "appid": str(appid),
+        "name": f"Game {appid}",
+        "owners": owners,
+        "ccu": ccu,
+        "positive": positive,
+        "negative": negative,
+        "average_forever": average_forever,
+        "average_2weeks": average_2weeks,
+        "price": price,
+    }
+
+
+# ---------------------------------------------------------------------------
+# TestAggregateSortOptions
+# ---------------------------------------------------------------------------
+
+class TestAggregateSortOptions:
+    """Test sort_by='reviews' and sort_by='playtime' options."""
+
+    @pytest.mark.asyncio
+    async def test_sort_by_reviews(self, mock_http):
+        """Sorting by reviews orders by total reviews (positive + negative) descending."""
+        tag_data = {
+            "1": _make_game(1, positive=100, negative=10),     # 110 total
+            "2": _make_game(2, positive=5000, negative=500),   # 5500 total
+            "3": _make_game(3, positive=1000, negative=100),   # 1100 total
+        }
+        mock_http.get_with_metadata.side_effect = _make_tag_mock_side_effect(tag_data)
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(tag="Test", sort_by="reviews")
+
+        assert isinstance(result, AggregateEngagementData)
+        assert result.sort_by == "reviews"
+        assert result.games[0].appid == 2   # 5500
+        assert result.games[1].appid == 3   # 1100
+        assert result.games[2].appid == 1   # 110
+
+    @pytest.mark.asyncio
+    async def test_sort_by_playtime(self, mock_http):
+        """Sorting by playtime orders by average_forever descending."""
+        tag_data = {
+            "1": _make_game(1, average_forever=60),    # 1 hour
+            "2": _make_game(2, average_forever=6000),  # 100 hours
+            "3": _make_game(3, average_forever=1200),  # 20 hours
+        }
+        mock_http.get_with_metadata.side_effect = _make_tag_mock_side_effect(tag_data)
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(tag="Test", sort_by="playtime")
+
+        assert isinstance(result, AggregateEngagementData)
+        assert result.sort_by == "playtime"
+        assert result.games[0].appid == 2   # 100 hrs
+        assert result.games[1].appid == 3   # 20 hrs
+        assert result.games[2].appid == 1   # 1 hr
+
+    @pytest.mark.asyncio
+    async def test_unknown_sort_by_defaults_to_owners(self, mock_http):
+        """Unknown sort_by value silently defaults to owners sorting."""
+        tag_data = {
+            "1": _make_game(1, owners="100 .. 200"),               # midpoint 150
+            "2": _make_game(2, owners="1,000,000 .. 2,000,000"),   # midpoint 1.5M
+            "3": _make_game(3, owners="10,000 .. 20,000"),         # midpoint 15k
+        }
+        mock_http.get_with_metadata.side_effect = _make_tag_mock_side_effect(tag_data)
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(tag="Test", sort_by="invalid_sort")
+
+        assert isinstance(result, AggregateEngagementData)
+        # Should fall back to owners sort
+        assert result.games[0].appid == 2   # 1.5M
+        assert result.games[1].appid == 3   # 15k
+        assert result.games[2].appid == 1   # 150
+
+
+# ---------------------------------------------------------------------------
+# TestAggregateAllZeroMetrics
+# ---------------------------------------------------------------------------
+
+class TestAggregateAllZeroMetrics:
+    """Test stats computation when all games have zero values for a metric."""
+
+    @pytest.mark.asyncio
+    async def test_all_zero_owners_returns_none_stats(self, mock_http):
+        """All games with 0 owners → owners_stats is None (filtered out)."""
+        tag_data = {
+            "1": _make_game(1, owners="0 .. 0", ccu=10),
+            "2": _make_game(2, owners="0 .. 0", ccu=20),
+            "3": _make_game(3, owners="0 .. 0", ccu=30),
+        }
+        mock_http.get_with_metadata.side_effect = _make_tag_mock_side_effect(tag_data)
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(tag="Test")
+
+        assert isinstance(result, AggregateEngagementData)
+        assert result.owners_stats is None
+        # CCU stats should still work (zeros included for CCU)
+        assert result.ccu_stats is not None
+
+    @pytest.mark.asyncio
+    async def test_all_zero_playtime_returns_none_stats(self, mock_http):
+        """All games with 0 playtime → playtime_stats is None."""
+        tag_data = {
+            "1": _make_game(1, average_forever=0, average_2weeks=0),
+            "2": _make_game(2, average_forever=0, average_2weeks=0),
+            "3": _make_game(3, average_forever=0, average_2weeks=0),
+        }
+        mock_http.get_with_metadata.side_effect = _make_tag_mock_side_effect(tag_data)
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(tag="Test")
+
+        assert isinstance(result, AggregateEngagementData)
+        assert result.playtime_stats is None
+
+    @pytest.mark.asyncio
+    async def test_all_zero_ccu_still_computes_stats(self, mock_http):
+        """All games with 0 CCU → ccu_stats still computed (zeros are real measurements)."""
+        tag_data = {
+            "1": _make_game(1, ccu=0),
+            "2": _make_game(2, ccu=0),
+            "3": _make_game(3, ccu=0),
+        }
+        mock_http.get_with_metadata.side_effect = _make_tag_mock_side_effect(tag_data)
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(tag="Test")
+
+        assert isinstance(result, AggregateEngagementData)
+        assert result.ccu_stats is not None
+        assert result.ccu_stats.mean == 0.0
+        assert result.ccu_stats.median == 0.0
+        assert result.ccu_stats.min == 0.0
+        assert result.ccu_stats.max == 0.0
+
+
+# ---------------------------------------------------------------------------
+# TestAggregateMarketWeightedZeroDivision
+# ---------------------------------------------------------------------------
+
+class TestAggregateMarketWeightedZeroDivision:
+    """Test market-weighted ratios with zero denominators."""
+
+    @pytest.mark.asyncio
+    async def test_zero_total_owners_ccu_ratio_none(self, mock_http):
+        """All games with 0 owners → market-weighted ccu_ratio is None."""
+        tag_data = {
+            "1": _make_game(1, owners="0 .. 0", ccu=10),
+            "2": _make_game(2, owners="0 .. 0", ccu=20),
+        }
+        mock_http.get_with_metadata.side_effect = _make_tag_mock_side_effect(tag_data)
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(tag="Test")
+
+        assert result.market_weighted["ccu_ratio"] is None
+        # Per-game also None (all owners are 0, no valid ratios)
+        assert result.per_game_average["ccu_ratio"] is None
+
+    @pytest.mark.asyncio
+    async def test_zero_total_reviews_review_score_none(self, mock_http):
+        """All games with 0 reviews → market-weighted review_score is None."""
+        tag_data = {
+            "1": _make_game(1, positive=0, negative=0),
+            "2": _make_game(2, positive=0, negative=0),
+        }
+        mock_http.get_with_metadata.side_effect = _make_tag_mock_side_effect(tag_data)
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(tag="Test")
+
+        assert result.market_weighted["review_score"] is None
+        assert result.per_game_average["review_score"] is None
+
+    @pytest.mark.asyncio
+    async def test_zero_total_playtime_activity_ratio_none(self, mock_http):
+        """All games with 0 average_forever → market-weighted activity_ratio is None."""
+        tag_data = {
+            "1": _make_game(1, average_forever=0, average_2weeks=0),
+            "2": _make_game(2, average_forever=0, average_2weeks=0),
+        }
+        mock_http.get_with_metadata.side_effect = _make_tag_mock_side_effect(tag_data)
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(tag="Test")
+
+        assert result.market_weighted["activity_ratio"] is None
+        assert result.per_game_average["activity_ratio"] is None
+
+
+# ---------------------------------------------------------------------------
+# TestAggregateSingleGame
+# ---------------------------------------------------------------------------
+
+class TestAggregateSingleGame:
+    """Test aggregation with only 1 game (n=1 edge case)."""
+
+    @pytest.mark.asyncio
+    async def test_single_game_tag_stats_none(self, mock_http):
+        """Single game in tag results → all stats None (need >= 2 for quantiles)."""
+        tag_data = {
+            "1": _make_game(1, ccu=500, owners="100,000 .. 200,000"),
+        }
+        mock_http.get_with_metadata.side_effect = _make_tag_mock_side_effect(tag_data)
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(tag="Test")
+
+        assert isinstance(result, AggregateEngagementData)
+        assert result.games_analyzed == 1
+        assert result.ccu_stats is None
+        assert result.owners_stats is None
+        assert result.playtime_stats is None
+        assert result.review_score_stats is None
+
+    @pytest.mark.asyncio
+    async def test_single_game_appid_stats_none(self, mock_http):
+        """Single AppID → all stats None but market_weighted still computed."""
+        game_data = {
+            "appid": 646570,
+            "name": "Slay the Spire",
+            "owners": "2,000,000 .. 5,000,000",
+            "ccu": 1500,
+            "positive": 82000,
+            "negative": 1500,
+            "average_forever": 4200,
+            "average_2weeks": 420,
+            "median_forever": 2520,
+            "median_2weeks": 180,
+            "price": "2499",
+        }
+        mock_http.get_with_metadata.return_value = (
+            game_data, datetime.now(timezone.utc), 0
+        )
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(appids=[646570])
+
+        assert isinstance(result, AggregateEngagementData)
+        assert result.games_analyzed == 1
+        assert result.ccu_stats is None
+        # Market-weighted ratios still computed with single game
+        assert result.market_weighted["ccu_ratio"] is not None
+        assert result.market_weighted["review_score"] is not None
+
+    @pytest.mark.asyncio
+    async def test_single_game_per_game_list_populated(self, mock_http):
+        """Single game aggregation still returns 1 game in the games list."""
+        tag_data = {
+            "1": _make_game(1, ccu=500),
+        }
+        mock_http.get_with_metadata.side_effect = _make_tag_mock_side_effect(tag_data)
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(tag="Test")
+
+        assert len(result.games) == 1
+        assert result.games[0].appid == 1
+
+
+# ---------------------------------------------------------------------------
+# TestAggregateAppIdDuplicates
+# ---------------------------------------------------------------------------
+
+class TestAggregateAppIdDuplicates:
+    """Test AppID list with duplicate entries."""
+
+    @pytest.mark.asyncio
+    async def test_duplicate_appids_fetched_twice(self, mock_http):
+        """Duplicate AppIDs in list are fetched separately (no dedup in client)."""
+        game_data = {
+            "appid": 646570,
+            "name": "Slay the Spire",
+            "owners": "2,000,000 .. 5,000,000",
+            "ccu": 1500,
+            "positive": 82000,
+            "negative": 1500,
+            "average_forever": 4200,
+            "average_2weeks": 420,
+            "median_forever": 2520,
+            "median_2weeks": 180,
+            "price": "2499",
+        }
+        mock_http.get_with_metadata.return_value = (
+            game_data, datetime.now(timezone.utc), 0
+        )
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(appids=[646570, 646570])
+
+        assert isinstance(result, AggregateEngagementData)
+        # Both fetches succeed — client doesn't dedup
+        assert result.games_total == 2
+        assert result.games_analyzed == 2
+
+
+# ---------------------------------------------------------------------------
+# TestAggregateIdenticalValues
+# ---------------------------------------------------------------------------
+
+class TestAggregateIdenticalValues:
+    """Test aggregation when all games have identical metric values."""
+
+    @pytest.mark.asyncio
+    async def test_identical_ccu_stats(self, mock_http):
+        """All games with same CCU → mean=median=p25=p75=min=max."""
+        tag_data = {
+            str(i): _make_game(i, ccu=500)
+            for i in range(1, 6)
+        }
+        mock_http.get_with_metadata.side_effect = _make_tag_mock_side_effect(tag_data)
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(tag="Test")
+
+        assert result.ccu_stats is not None
+        assert result.ccu_stats.mean == 500.0
+        assert result.ccu_stats.median == 500.0
+        assert result.ccu_stats.min == 500.0
+        assert result.ccu_stats.max == 500.0
+        assert result.ccu_stats.p25 == 500.0
+        assert result.ccu_stats.p75 == 500.0
+
+    @pytest.mark.asyncio
+    async def test_identical_review_scores(self, mock_http):
+        """All games with same review ratio → identical stats."""
+        tag_data = {
+            str(i): _make_game(i, positive=900, negative=100)
+            for i in range(1, 6)
+        }
+        mock_http.get_with_metadata.side_effect = _make_tag_mock_side_effect(tag_data)
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(tag="Test")
+
+        assert result.review_score_stats is not None
+        assert result.review_score_stats.mean == 90.0
+        assert result.review_score_stats.median == 90.0
+
+
+# ---------------------------------------------------------------------------
+# TestAggregateMixedNoneReviewScore
+# ---------------------------------------------------------------------------
+
+class TestAggregateMixedNoneReviewScore:
+    """Test stats when some games have review_score=None (0 reviews)."""
+
+    @pytest.mark.asyncio
+    async def test_mixed_none_review_scores(self, mock_http):
+        """Games with 0 reviews (review_score=None) excluded from review_score_stats."""
+        tag_data = {
+            "1": _make_game(1, positive=900, negative=100),   # score = 90.0
+            "2": _make_game(2, positive=0, negative=0),       # score = None
+            "3": _make_game(3, positive=800, negative=200),   # score = 80.0
+            "4": _make_game(4, positive=0, negative=0),       # score = None
+            "5": _make_game(5, positive=950, negative=50),    # score = 95.0
+        }
+        mock_http.get_with_metadata.side_effect = _make_tag_mock_side_effect(tag_data)
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(tag="Test")
+
+        assert result.review_score_stats is not None
+        # Only 3 games with valid review scores: 90, 80, 95
+        assert result.review_score_stats.games_with_data == 3
+        # Mean = (90 + 80 + 95) / 3 = 88.33
+        assert result.review_score_stats.mean == pytest.approx(88.33, abs=0.01)
+        assert result.review_score_stats.min == 80.0
+        assert result.review_score_stats.max == 95.0
+
+    @pytest.mark.asyncio
+    async def test_only_one_valid_review_score_returns_none(self, mock_http):
+        """Only 1 game with reviews, rest have 0 → review_score_stats None (need >= 2)."""
+        tag_data = {
+            "1": _make_game(1, positive=900, negative=100),   # score = 90.0
+            "2": _make_game(2, positive=0, negative=0),       # score = None
+            "3": _make_game(3, positive=0, negative=0),       # score = None
+        }
+        mock_http.get_with_metadata.side_effect = _make_tag_mock_side_effect(tag_data)
+
+        client = SteamSpyClient(mock_http)
+        result = await client.aggregate_engagement(tag="Test")
+
+        # Only 1 valid review score → below minimum of 2
+        assert result.review_score_stats is None
+        # Per-game average still computed (1 valid score)
+        assert result.per_game_average["review_score"] is not None
+        assert result.per_game_average["review_score"] == 90.0
