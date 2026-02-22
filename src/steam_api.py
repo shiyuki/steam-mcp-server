@@ -1576,9 +1576,10 @@ class SteamReviewClient:
     # ---------------------------------------------------------------------------
 
     async def _fetch_stats_scan(
-        self, appid: int, language: str, max_reviews: int
+        self, appid: int, language: str, max_reviews: int,
+        filter_mode: str = "recent",
     ) -> list[dict]:
-        """Fetch reviews in recent-sort order for stats computation.
+        """Fetch reviews for stats computation (histogram, sentiment periods).
 
         Uses review_type=all and purchase_type=all regardless of user filters.
         Only the language filter carries over.
@@ -1586,13 +1587,15 @@ class SteamReviewClient:
         Args:
             appid: Steam AppID
             language: Language filter
-            max_reviews: Maximum reviews to collect (1000 compact, 5000 full)
+            max_reviews: Maximum reviews to collect
+            filter_mode: Steam API filter — "recent" for newest reviews,
+                "all" for helpfulness-sorted (time-diverse coverage)
 
         Returns:
             List of raw review dicts (not parsed)
         """
         base_params: dict = {
-            "filter": "recent",
+            "filter": filter_mode,
             "language": language,
             "review_type": "all",
             "purchase_type": "all",
@@ -1914,105 +1917,6 @@ class SteamReviewClient:
         return (fixed_rolling, yearly, ratio_timeline)
 
     # ---------------------------------------------------------------------------
-    # EA-period targeted scan (best-effort)
-    # ---------------------------------------------------------------------------
-
-    async def _fetch_ea_period_scan(
-        self, appid: int, language: str, ea_dates: EADateInfo, max_reviews: int = 2000
-    ) -> list[dict]:
-        """Best-effort fetch of reviews from the EA release period for sentiment coverage.
-
-        Pages through helpfulness-sorted reviews and post-filters by EA-period
-        timestamps. This is best-effort because the Steam API has no mechanism to
-        directly target a historical date range beyond 365 days ago. The yield
-        depends on whether highly-voted reviews happen to fall within the EA window.
-
-        Only called when EA dates are available and game has significant review volume
-        (total_reviews > 10000) and EA release is more than 1 year ago.
-
-        Args:
-            appid: Steam AppID
-            language: Language filter
-            ea_dates: Resolved EA date info (needs ea_release_date or full_release_date)
-            max_reviews: Maximum EA-period reviews to collect
-
-        Returns:
-            List of raw review dicts from the EA period (may be empty if no
-            EA-period reviews appear in the helpfulness-sorted pages scanned)
-        """
-        # Determine anchor date
-        anchor_date_str = ea_dates.ea_release_date or ea_dates.full_release_date
-        if not anchor_date_str:
-            return []
-
-        try:
-            anchor_dt = datetime.strptime(anchor_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        except ValueError:
-            return []
-
-        # Calculate how many days ago the anchor was
-        now = datetime.now(tz=timezone.utc)
-        days_since_anchor = (now - anchor_dt).days
-        if days_since_anchor <= 365:
-            # Game is less than a year old -- main stats scan likely covers EA period
-            return []
-
-        # Steam API filter='all' sorts by helpfulness (most helpful first).
-        # We page through and post-filter by timestamp. This is best-effort:
-        # there is no API param to target reviews from a specific historical window
-        # older than 365 days ago (day_range counts back from NOW, caps at 365).
-        base_params: dict = {
-            "filter": "all",
-            "language": language,
-            "review_type": "all",
-            "purchase_type": "all",
-            "filter_offtopic_activity": "0",  # Don't filter -- we want EA reviews regardless
-        }
-
-        anchor_ts = int(anchor_dt.timestamp())
-        ea_end_ts = anchor_ts + 365 * 86400  # First year from anchor
-
-        cursor = "*"
-        seen_ids: set[str] = set()
-        ea_reviews: list[dict] = []
-        pages_fetched = 0
-        max_pages = 20  # Cap pages scanned -- diminishing returns beyond this
-
-        while pages_fetched < max_pages:
-            try:
-                data, cursor_new = await self._fetch_review_page(appid, cursor, base_params)
-            except Exception as e:
-                logger.warning(f"EA period scan error for AppID {appid}: {e}")
-                break
-
-            page_reviews = data.get("reviews", [])
-            if not page_reviews:
-                break
-            if cursor_new == cursor and pages_fetched > 0:
-                break
-
-            for review in page_reviews:
-                rid = str(review.get("recommendationid", ""))
-                ts = review.get("timestamp_created", 0)
-                if rid and rid not in seen_ids and anchor_ts <= ts < ea_end_ts:
-                    seen_ids.add(rid)
-                    ea_reviews.append(review)
-
-            cursor = cursor_new
-            pages_fetched += 1
-
-            if len(ea_reviews) >= max_reviews:
-                break
-
-            await asyncio.sleep(0.1)
-
-        logger.info(
-            f"EA period scan for AppID {appid}: found {len(ea_reviews)} reviews "
-            f"from EA period across {pages_fetched} pages (best-effort)"
-        )
-        return ea_reviews[:max_reviews]
-
-    # ---------------------------------------------------------------------------
     # Language distribution
     # ---------------------------------------------------------------------------
 
@@ -2153,24 +2057,39 @@ class SteamReviewClient:
                         days = num * 365
                     day_range_param = min(days, 365)  # Steam caps at 365
 
-        # Stats scan size by detail level
-        stats_limit = 1000 if detail_level == "compact" else 5000
+        # Dual stats scan: helpful (time-diverse) + recent (recency coverage)
+        # Configurable split — adjust limits to shift balance between coverage types
+        if detail_level == "compact":
+            helpful_limit, recent_limit = 500, 500
+        else:
+            helpful_limit, recent_limit = 3000, 3000
 
-        # Run review text + stats scan + EA dates + language distribution in parallel
+        # Run review text + dual stats scans + EA dates + language distribution in parallel
         text_task = self._fetch_review_text(
             appid, limit, language, review_type, purchase_type,
             filter_offtopic, day_range_param, platform, sort
         )
-        stats_task = self._fetch_stats_scan(appid, language, stats_limit)
+        stats_helpful_task = self._fetch_stats_scan(appid, language, helpful_limit, filter_mode="all")
+        stats_recent_task = self._fetch_stats_scan(appid, language, recent_limit, filter_mode="recent")
         ea_task = self._resolve_ea_dates(appid)
         lang_task = self._fetch_language_distribution(appid)
 
         (
             (raw_text, query_summary, last_cursor, pages_text),
-            stats_reviews,
+            stats_helpful,
+            stats_recent,
             ea_dates,
             lang_dist,
-        ) = await asyncio.gather(text_task, stats_task, ea_task, lang_task)
+        ) = await asyncio.gather(text_task, stats_helpful_task, stats_recent_task, ea_task, lang_task)
+
+        # Merge helpful + recent stats scans (dedup by recommendationid)
+        seen_ids: set[str] = set()
+        stats_reviews: list[dict] = []
+        for r in stats_helpful + stats_recent:
+            rid = str(r.get("recommendationid", ""))
+            if rid and rid not in seen_ids:
+                seen_ids.add(rid)
+                stats_reviews.append(r)
 
         # Determine partial status (set during _fetch_review_text if mid-pagination failure)
         # We can't directly get it from the tuple, but partial is implicitly detected by
@@ -2195,21 +2114,6 @@ class SteamReviewClient:
                 meta=meta,
                 query_params=query_params,
             )
-
-        # EA-period targeted scan for high-volume games (best-effort)
-        # Only if: EA dates available AND total reviews > 10000 (high-volume threshold)
-        # Note: filter='all' sorts by helpfulness, so EA-period review yield is
-        # probabilistic -- depends on whether highly-voted reviews are from the EA era.
-        total_available_check = query_summary.get("total_reviews", 0) if query_summary else 0
-        if total_available_check > 10000 and (ea_dates.ea_release_date or ea_dates.full_release_date):
-            ea_period_reviews = await self._fetch_ea_period_scan(appid, language, ea_dates)
-            # Merge EA-period reviews into stats_reviews (dedup by recommendationid)
-            existing_ids = {str(r.get("recommendationid", "")) for r in stats_reviews}
-            for r in ea_period_reviews:
-                rid = str(r.get("recommendationid", ""))
-                if rid and rid not in existing_ids:
-                    stats_reviews.append(r)
-                    existing_ids.add(rid)
 
         # Parse raw review text to ReviewItem list
         parsed_reviews: list[ReviewItem] = [self._parse_review(r) for r in raw_text]
