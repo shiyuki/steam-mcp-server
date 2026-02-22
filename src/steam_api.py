@@ -129,6 +129,72 @@ BOWLING_FALLBACK_APPIDS = {901583, 12210, 2990, 891040, 22230}
 TAG_CROSSVAL_THRESHOLD = 5000
 
 
+# ---------------------------------------------------------------------------
+# Review Intelligence helpers
+# ---------------------------------------------------------------------------
+
+def _strip_bbcode(text: str) -> str:
+    """Strip BBCode markup tags, preserving text content including spoiler text.
+
+    Handles: [b], [i], [u], [h2], [spoiler], [hr], [list], [*], [url=...], etc.
+    Order matters — URL tags require two-pass removal before generic tag pass.
+
+    Args:
+        text: BBCode-formatted string
+
+    Returns:
+        Plain text with all BBCode tags removed and whitespace trimmed
+    """
+    # Remove [url=...] opening tags (with attribute)
+    text = re.sub(r'\[url=[^\]]*\]', '', text)
+    # Remove [/url] closing tags
+    text = re.sub(r'\[/url\]', '', text, flags=re.IGNORECASE)
+    # Convert list item markers to newlines
+    text = re.sub(r'\[\*\]', '\n', text)
+    # Remove all remaining BBCode tags (opening, closing, self-closing with attributes)
+    text = re.sub(r'\[/?[a-zA-Z][a-zA-Z0-9]*[^\]]*\]', '', text)
+    return text.strip()
+
+
+def _truncate_text(text: str, max_chars: int = 1000) -> tuple[str, bool, int]:
+    """Truncate text to max_chars with word-boundary awareness.
+
+    Attempts to break at a word boundary (last space before limit) rather than
+    mid-word, falling back to hard truncation if the nearest space is too far back.
+
+    Args:
+        text: Input string to truncate
+        max_chars: Maximum character count (default 1000)
+
+    Returns:
+        Tuple of (truncated_text, is_truncated, full_length)
+    """
+    full_length = len(text)
+    if full_length <= max_chars:
+        return (text, False, full_length)
+    # Try to break at a word boundary
+    last_space = text.rfind(' ', 0, max_chars)
+    if last_space > max_chars * 0.8:
+        candidate = text[:last_space]
+    else:
+        candidate = text[:max_chars]
+    return (candidate, True, full_length)
+
+
+def _ms_to_iso(ms_ts) -> str | None:
+    """Convert a Gamalytic Unix millisecond timestamp to an ISO date string.
+
+    Args:
+        ms_ts: Millisecond Unix timestamp (int or float). Falsy values (0, None) return None.
+
+    Returns:
+        ISO date string "YYYY-MM-DD" in UTC, or None if timestamp is absent/zero
+    """
+    if not ms_ts:
+        return None
+    return datetime.fromtimestamp(ms_ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
 class SteamSpyClient:
     """Client for SteamSpy API (tag-based game search)."""
 
@@ -491,6 +557,8 @@ class SteamSpyClient:
             "developer": data.get("developer", ""),
             "publisher": data.get("publisher", ""),
             "ccu": ccu,
+            "owners_min": owners_min,
+            "owners_max": owners_max,
             "owners_midpoint": owners_midpoint,
             "average_forever": average_forever,
             "median_forever": median_forever,
