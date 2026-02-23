@@ -402,11 +402,20 @@ def register_tools(mcp: FastMCP):
     async def fetch_metadata(appid: int) -> str:
         """Fetch metadata for a Steam game by AppID.
 
+        Returns comprehensive game details from the Steam Store including identification,
+        pricing, platform support, release info, reviews, categories, media assets, DLC,
+        and content information.
+
+        Extended fields (Phase 8): achievement_count, ratings (regional: ESRB, PEGI, USK, etc.),
+        supported_languages (structured list with full_audio indicator), developer_website,
+        pc_requirements_min/rec (HTML-stripped plain text), controller_support ("full"/"partial"/None).
+
         Args:
             appid: Steam AppID (e.g., 646570 for Slay the Spire)
 
         Returns:
-            JSON string with game metadata including name, tags, developer, and description
+            JSON string with game metadata including name, tags, developer, description,
+            and all extended Steam Store fields
         """
         # Input validation
         if appid <= 0:
@@ -421,29 +430,81 @@ def register_tools(mcp: FastMCP):
         return json.dumps(result.model_dump())
 
     @mcp.tool()
-    async def fetch_commercial(appid: int) -> str:
-        """Fetch commercial data (pricing, revenue estimates) for a Steam game.
+    async def fetch_commercial(appid: int, detail_level: str = "full") -> str:
+        """Fetch commercial data (pricing, revenue estimates, and extended analytics) for a Steam game.
 
         Returns revenue as a range (min-max) with confidence level and data source.
         Uses Gamalytic API as primary source, falls back to review-based estimation.
         Includes triangulation warning when data sources disagree significantly.
 
+        Extended fields (Phase 8): copies_sold, followers, accuracy, history array
+        (daily snapshots with revenue/reviews/players trends), country_data (top 10 markets),
+        audience_overlap and also_played (10 competitor entries each), estimate_details
+        (3 independent revenue models), gamalytic_dlc, early access info, and player count.
+
+        Overlapping fields prefixed with gamalytic_ (gamalytic_owners, gamalytic_players,
+        gamalytic_reviews) for cross-validation with SteamSpy data.
+
         Args:
             appid: Steam AppID (e.g., 646570 for Slay the Spire)
+            detail_level: "full" (default) returns all fields; "summary" returns core fields only
+                         (revenue, copies_sold, price, accuracy, review_score, followers, top-3 countries).
+                         Summary mode excludes: history array, competitor arrays, DLC, estimation breakdown.
 
         Returns:
-            JSON string with revenue range, confidence, source, and optional triangulation warning
+            JSON string with revenue range, confidence, source, extended Gamalytic fields,
+            and optional triangulation warning
         """
         if appid <= 0:
             return json.dumps({"error": "appid must be positive", "error_type": "validation"})
 
-        logger.info("Fetching commercial data for AppID: %d", appid)
-        result = await _gamalytic.get_revenue_estimate(appid)
+        if detail_level not in ("full", "summary"):
+            return json.dumps({"error": "detail_level must be 'full' or 'summary'", "error_type": "validation"})
+
+        logger.info("Fetching commercial data for AppID: %d, detail_level: %s", appid, detail_level)
+        result = await _gamalytic.get_commercial_data(appid, detail_level=detail_level)
 
         if isinstance(result, APIError):
             return json.dumps(result.model_dump())
 
         return json.dumps(result.model_dump())
+
+    @mcp.tool()
+    async def fetch_commercial_batch(appids: str, detail_level: str = "summary") -> str:
+        """Fetch commercial data for multiple Steam games in a single call.
+
+        Accepts comma-separated AppIDs and returns an array of CommercialData results.
+        Uses concurrent fetching with rate limiting (5 req/s for Gamalytic).
+        Default detail_level is "summary" for batch to reduce response size.
+
+        Args:
+            appids: Comma-separated Steam AppIDs (e.g., "646570,2379780,247080")
+            detail_level: "full" or "summary" (default "summary" for batch efficiency)
+
+        Returns:
+            JSON string with array of commercial data objects (one per AppID, same order as input).
+            Failed AppIDs return error objects in the array instead of commercial data.
+        """
+        appids_str = appids.strip()
+        if not appids_str:
+            return json.dumps({"error": "appids is required", "error_type": "validation"})
+
+        if detail_level not in ("full", "summary"):
+            return json.dumps({"error": "detail_level must be 'full' or 'summary'", "error_type": "validation"})
+
+        try:
+            appid_list = [int(a.strip()) for a in appids_str.split(",") if a.strip()]
+            if not appid_list:
+                return json.dumps({"error": "appids list is empty", "error_type": "validation"})
+            if any(a <= 0 for a in appid_list):
+                return json.dumps({"error": "All appids must be positive", "error_type": "validation"})
+        except ValueError:
+            return json.dumps({"error": "appids must be comma-separated integers", "error_type": "validation"})
+
+        logger.info("Batch fetching commercial data for %d AppIDs, detail_level: %s", len(appid_list), detail_level)
+        results = await _gamalytic.get_commercial_batch(appid_list, detail_level=detail_level)
+
+        return json.dumps([r.model_dump() for r in results])
 
     @mcp.tool()
     async def fetch_engagement(appid: int) -> str:
