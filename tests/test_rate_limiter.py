@@ -29,10 +29,10 @@ class TestRateLimitConfig:
         assert config.time_period == 1.5
 
     def test_gamalytic_config(self):
-        """Gamalytic should have 10 req/min rate limit."""
+        """Gamalytic should have 5 req/s rate limit (Phase 8 verified)."""
         config = RATE_LIMITS["gamalytic.com"]
-        assert config.max_rate == 10
-        assert config.time_period == 60.0
+        assert config.max_rate == 5
+        assert config.time_period == 1.0
 
     def test_default_fallback(self):
         """Default rate limit should be conservative."""

@@ -25,7 +25,7 @@ RATE_LIMITS: dict[str, RateLimitConfig] = {
     "steamspy.com": RateLimitConfig(max_rate=1, time_period=1.0),  # 1 req/sec
     "store.steampowered.com": RateLimitConfig(max_rate=1, time_period=1.5),  # ~0.67 req/sec (Phase 1 conservative limit)
     "api.steampowered.com": RateLimitConfig(max_rate=1, time_period=1.5),  # Same as store
-    "gamalytic.com": RateLimitConfig(max_rate=10, time_period=60.0),  # Conservative 10 req/min (TBD)
+    "gamalytic.com": RateLimitConfig(max_rate=5, time_period=1.0),  # 5 req/s (Phase 8 verified)
 }
 
 # Safe fallback for unknown hosts
