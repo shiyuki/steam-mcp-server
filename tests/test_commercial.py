@@ -73,9 +73,17 @@ class TestGamalyticClient:
             "owners": "500,000 .. 1,000,000"
         }
 
+        # Third call: Steam Web API player count (second-tier fallback, fails silently)
+        steam_web_api_request = httpx.Request(
+            "GET",
+            "https://api.steampowered.com/ISteamUserStats/GetNumberOfCurrentPlayers/v1/"
+        )
+        steam_web_api_response = httpx.Response(503, request=steam_web_api_request)
+
         mock_http.get_with_metadata.side_effect = [
             httpx.HTTPStatusError("Service unavailable", request=gamalytic_request, response=gamalytic_response),
-            (steamspy_data, datetime.now(timezone.utc), 0)
+            (steamspy_data, datetime.now(timezone.utc), 0),
+            httpx.HTTPStatusError("Service unavailable", request=steam_web_api_request, response=steam_web_api_response),
         ]
 
         client = GamalyticClient(mock_http)
@@ -103,9 +111,17 @@ class TestGamalyticClient:
             "owners": "100,000 .. 200,000"
         }
 
+        # Third call: Steam Web API player count (second-tier fallback, fails silently)
+        steam_web_api_request = httpx.Request(
+            "GET",
+            "https://api.steampowered.com/ISteamUserStats/GetNumberOfCurrentPlayers/v1/"
+        )
+        steam_web_api_response = httpx.Response(503, request=steam_web_api_request)
+
         mock_http.get_with_metadata.side_effect = [
             ConnectionError("DNS resolution failed"),
-            (steamspy_data, datetime.now(timezone.utc), 0)
+            (steamspy_data, datetime.now(timezone.utc), 0),
+            httpx.HTTPStatusError("Service unavailable", request=steam_web_api_request, response=steam_web_api_response),
         ]
 
         client = GamalyticClient(mock_http)
@@ -156,9 +172,17 @@ class TestGamalyticClient:
             "price": "0"  # Free-to-play
         }
 
+        # Third call: Steam Web API player count (second-tier fallback, fails silently)
+        steam_web_api_request = httpx.Request(
+            "GET",
+            "https://api.steampowered.com/ISteamUserStats/GetNumberOfCurrentPlayers/v1/"
+        )
+        steam_web_api_response = httpx.Response(503, request=steam_web_api_request)
+
         mock_http.get_with_metadata.side_effect = [
             httpx.HTTPStatusError("Not found", request=gamalytic_request, response=gamalytic_response),
-            (steamspy_data, datetime.now(timezone.utc), 0)
+            (steamspy_data, datetime.now(timezone.utc), 0),
+            httpx.HTTPStatusError("Not found", request=steam_web_api_request, response=steam_web_api_response),
         ]
 
         client = GamalyticClient(mock_http)

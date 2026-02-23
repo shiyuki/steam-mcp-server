@@ -13,6 +13,7 @@ from src.schemas import (
     AggregateEngagementData, MetricStats, GameEngagementSummary,
     ReviewItem, ReviewsData, ReviewAggregates, PlaytimeBucket, SentimentPeriod,
     ReviewsMeta, QueryParams, ReviewSnippet, EADateInfo,
+    GamalyticHistoryEntry, CountryDataEntry, CompetitorEntry, EstimateModelEntry, DLCEntry,
 )
 from src.logging_config import get_logger
 
@@ -1147,17 +1148,24 @@ class GamalyticClient:
         self.http = http_client
 
     async def get_revenue_estimate(self, appid: int) -> CommercialData | APIError:
-        """Get revenue estimate for a Steam game with fallback and triangulation.
+        """Backward-compatible alias for get_commercial_data."""
+        return await self.get_commercial_data(appid)
 
-        Primary path: Gamalytic API (no auth required)
-        Fallback path: SteamSpy review-based estimation (reviews * 30-50)
+    async def get_commercial_data(self, appid: int, detail_level: str = "full") -> CommercialData | APIError:
+        """Get commercial data for a Steam game with full field parsing and fallback.
+
+        Primary path: Gamalytic API (no auth required) — parses 40+ fields
+        Fallback path 1: Steam Web API player count (when Gamalytic fails)
+        Fallback path 2: SteamSpy CCU from appdetails (third tier, stale data)
+        Fallback path 3: SteamSpy review-based estimation (reviews * 30-50)
         Triangulation: Compare Gamalytic with SteamSpy owner data when available
 
         Args:
-            appid: Steam AppID to get revenue estimate for
+            appid: Steam AppID to get commercial data for
+            detail_level: "full" (default) or "summary" (strips heavy arrays)
 
         Returns:
-            CommercialData with revenue range and metadata, or APIError on failure
+            CommercialData with revenue range and extended metadata, or APIError on failure
         """
         # Primary path: Try Gamalytic API first
         try:
@@ -1176,7 +1184,236 @@ class GamalyticClient:
             revenue_min = revenue * 0.80
             revenue_max = revenue * 1.20
 
-            # Create CommercialData with Gamalytic source
+            # --- Extended field parsing (all defensive: each field in its own try/except) ---
+
+            copies_sold = None
+            try:
+                raw = data.get("copiesSold")
+                if raw is not None:
+                    val = int(raw)
+                    copies_sold = val if val >= 0 else None
+            except Exception:
+                pass
+
+            followers = None
+            try:
+                raw = data.get("followers")
+                if raw is not None:
+                    val = int(raw)
+                    followers = val if val >= 0 else None
+            except Exception:
+                pass
+
+            accuracy = None
+            try:
+                raw = data.get("accuracy")
+                if raw is not None:
+                    val = float(raw)
+                    accuracy = val if 0.0 <= val <= 1.0 else None
+            except Exception:
+                pass
+
+            total_revenue_flag = None
+            try:
+                raw = data.get("totalRevenue")
+                if raw is not None:
+                    total_revenue_flag = bool(raw)
+            except Exception:
+                pass
+
+            review_score = None
+            try:
+                raw = data.get("reviewScore")
+                if raw is not None:
+                    review_score = float(raw)
+            except Exception:
+                pass
+
+            gamalytic_owners = None
+            try:
+                raw = data.get("owners")
+                if raw is not None:
+                    val = int(raw)
+                    gamalytic_owners = val if val >= 0 else None
+            except Exception:
+                pass
+
+            gamalytic_players = None
+            try:
+                raw = data.get("players")
+                if raw is not None:
+                    val = int(raw)
+                    gamalytic_players = val if val >= 0 else None
+            except Exception:
+                pass
+
+            gamalytic_reviews = None
+            try:
+                raw = data.get("reviews")
+                if raw is not None:
+                    val = int(raw)
+                    gamalytic_reviews = val if val >= 0 else None
+            except Exception:
+                pass
+
+            gamalytic_is_early_access = None
+            try:
+                raw = data.get("isEarlyAccess")
+                if raw is not None:
+                    gamalytic_is_early_access = bool(raw)
+            except Exception:
+                pass
+
+            gamalytic_ea_date = None
+            try:
+                raw = data.get("earlyAccessDate")
+                if raw is not None:
+                    gamalytic_ea_date = _ms_to_iso(raw)
+            except Exception:
+                pass
+
+            # --- History array parsing ---
+            history_entries = []
+            try:
+                raw_history = data.get("history", [])
+                for i, entry in enumerate(raw_history):
+                    entry_type = "launch" if i == 0 else "daily"
+                    ts = _ms_to_iso(entry.get("timeStamp"))
+                    # Light validation: reject timestamps before 2003
+                    if ts and ts < "2003":
+                        ts = None
+                    history_entries.append(GamalyticHistoryEntry(
+                        entry_type=entry_type,
+                        timestamp=ts,
+                        reviews=entry.get("reviews"),
+                        price=entry.get("price"),
+                        score=entry.get("score"),
+                        rank=entry.get("rank"),
+                        followers=entry.get("followers"),
+                        gamalytic_players=entry.get("players"),
+                        avg_playtime=entry.get("avgPlaytime"),
+                        sales=entry.get("sales"),
+                        revenue=entry.get("revenue"),
+                    ))
+            except Exception:
+                history_entries = []
+
+            # --- Country data (cap at top 10 by share_pct) ---
+            country_entries = []
+            try:
+                raw_countries = data.get("countryData", [])
+                if isinstance(raw_countries, list):
+                    for c in raw_countries:
+                        if isinstance(c, dict):
+                            share_raw = c.get("share")
+                            country_entries.append(CountryDataEntry(
+                                country_code=str(c.get("country", "")),
+                                share_pct=float(share_raw) if share_raw is not None else None,
+                            ))
+                    country_entries.sort(key=lambda x: x.share_pct or 0, reverse=True)
+                    country_entries = country_entries[:10]
+            except Exception:
+                country_entries = []
+
+            # --- Audience overlap (up to 10 entries) ---
+            overlap_entries = []
+            try:
+                raw_overlap = data.get("audienceOverlap", [])
+                if isinstance(raw_overlap, list):
+                    for item in raw_overlap[:10]:
+                        if isinstance(item, dict):
+                            overlap_entries.append(CompetitorEntry(
+                                appid=item.get("appId") or item.get("steamId"),
+                                name=str(item.get("name", "")),
+                                overlap_pct=item.get("overlap") or item.get("overlapPercent"),
+                                revenue=item.get("revenue"),
+                                followers=item.get("followers"),
+                                score=item.get("score"),
+                            ))
+            except Exception:
+                overlap_entries = []
+
+            # --- Also played (up to 10 entries) ---
+            also_played_entries = []
+            try:
+                raw_also = data.get("alsoPlayed", [])
+                if isinstance(raw_also, list):
+                    for item in raw_also[:10]:
+                        if isinstance(item, dict):
+                            also_played_entries.append(CompetitorEntry(
+                                appid=item.get("appId") or item.get("steamId"),
+                                name=str(item.get("name", "")),
+                                overlap_pct=item.get("overlap") or item.get("overlapPercent"),
+                                revenue=item.get("revenue"),
+                                followers=item.get("followers"),
+                                score=item.get("score"),
+                            ))
+            except Exception:
+                also_played_entries = []
+
+            # --- Estimate details ---
+            estimate_entries = []
+            try:
+                raw_estimates = data.get("estimateDetails", [])
+                if isinstance(raw_estimates, list):
+                    for est in raw_estimates:
+                        if isinstance(est, dict):
+                            estimate_entries.append(EstimateModelEntry(
+                                model_name=str(est.get("model", est.get("name", ""))),
+                                estimate=est.get("estimate") or est.get("value"),
+                            ))
+            except Exception:
+                estimate_entries = []
+
+            # --- DLC array ---
+            dlc_entries = []
+            try:
+                raw_dlc = data.get("dlc", [])
+                if isinstance(raw_dlc, list):
+                    for d in raw_dlc:
+                        if isinstance(d, dict):
+                            dlc_entries.append(DLCEntry(
+                                name=str(d.get("name", "")),
+                                price=d.get("price"),
+                                release_date=_ms_to_iso(d.get("releaseDate")),
+                                revenue=d.get("revenue"),
+                            ))
+            except Exception:
+                dlc_entries = []
+
+            # --- Player count: extract from history (first tier) ---
+            current_player_count = None
+            player_count_source = None
+            player_count_note = None
+            if history_entries and len(history_entries) > 1:
+                latest = history_entries[-1]
+                if latest.gamalytic_players is not None:
+                    current_player_count = latest.gamalytic_players
+                    player_count_source = "gamalytic_history"
+
+            # --- Prominent warning if expected extended fields are absent ---
+            expected_extended = ["copiesSold", "history", "countryData"]
+            extended_present = any(data.get(f) for f in expected_extended)
+            if not extended_present and data.get("revenue"):
+                logger.error(
+                    "=" * 60 + "\n"
+                    "GAMALYTIC EXTENDED FIELDS UNAVAILABLE\n"
+                    f"AppID {appid}: expected fields (copiesSold, history, countryData) absent.\n"
+                    "API response may have changed structure. Core revenue data returned.\n"
+                    "Fix needed: verify Gamalytic /game/{appid} response shape.\n"
+                    + "=" * 60
+                )
+
+            # --- detail_level filtering ---
+            if detail_level == "summary":
+                history_entries = []
+                overlap_entries = []
+                also_played_entries = []
+                dlc_entries = []
+                estimate_entries = []
+                country_entries = country_entries[:3]
+
+            # Create CommercialData with all fields
             commercial_data = CommercialData(
                 appid=appid,
                 name=name,
@@ -1187,7 +1424,27 @@ class GamalyticClient:
                 confidence="high",
                 source="gamalytic",
                 fetched_at=fetched_at,
-                cache_age_seconds=cache_age
+                cache_age_seconds=cache_age,
+                # Extended fields
+                copies_sold=copies_sold,
+                followers=followers,
+                accuracy=accuracy,
+                total_revenue=total_revenue_flag,
+                review_score=review_score,
+                gamalytic_owners=gamalytic_owners,
+                gamalytic_players=gamalytic_players,
+                gamalytic_reviews=gamalytic_reviews,
+                gamalytic_is_early_access=gamalytic_is_early_access,
+                gamalytic_ea_date=gamalytic_ea_date,
+                history=history_entries,
+                country_data=country_entries,
+                audience_overlap=overlap_entries,
+                also_played=also_played_entries,
+                estimate_details=estimate_entries,
+                gamalytic_dlc=dlc_entries,
+                current_player_count=current_player_count,
+                player_count_source=player_count_source,
+                player_count_note=player_count_note,
             )
 
             # Triangulation: Compare with SteamSpy owner data
@@ -1201,14 +1458,27 @@ class GamalyticClient:
 
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
-            logger.warning(f"Gamalytic API error {status} for AppID {appid}, falling back to review estimation")
+            logger.warning(f"Gamalytic API error {status} for AppID {appid}, trying Steam Web API fallback")
             # Fall through to fallback
         except Exception as e:
-            logger.warning(f"Gamalytic API error for AppID {appid}: {e}, falling back to review estimation")
+            logger.warning(f"Gamalytic API error for AppID {appid}: {e}, trying Steam Web API fallback")
             # Fall through to fallback
 
-        # Fallback path: Review-based estimation using SteamSpy
-        return await self._get_review_based_estimate(appid)
+        # Fallback path: Try Steam Web API for player count, then review-based estimate
+        fallback_result = await self._get_review_based_estimate(appid)
+        if isinstance(fallback_result, CommercialData):
+            # Try to get player count from Steam Web API (second-tier fallback)
+            steam_ccu = await self._get_steam_player_count(appid)
+            if steam_ccu is not None:
+                # Steam Web API succeeded — override any SteamSpy CCU from _get_review_based_estimate
+                fallback_result.current_player_count = steam_ccu
+                fallback_result.player_count_source = "steam_web_api"
+                fallback_result.player_count_note = (
+                    "Gamalytic unavailable. Player count from Steam Web API "
+                    "(real-time snapshot, may need rerun for updated data)."
+                )
+            # If Steam Web API also failed, _get_review_based_estimate already set SteamSpy CCU as third fallback
+        return fallback_result
 
     async def _get_review_based_estimate(self, appid: int) -> CommercialData | APIError:
         """Fallback revenue estimation using SteamSpy review count.
@@ -1246,6 +1516,20 @@ class GamalyticClient:
             # Convert SteamSpy price from cents to dollars
             price_dollars = int(price_str) / 100.0 if price_str and price_str != "0" else None
 
+            # Third-tier fallback: extract CCU from SteamSpy appdetails response
+            # (this data is already fetched — just not extracted yet)
+            current_player_count = None
+            player_count_source = None
+            player_count_note = None
+            steamspy_ccu = data.get("ccu", 0)
+            if steamspy_ccu and int(steamspy_ccu) > 0:
+                current_player_count = int(steamspy_ccu)
+                player_count_source = "steamspy"
+                player_count_note = (
+                    "Gamalytic and Steam Web API unavailable. "
+                    "Player count from SteamSpy (may be stale — SteamSpy updates infrequently)."
+                )
+
             return CommercialData(
                 appid=appid,
                 name="",  # SteamSpy doesn't provide name in appdetails
@@ -1257,7 +1541,10 @@ class GamalyticClient:
                 source="review_estimate",
                 method="review_multiplier",
                 fetched_at=fetched_at,
-                cache_age_seconds=cache_age
+                cache_age_seconds=cache_age,
+                current_player_count=current_player_count,
+                player_count_source=player_count_source,
+                player_count_note=player_count_note,
             )
 
         except httpx.HTTPStatusError as e:
@@ -1330,6 +1617,57 @@ class GamalyticClient:
             )
             commercial_data.steamspy_implied_revenue = steamspy_implied_revenue
             commercial_data.gamalytic_revenue = gamalytic_midpoint
+
+    async def _get_steam_player_count(self, appid: int) -> int | None:
+        """Fallback: get current player count from Steam Web API.
+
+        Uses GetNumberOfCurrentPlayers endpoint (public, no API key required).
+        Cache TTL: 300 seconds (5 minutes) for real-time data.
+
+        Args:
+            appid: Steam AppID
+
+        Returns:
+            Current player count or None if unavailable
+        """
+        try:
+            data, _, _ = await self.http.get_with_metadata(
+                "https://api.steampowered.com/ISteamUserStats/GetNumberOfCurrentPlayers/v1/",
+                params={"appid": str(appid)},
+                cache_ttl=300  # 5-minute TTL for real-time data
+            )
+            response = data.get("response", {})
+            result = response.get("result")
+            count = response.get("player_count")
+            # result=1 means success per Steam API docs
+            if result == 1 and count is not None:
+                return int(count)
+            return None
+        except Exception as e:
+            logger.warning(f"Steam Web API player count unavailable for AppID {appid}: {e}")
+            return None
+
+    async def get_commercial_batch(
+        self, appids: list[int], detail_level: str = "full"
+    ) -> list[CommercialData | APIError]:
+        """Fetch commercial data for multiple AppIDs concurrently.
+
+        Rate limiting handled by HostRateLimiter (5 req/s for gamalytic.com).
+
+        Args:
+            appids: List of Steam AppIDs
+            detail_level: "full" or "summary"
+
+        Returns:
+            List of CommercialData or APIError for each AppID (same order as input)
+        """
+        tasks = [self.get_commercial_data(appid, detail_level=detail_level) for appid in appids]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return [
+            r if isinstance(r, (CommercialData, APIError))
+            else APIError(error_code=502, error_type="api_error", message=str(r))
+            for r in results
+        ]
 
 
 class SteamReviewClient:
