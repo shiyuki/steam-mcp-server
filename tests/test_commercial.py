@@ -4,7 +4,7 @@ import json
 import pytest
 import httpx
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from src.schemas import CommercialData, APIError
 from src.steam_api import GamalyticClient
@@ -466,3 +466,633 @@ class TestFetchCommercialValidation:
 
         assert result["error_code"] == 404
         assert result["error_type"] == "not_found"
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: Extended Gamalytic field tests
+# ---------------------------------------------------------------------------
+
+def _make_full_gamalytic_response(appid=646570):
+    """Full Gamalytic API response fixture with all 40+ fields."""
+    return {
+        "steamId": str(appid),
+        "name": "Slay the Spire",
+        "price": 24.99,
+        "revenue": 50000000,
+        "copiesSold": 3000000,
+        "followers": 450000,
+        "accuracy": 0.85,
+        "totalRevenue": True,
+        "reviewScore": 97,
+        "owners": 2800000,
+        "players": 15000,
+        "reviews": 82000,
+        "isEarlyAccess": False,
+        "earlyAccessDate": None,
+        "history": [
+            {  # Entry 0: launch snapshot
+                "timeStamp": 1516665600000,  # 2018-01-23
+                "reviews": 1000, "price": 15.99, "score": 90, "rank": 50,
+                "followers": 50000, "players": 8000, "avgPlaytime": 5.2,
+                "sales": 100000, "revenue": 1500000
+            },
+            {  # Entry 1: recent daily
+                "timeStamp": 1708646400000,  # 2024-02-23
+                "reviews": 82000, "price": 24.99, "score": 97, "rank": 15,
+                "followers": 450000, "players": 14500, "avgPlaytime": 28.3,
+                "sales": 3000000, "revenue": 50000000
+            },
+            {  # Entry 2: another daily
+                "timeStamp": 1708560000000,  # 2024-02-22
+                "reviews": 81900, "price": 24.99, "score": 97, "rank": 16,
+                "followers": 449500, "players": 15200, "avgPlaytime": 28.1,
+                "sales": 2990000, "revenue": 49800000
+            },
+        ],
+        "countryData": [
+            {"country": "US", "share": 0.35},
+            {"country": "CN", "share": 0.15},
+            {"country": "DE", "share": 0.08},
+            {"country": "GB", "share": 0.07},
+            {"country": "RU", "share": 0.06},
+            {"country": "FR", "share": 0.05},
+            {"country": "JP", "share": 0.04},
+            {"country": "BR", "share": 0.04},
+            {"country": "KR", "share": 0.03},
+            {"country": "CA", "share": 0.03},
+            {"country": "AU", "share": 0.02},
+            {"country": "IT", "share": 0.02},
+        ],
+        "audienceOverlap": [
+            {"appId": 261550, "name": "Mount & Blade II", "overlap": 0.45, "revenue": 30000000, "followers": 200000, "score": 85},
+            {"appId": 322330, "name": "Don't Starve Together", "overlap": 0.38, "revenue": 25000000, "followers": 180000, "score": 91},
+        ],
+        "alsoPlayed": [
+            {"appId": 1145360, "name": "Hades", "revenue": 40000000, "followers": 300000, "score": 95},
+            {"appId": 2379780, "name": "Balatro", "revenue": 35000000, "followers": 250000, "score": 96},
+        ],
+        "estimateDetails": [
+            {"model": "review_based", "estimate": 48000000},
+            {"model": "owner_based", "estimate": 52000000},
+            {"model": "engagement_based", "estimate": 50000000},
+        ],
+        "dlc": [
+            {"name": "Slay the Spire: Downfall", "price": 0, "releaseDate": 1640995200000, "revenue": 0},
+        ],
+    }
+
+
+def _make_steamspy_response():
+    """Standard SteamSpy mock response for triangulation."""
+    return {
+        "positive": 78000, "negative": 4000, "price": "2499",
+        "owners": "2,000,000 .. 5,000,000"
+    }
+
+
+class TestGamalyticExtendedFields:
+    """Tests for Phase 8 extended Gamalytic fields."""
+
+    @pytest.mark.asyncio
+    async def test_full_response_parses_all_fields(self, mock_http):
+        """Full Gamalytic response returns CommercialData with all extended fields."""
+        gamalytic_data = _make_full_gamalytic_response()
+        steamspy_data = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        assert result.copies_sold == 3000000
+        assert result.followers == 450000
+        assert result.accuracy == 0.85
+        assert result.total_revenue is True
+        assert result.review_score == 97.0
+        assert result.gamalytic_owners == 2800000
+        assert result.gamalytic_players == 15000
+        assert result.gamalytic_reviews == 82000
+
+    @pytest.mark.asyncio
+    async def test_history_entry_types(self, mock_http):
+        """History array tags entry 0 as 'launch', entries 1+ as 'daily'."""
+        gamalytic_data = _make_full_gamalytic_response()
+        steamspy_data = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert result.history[0].entry_type == "launch"
+        assert result.history[1].entry_type == "daily"
+        assert result.history[2].entry_type == "daily"
+
+    @pytest.mark.asyncio
+    async def test_history_timestamps_iso(self, mock_http):
+        """History timestamps are converted to ISO 8601 date strings."""
+        gamalytic_data = _make_full_gamalytic_response()
+        steamspy_data = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        # 1516665600000 ms = 2018-01-23 UTC
+        assert result.history[0].timestamp == "2018-01-23"
+        # 1708646400000 ms = 2024-02-23 UTC
+        assert result.history[1].timestamp == "2024-02-23"
+
+    @pytest.mark.asyncio
+    async def test_history_all_fields_present(self, mock_http):
+        """Each history entry has all 10 expected fields."""
+        gamalytic_data = _make_full_gamalytic_response()
+        steamspy_data = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        for entry in result.history:
+            assert hasattr(entry, "entry_type")
+            assert hasattr(entry, "timestamp")
+            assert hasattr(entry, "reviews")
+            assert hasattr(entry, "price")
+            assert hasattr(entry, "score")
+            assert hasattr(entry, "rank")
+            assert hasattr(entry, "followers")
+            assert hasattr(entry, "gamalytic_players")
+            assert hasattr(entry, "avg_playtime")
+            assert hasattr(entry, "sales")
+            assert hasattr(entry, "revenue")
+
+    @pytest.mark.asyncio
+    async def test_country_data_top_10_cap(self, mock_http):
+        """12 country entries in results in 10 coming out (cap at 10)."""
+        gamalytic_data = _make_full_gamalytic_response()  # has 12 countries
+        steamspy_data = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert len(result.country_data) == 10
+
+    @pytest.mark.asyncio
+    async def test_country_data_sorted(self, mock_http):
+        """Country data is sorted by share_pct descending (highest first)."""
+        gamalytic_data = _make_full_gamalytic_response()
+        steamspy_data = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        # US has 0.35 share, should be first
+        assert result.country_data[0].country_code == "US"
+        assert result.country_data[0].share_pct == 0.35
+
+    @pytest.mark.asyncio
+    async def test_audience_overlap_parsed(self, mock_http):
+        """2 competitor entries parsed with appid, name, overlap_pct, revenue."""
+        gamalytic_data = _make_full_gamalytic_response()
+        steamspy_data = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert len(result.audience_overlap) == 2
+        entry = result.audience_overlap[0]
+        assert entry.appid == 261550
+        assert "Mount" in entry.name
+        assert entry.overlap_pct == 0.45
+        assert entry.revenue == 30000000
+
+    @pytest.mark.asyncio
+    async def test_also_played_parsed(self, mock_http):
+        """Also played entries have None overlap_pct (no overlap field in alsoPlayed)."""
+        gamalytic_data = _make_full_gamalytic_response()
+        steamspy_data = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert len(result.also_played) == 2
+        entry = result.also_played[0]
+        assert entry.appid == 1145360
+        assert entry.name == "Hades"
+        assert entry.overlap_pct is None  # alsoPlayed has no overlap field
+
+    @pytest.mark.asyncio
+    async def test_estimate_details_parsed(self, mock_http):
+        """3 estimate models parsed with model_name and estimate."""
+        gamalytic_data = _make_full_gamalytic_response()
+        steamspy_data = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert len(result.estimate_details) == 3
+        model_names = {e.model_name for e in result.estimate_details}
+        assert "review_based" in model_names
+        assert "owner_based" in model_names
+        assert "engagement_based" in model_names
+
+    @pytest.mark.asyncio
+    async def test_dlc_parsed(self, mock_http):
+        """DLC entry parsed with name, price, release_date, revenue."""
+        gamalytic_data = _make_full_gamalytic_response()
+        steamspy_data = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert len(result.gamalytic_dlc) == 1
+        dlc = result.gamalytic_dlc[0]
+        assert "Downfall" in dlc.name or "Spire" in dlc.name
+        assert dlc.price == 0
+        assert dlc.release_date == "2022-01-01"  # 1640995200000 ms = 2022-01-01
+        assert dlc.revenue == 0
+
+    @pytest.mark.asyncio
+    async def test_gamalytic_prefix_fields(self, mock_http):
+        """gamalytic_owners/players/reviews are populated and distinct from CommercialData."""
+        gamalytic_data = _make_full_gamalytic_response()
+        steamspy_data = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        # All three gamalytic_ prefix fields should be populated
+        assert result.gamalytic_owners == 2800000
+        assert result.gamalytic_players == 15000
+        assert result.gamalytic_reviews == 82000
+        # They should be accessible as separate fields
+        assert result.gamalytic_owners != result.gamalytic_players
+        assert result.gamalytic_owners != result.gamalytic_reviews
+
+    @pytest.mark.asyncio
+    async def test_detail_level_summary(self, mock_http):
+        """Summary mode strips heavy arrays; core fields still present."""
+        gamalytic_data = _make_full_gamalytic_response()
+        steamspy_data = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570, detail_level="summary")
+
+        assert isinstance(result, CommercialData)
+        # Heavy arrays stripped
+        assert result.history == []
+        assert result.audience_overlap == []
+        assert result.also_played == []
+        assert result.gamalytic_dlc == []
+        assert result.estimate_details == []
+        # Country data capped at 3
+        assert len(result.country_data) <= 3
+        # Core fields still present
+        assert result.copies_sold == 3000000
+        assert result.followers == 450000
+        assert result.accuracy == 0.85
+        assert result.revenue_min == 50000000 * 0.80
+
+    @pytest.mark.asyncio
+    async def test_detail_level_full_default(self, mock_http):
+        """Default (no detail_level) returns full arrays."""
+        gamalytic_data = _make_full_gamalytic_response()
+        steamspy_data = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)  # No detail_level = "full"
+
+        assert len(result.history) == 3
+        assert len(result.audience_overlap) == 2
+        assert len(result.also_played) == 2
+        assert len(result.gamalytic_dlc) == 1
+        assert len(result.estimate_details) == 3
+
+    @pytest.mark.asyncio
+    async def test_negative_revenue_rejected(self, mock_http):
+        """Negative copiesSold is rejected and set to None with warning."""
+        gamalytic_data = _make_full_gamalytic_response()
+        gamalytic_data["copiesSold"] = -500
+        steamspy_data = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert result.copies_sold is None
+
+    @pytest.mark.asyncio
+    async def test_accuracy_outside_range_rejected(self, mock_http):
+        """accuracy=1.5 is out of [0, 1] range and should be set to None."""
+        gamalytic_data = _make_full_gamalytic_response()
+        gamalytic_data["accuracy"] = 1.5
+        steamspy_data = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert result.accuracy is None
+
+    @pytest.mark.asyncio
+    async def test_missing_extended_fields_prominent_warning(self, mock_http):
+        """When extended fields are absent but revenue present, logger.error is called."""
+        gamalytic_data = {
+            "steamId": "646570",
+            "name": "Slay the Spire",
+            "price": 24.99,
+            "revenue": 50000000,
+            # No copiesSold, no history, no countryData
+        }
+        steamspy_data = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+        ]
+
+        import logging
+        from src.steam_api import logger as steam_logger
+        with patch.object(steam_logger, "error") as mock_error:
+            client = GamalyticClient(mock_http)
+            result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        # Should have called logger.error with prominent warning
+        assert mock_error.called
+        all_args = " ".join(str(a) for call in mock_error.call_args_list for a in call[0])
+        assert "GAMALYTIC EXTENDED FIELDS UNAVAILABLE" in all_args
+
+    @pytest.mark.asyncio
+    async def test_player_count_from_history(self, mock_http):
+        """current_player_count extracted from latest daily history entry."""
+        gamalytic_data = _make_full_gamalytic_response()
+        steamspy_data = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        # Latest daily entry (index 2) has players=15200
+        assert result.current_player_count == 15200
+        assert result.player_count_source == "gamalytic_history"
+
+    @pytest.mark.asyncio
+    async def test_steam_web_api_fallback(self, mock_http):
+        """Gamalytic fails, Steam Web API returns player count with correct source."""
+        gamalytic_request = httpx.Request("GET", "https://api.gamalytic.com/game/646570")
+        gamalytic_response = httpx.Response(503, request=gamalytic_request)
+
+        steamspy_data = {
+            "positive": 8000, "negative": 2000, "price": "2499",
+            "owners": "500,000 .. 1,000,000", "ccu": 0
+        }
+
+        steam_web_api_data = {
+            "response": {"result": 1, "player_count": 12345}
+        }
+
+        mock_http.get_with_metadata.side_effect = [
+            httpx.HTTPStatusError("Service unavailable", request=gamalytic_request, response=gamalytic_response),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+            (steam_web_api_data, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        assert result.current_player_count == 12345
+        assert result.player_count_source == "steam_web_api"
+        assert result.player_count_note is not None
+        assert "Gamalytic" in result.player_count_note
+
+    @pytest.mark.asyncio
+    async def test_steam_web_api_fallback_also_fails(self, mock_http):
+        """Both Gamalytic and Steam Web API fail; SteamSpy CCU used as third fallback."""
+        gamalytic_request = httpx.Request("GET", "https://api.gamalytic.com/game/646570")
+        gamalytic_response = httpx.Response(503, request=gamalytic_request)
+
+        steam_web_api_request = httpx.Request(
+            "GET", "https://api.steampowered.com/ISteamUserStats/GetNumberOfCurrentPlayers/v1/"
+        )
+        steam_web_api_response = httpx.Response(503, request=steam_web_api_request)
+
+        # SteamSpy has no CCU in this scenario (ccu=0)
+        steamspy_data = {
+            "positive": 8000, "negative": 2000, "price": "2499",
+            "owners": "500,000 .. 1,000,000", "ccu": 0
+        }
+
+        mock_http.get_with_metadata.side_effect = [
+            httpx.HTTPStatusError("Service unavailable", request=gamalytic_request, response=gamalytic_response),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+            httpx.HTTPStatusError("Service unavailable", request=steam_web_api_request, response=steam_web_api_response),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        assert result.source == "review_estimate"
+        # Both APIs failed, no player count available (SteamSpy ccu=0)
+        assert result.current_player_count is None
+
+    @pytest.mark.asyncio
+    async def test_all_fallbacks_fail_no_player_count(self, mock_http):
+        """Gamalytic fails, Steam Web API fails, SteamSpy ccu=0 -> no player count."""
+        gamalytic_request = httpx.Request("GET", "https://api.gamalytic.com/game/646570")
+        gamalytic_response = httpx.Response(503, request=gamalytic_request)
+
+        steam_web_api_request = httpx.Request(
+            "GET", "https://api.steampowered.com/ISteamUserStats/GetNumberOfCurrentPlayers/v1/"
+        )
+        steam_web_api_response = httpx.Response(503, request=steam_web_api_request)
+
+        steamspy_data = {
+            "positive": 5000, "negative": 500, "price": "999",
+            "owners": "100,000 .. 200,000", "ccu": 0
+        }
+
+        mock_http.get_with_metadata.side_effect = [
+            httpx.HTTPStatusError("Gamalytic down", request=gamalytic_request, response=gamalytic_response),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+            httpx.HTTPStatusError("Steam Web API down", request=steam_web_api_request, response=steam_web_api_response),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        assert result.current_player_count is None
+        assert result.player_count_source is None
+
+    @pytest.mark.asyncio
+    async def test_early_access_fields(self, mock_http):
+        """isEarlyAccess=True and earlyAccessDate are parsed into CommercialData."""
+        gamalytic_data = _make_full_gamalytic_response()
+        gamalytic_data["isEarlyAccess"] = True
+        gamalytic_data["earlyAccessDate"] = 1516665600000  # 2018-01-23
+        steamspy_data = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert result.gamalytic_is_early_access is True
+        assert result.gamalytic_ea_date == "2018-01-23"
+
+    @pytest.mark.asyncio
+    async def test_backward_compat_alias(self, mock_http):
+        """get_revenue_estimate still works and returns same result as get_commercial_data."""
+        gamalytic_data = _make_full_gamalytic_response()
+        steamspy_data = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_revenue_estimate(646570)
+
+        assert isinstance(result, CommercialData)
+        assert result.appid == 646570
+        assert result.source == "gamalytic"
+
+    @pytest.mark.asyncio
+    async def test_batch_mode(self, mock_http):
+        """get_commercial_batch returns list of 2 CommercialData objects."""
+        gamalytic_data1 = _make_full_gamalytic_response(appid=646570)
+        gamalytic_data2 = _make_full_gamalytic_response(appid=2379780)
+        steamspy_data = _make_steamspy_response()
+
+        # 4 calls: 2 Gamalytic + 2 SteamSpy triangulations
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data1, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+            (gamalytic_data2, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        results = await client.get_commercial_batch([646570, 2379780])
+
+        assert len(results) == 2
+        assert all(isinstance(r, CommercialData) for r in results)
+
+    @pytest.mark.asyncio
+    async def test_batch_mode_partial_failure(self, mock_http):
+        """One AppID succeeds, one fails: returns [CommercialData, APIError]."""
+        gamalytic_data = _make_full_gamalytic_response(appid=646570)
+        steamspy_data = _make_steamspy_response()
+
+        gamalytic_request2 = httpx.Request("GET", "https://api.gamalytic.com/game/999")
+        gamalytic_response2 = httpx.Response(404, request=gamalytic_request2)
+
+        steamspy_data_fail = {
+            "positive": 0, "negative": 0, "price": "0"
+        }
+
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+            httpx.HTTPStatusError("Not found", request=gamalytic_request2, response=gamalytic_response2),
+            (steamspy_data_fail, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        results = await client.get_commercial_batch([646570, 999])
+
+        assert len(results) == 2
+        assert isinstance(results[0], CommercialData)
+        assert isinstance(results[1], APIError)
+
+    @pytest.mark.asyncio
+    async def test_steamspy_ccu_fallback(self, mock_http):
+        """Gamalytic fails, Steam Web API fails, SteamSpy ccu=5000 -> fallback with source='steamspy'."""
+        gamalytic_request = httpx.Request("GET", "https://api.gamalytic.com/game/646570")
+        gamalytic_response = httpx.Response(503, request=gamalytic_request)
+
+        steam_web_api_request = httpx.Request(
+            "GET", "https://api.steampowered.com/ISteamUserStats/GetNumberOfCurrentPlayers/v1/"
+        )
+        steam_web_api_response = httpx.Response(503, request=steam_web_api_request)
+
+        steamspy_data = {
+            "positive": 8000, "negative": 2000, "price": "2499",
+            "owners": "500,000 .. 1,000,000", "ccu": 5000
+        }
+
+        mock_http.get_with_metadata.side_effect = [
+            httpx.HTTPStatusError("Service unavailable", request=gamalytic_request, response=gamalytic_response),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+            httpx.HTTPStatusError("Steam Web API down", request=steam_web_api_request, response=steam_web_api_response),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        assert result.current_player_count == 5000
+        assert result.player_count_source == "steamspy"
+        assert result.player_count_note is not None
+        assert "SteamSpy" in result.player_count_note
+        assert "stale" in result.player_count_note.lower()
