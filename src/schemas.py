@@ -77,6 +77,15 @@ class GameMetadata(CachedResponse):
     supported_languages_count: int = 0
     supported_languages_raw: str = ""  # Raw languages string from API
 
+    # Phase 8: Steam Store extended fields
+    achievement_count: int | None = None
+    ratings: dict = Field(default_factory=dict)  # {authority: {rating, descriptors}}
+    supported_languages: list["LanguageEntry"] = Field(default_factory=list)  # structured parsed list
+    developer_website: str | None = None
+    pc_requirements_min: str = ""  # HTML-stripped plain text
+    pc_requirements_rec: str = ""  # HTML-stripped plain text
+    controller_support: str | None = None  # "full", "partial", or None
+
 
 class GameSummary(BaseModel):
     """Per-game summary data from SteamSpy bulk endpoint.
@@ -138,6 +147,29 @@ class CommercialData(CachedResponse):
     triangulation_warning: str | None = None
     steamspy_implied_revenue: float | None = None
     gamalytic_revenue: float | None = None
+
+    # Phase 8: Gamalytic extended fields
+    copies_sold: int | None = None
+    followers: int | None = None
+    accuracy: float | None = None
+    total_revenue: bool | None = None  # data quality flag: True=lifetime, False=partial
+    review_score: float | None = None  # Gamalytic's review score (0-100)
+    gamalytic_owners: int | None = None
+    gamalytic_players: int | None = None  # daily avg CCU
+    gamalytic_reviews: int | None = None
+    gamalytic_is_early_access: bool | None = None
+    gamalytic_ea_date: str | None = None  # ISO date
+    history: list["GamalyticHistoryEntry"] = Field(default_factory=list)
+    country_data: list["CountryDataEntry"] = Field(default_factory=list)
+    audience_overlap: list["CompetitorEntry"] = Field(default_factory=list)
+    also_played: list["CompetitorEntry"] = Field(default_factory=list)
+    estimate_details: list["EstimateModelEntry"] = Field(default_factory=list)
+    gamalytic_dlc: list["DLCEntry"] = Field(default_factory=list)
+
+    # Phase 8: Player count fallback
+    current_player_count: int | None = None
+    player_count_source: str | None = None  # "gamalytic_history" / "steam_web_api" / "steamspy"
+    player_count_note: str | None = None  # Warning when fallback used
 
 
 class EngagementData(CachedResponse):
@@ -603,3 +635,58 @@ class ReviewsData(BaseModel):
     language_distribution: dict[str, int] = Field(default_factory=dict)  # language -> count
     meta: ReviewsMeta | None = None
     query_params: QueryParams | None = None
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: Extended Data Sources schemas (additive — existing schemas unchanged)
+# ---------------------------------------------------------------------------
+
+class GamalyticHistoryEntry(BaseModel):
+    """Single history snapshot from Gamalytic game history data."""
+    entry_type: str  # "launch" or "daily"
+    timestamp: str | None = None  # ISO 8601 date string
+    reviews: int | None = None
+    price: float | None = None
+    score: float | None = None
+    rank: int | None = None
+    followers: int | None = None
+    gamalytic_players: int | None = None  # daily avg CCU (gamalytic_ prefix)
+    avg_playtime: float | None = None
+    sales: int | None = None
+    revenue: float | None = None
+
+
+class CountryDataEntry(BaseModel):
+    """Single country revenue share entry."""
+    country_code: str  # 2-letter ISO code, passed through as-is
+    share_pct: float | None = None
+
+
+class CompetitorEntry(BaseModel):
+    """Competitor game entry from audienceOverlap or alsoPlayed."""
+    appid: int | None = None
+    name: str = ""
+    overlap_pct: float | None = None  # for audienceOverlap (may be None for alsoPlayed)
+    revenue: float | None = None
+    followers: int | None = None
+    score: float | None = None
+
+
+class EstimateModelEntry(BaseModel):
+    """Single revenue estimate model entry."""
+    model_name: str = ""
+    estimate: float | None = None
+
+
+class DLCEntry(BaseModel):
+    """Single Gamalytic DLC entry."""
+    name: str = ""
+    price: float | None = None
+    release_date: str | None = None  # ISO date
+    revenue: float | None = None
+
+
+class LanguageEntry(BaseModel):
+    """Structured language support entry from Steam Store data."""
+    language: str
+    full_audio: bool = False
