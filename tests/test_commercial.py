@@ -1096,3 +1096,468 @@ class TestGamalyticExtendedFields:
         assert result.player_count_note is not None
         assert "SteamSpy" in result.player_count_note
         assert "stale" in result.player_count_note.lower()
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: Batch error recovery tests
+# ---------------------------------------------------------------------------
+
+class TestBatchErrorRecovery:
+    """Tests for get_commercial_batch error recovery and ordering."""
+
+    @pytest.mark.asyncio
+    async def test_batch_mixed_success_failure_ordering(self, mock_http):
+        """3 AppIDs: success, failure, success — results preserve input order."""
+        gamalytic1 = _make_full_gamalytic_response(appid=111)
+        gamalytic3 = _make_full_gamalytic_response(appid=333)
+        steamspy = _make_steamspy_response()
+
+        gamalytic_req2 = httpx.Request("GET", "https://api.gamalytic.com/game/222")
+        gamalytic_resp2 = httpx.Response(404, request=gamalytic_req2)
+
+        steamspy_fail = {"positive": 0, "negative": 0, "price": "0"}
+
+        # Concurrent calls — mock returns in order of invocation
+        mock_http.get_with_metadata.side_effect = [
+            # AppID 111: Gamalytic OK + SteamSpy triangulation
+            (gamalytic1, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+            # AppID 222: Gamalytic 404 + SteamSpy no reviews
+            httpx.HTTPStatusError("Not found", request=gamalytic_req2, response=gamalytic_resp2),
+            (steamspy_fail, datetime.now(timezone.utc), 0),
+            # AppID 333: Gamalytic OK + SteamSpy triangulation
+            (gamalytic3, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        results = await client.get_commercial_batch([111, 222, 333])
+
+        assert len(results) == 3
+        # First and third should succeed
+        assert isinstance(results[0], CommercialData)
+        assert results[0].appid == 111
+        # Second should be an error
+        assert isinstance(results[1], APIError)
+        # Third should succeed and be in correct position
+        assert isinstance(results[2], CommercialData)
+        assert results[2].appid == 333
+
+    @pytest.mark.asyncio
+    async def test_batch_all_failures(self, mock_http):
+        """All AppIDs fail — returns list of APIError objects."""
+        req1 = httpx.Request("GET", "https://api.gamalytic.com/game/111")
+        resp1 = httpx.Response(503, request=req1)
+        req2 = httpx.Request("GET", "https://api.gamalytic.com/game/222")
+        resp2 = httpx.Response(503, request=req2)
+
+        steamspy_req = httpx.Request("GET", "https://steamspy.com/api.php")
+        steamspy_resp = httpx.Response(503, request=steamspy_req)
+
+        mock_http.get_with_metadata.side_effect = [
+            # AppID 111: both fail
+            httpx.HTTPStatusError("Down", request=req1, response=resp1),
+            httpx.HTTPStatusError("Down", request=steamspy_req, response=steamspy_resp),
+            # AppID 222: both fail
+            httpx.HTTPStatusError("Down", request=req2, response=resp2),
+            httpx.HTTPStatusError("Down", request=steamspy_req, response=steamspy_resp),
+        ]
+
+        client = GamalyticClient(mock_http)
+        results = await client.get_commercial_batch([111, 222])
+
+        assert len(results) == 2
+        assert all(isinstance(r, APIError) for r in results)
+
+    @pytest.mark.asyncio
+    async def test_batch_unhandled_exception_wrapped_as_api_error(self, mock_http):
+        """Unhandled exception (e.g. RuntimeError) is wrapped as APIError(502).
+
+        RuntimeError in Gamalytic triggers fallback to SteamSpy. If SteamSpy also
+        fails, the error surfaces as 'Both Gamalytic and SteamSpy unavailable'.
+        """
+        gamalytic_data = _make_full_gamalytic_response(appid=111)
+        steamspy = _make_steamspy_response()
+
+        steamspy_req = httpx.Request("GET", "https://steamspy.com/api.php")
+        steamspy_resp = httpx.Response(503, request=steamspy_req)
+
+        mock_http.get_with_metadata.side_effect = [
+            # AppID 111: OK
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+            # AppID 222: Gamalytic throws RuntimeError, then SteamSpy fallback also fails
+            RuntimeError("Unexpected internal error"),
+            httpx.HTTPStatusError("Down", request=steamspy_req, response=steamspy_resp),
+        ]
+
+        client = GamalyticClient(mock_http)
+        results = await client.get_commercial_batch([111, 222])
+
+        assert len(results) == 2
+        assert isinstance(results[0], CommercialData)
+        assert isinstance(results[1], APIError)
+        assert results[1].error_code == 503
+
+    @pytest.mark.asyncio
+    async def test_batch_detail_level_threading(self, mock_http):
+        """detail_level='summary' is passed through to each individual call."""
+        gamalytic1 = _make_full_gamalytic_response(appid=111)
+        gamalytic2 = _make_full_gamalytic_response(appid=222)
+        steamspy = _make_steamspy_response()
+
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic1, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+            (gamalytic2, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        results = await client.get_commercial_batch([111, 222], detail_level="summary")
+
+        assert len(results) == 2
+        # Summary mode should strip heavy arrays
+        for r in results:
+            assert isinstance(r, CommercialData)
+            assert r.history == []
+            assert r.audience_overlap == []
+            assert r.also_played == []
+
+    @pytest.mark.asyncio
+    async def test_batch_single_appid(self, mock_http):
+        """Batch with single AppID behaves like individual call."""
+        gamalytic_data = _make_full_gamalytic_response(appid=646570)
+        steamspy = _make_steamspy_response()
+
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        results = await client.get_commercial_batch([646570])
+
+        assert len(results) == 1
+        assert isinstance(results[0], CommercialData)
+        assert results[0].appid == 646570
+
+    @pytest.mark.asyncio
+    async def test_batch_empty_list(self, mock_http):
+        """Batch with empty AppID list returns empty list."""
+        client = GamalyticClient(mock_http)
+        results = await client.get_commercial_batch([])
+
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_batch_connection_error_mid_batch(self, mock_http):
+        """First AppID succeeds, second gets ConnectionError — wrapped as APIError."""
+        gamalytic_data = _make_full_gamalytic_response(appid=111)
+        steamspy = _make_steamspy_response()
+
+        mock_http.get_with_metadata.side_effect = [
+            # AppID 111: OK
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+            # AppID 222: connection drops
+            ConnectionError("Connection reset by peer"),
+            # SteamSpy fallback also fails
+            ConnectionError("Connection reset by peer"),
+        ]
+
+        client = GamalyticClient(mock_http)
+        results = await client.get_commercial_batch([111, 222])
+
+        assert len(results) == 2
+        assert isinstance(results[0], CommercialData)
+        # ConnectionError goes through review fallback which catches it
+        assert isinstance(results[1], APIError)
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: Malformed Gamalytic extended field tests
+# ---------------------------------------------------------------------------
+
+class TestMalformedGamalyticFields:
+    """Tests for defensive parsing of malformed/missing Gamalytic extended fields."""
+
+    @pytest.mark.asyncio
+    async def test_missing_history_array_entirely(self, mock_http):
+        """No 'history' key in response — history defaults to empty list."""
+        gamalytic_data = _make_full_gamalytic_response()
+        del gamalytic_data["history"]
+        steamspy = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        assert result.history == []
+        # Player count can't come from history
+        assert result.player_count_source != "gamalytic_history"
+
+    @pytest.mark.asyncio
+    async def test_history_null_value(self, mock_http):
+        """history=null in response — treated same as missing."""
+        gamalytic_data = _make_full_gamalytic_response()
+        gamalytic_data["history"] = None
+        steamspy = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        assert result.history == []
+
+    @pytest.mark.asyncio
+    async def test_history_empty_array(self, mock_http):
+        """history=[] in response — empty list, no player count from history."""
+        gamalytic_data = _make_full_gamalytic_response()
+        gamalytic_data["history"] = []
+        steamspy = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        assert result.history == []
+        assert result.current_player_count is None or result.player_count_source != "gamalytic_history"
+
+    @pytest.mark.asyncio
+    async def test_history_entry_null_timestamp(self, mock_http):
+        """History entry with timeStamp=null — timestamp set to None, entry still parsed."""
+        gamalytic_data = _make_full_gamalytic_response()
+        gamalytic_data["history"] = [
+            {"timeStamp": None, "reviews": 100, "price": 9.99, "score": 80,
+             "rank": 50, "followers": 1000, "players": 500, "avgPlaytime": 2.0,
+             "sales": 5000, "revenue": 50000},
+        ]
+        steamspy = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        assert len(result.history) == 1
+        assert result.history[0].timestamp is None
+        assert result.history[0].reviews == 100
+
+    @pytest.mark.asyncio
+    async def test_history_entry_zero_timestamp(self, mock_http):
+        """History entry with timeStamp=0 — _ms_to_iso returns None for falsy values."""
+        gamalytic_data = _make_full_gamalytic_response()
+        gamalytic_data["history"] = [
+            {"timeStamp": 0, "reviews": 50, "price": 14.99, "score": 70,
+             "rank": 100, "followers": 500, "players": 200, "avgPlaytime": 1.5,
+             "sales": 2000, "revenue": 30000},
+        ]
+        steamspy = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        assert len(result.history) == 1
+        assert result.history[0].timestamp is None
+
+    @pytest.mark.asyncio
+    async def test_history_pre_2003_timestamp_rejected(self, mock_http):
+        """Timestamp before 2003 is rejected (set to None)."""
+        gamalytic_data = _make_full_gamalytic_response()
+        gamalytic_data["history"] = [
+            {"timeStamp": 946684800000, "reviews": 10, "price": 5.0, "score": 60,  # 2000-01-01
+             "rank": 200, "followers": 100, "players": 50, "avgPlaytime": 0.5,
+             "sales": 500, "revenue": 2500},
+        ]
+        steamspy = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        assert len(result.history) == 1
+        assert result.history[0].timestamp is None  # Rejected as too old
+
+    @pytest.mark.asyncio
+    async def test_country_data_empty(self, mock_http):
+        """countryData=[] returns empty country_data list."""
+        gamalytic_data = _make_full_gamalytic_response()
+        gamalytic_data["countryData"] = []
+        steamspy = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        assert result.country_data == []
+
+    @pytest.mark.asyncio
+    async def test_country_data_missing_key(self, mock_http):
+        """No 'countryData' key — defaults to empty list."""
+        gamalytic_data = _make_full_gamalytic_response()
+        del gamalytic_data["countryData"]
+        steamspy = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        assert result.country_data == []
+
+    @pytest.mark.asyncio
+    async def test_country_data_null_share(self, mock_http):
+        """Country entry with share=null — share_pct is None, doesn't crash."""
+        gamalytic_data = _make_full_gamalytic_response()
+        gamalytic_data["countryData"] = [
+            {"country": "US", "share": None},
+            {"country": "CN", "share": 0.15},
+        ]
+        steamspy = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        assert len(result.country_data) == 2
+        # CN with real share should be sorted first
+        assert result.country_data[0].country_code == "CN"
+        assert result.country_data[0].share_pct == 0.15
+
+    @pytest.mark.asyncio
+    async def test_copies_sold_null(self, mock_http):
+        """copiesSold=null — copies_sold is None (not crash)."""
+        gamalytic_data = _make_full_gamalytic_response()
+        gamalytic_data["copiesSold"] = None
+        steamspy = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        assert result.copies_sold is None
+
+    @pytest.mark.asyncio
+    async def test_copies_sold_zero(self, mock_http):
+        """copiesSold=0 — treated as valid zero, not None."""
+        gamalytic_data = _make_full_gamalytic_response()
+        gamalytic_data["copiesSold"] = 0
+        steamspy = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        assert result.copies_sold == 0
+
+    @pytest.mark.asyncio
+    async def test_followers_negative_rejected(self, mock_http):
+        """Negative followers value is rejected (set to None)."""
+        gamalytic_data = _make_full_gamalytic_response()
+        gamalytic_data["followers"] = -100
+        steamspy = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        assert result.followers is None
+
+    @pytest.mark.asyncio
+    async def test_audience_overlap_empty(self, mock_http):
+        """Missing audienceOverlap — defaults to empty list."""
+        gamalytic_data = _make_full_gamalytic_response()
+        del gamalytic_data["audienceOverlap"]
+        steamspy = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        assert result.audience_overlap == []
+
+    @pytest.mark.asyncio
+    async def test_estimate_details_non_list(self, mock_http):
+        """estimateDetails is a string instead of list — falls back to empty."""
+        gamalytic_data = _make_full_gamalytic_response()
+        gamalytic_data["estimateDetails"] = "not a list"
+        steamspy = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        assert result.estimate_details == []
+
+    @pytest.mark.asyncio
+    async def test_accuracy_negative_rejected(self, mock_http):
+        """accuracy=-0.5 is out of [0, 1] range — set to None."""
+        gamalytic_data = _make_full_gamalytic_response()
+        gamalytic_data["accuracy"] = -0.5
+        steamspy = _make_steamspy_response()
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        assert result.accuracy is None

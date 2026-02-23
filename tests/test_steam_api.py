@@ -444,3 +444,222 @@ class TestSteamStoreExtendedFields:
         assert lang_map.get("English") is True
         assert lang_map.get("French") is True
         assert lang_map.get("German") is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: Malformed Steam Store extended field tests
+# ---------------------------------------------------------------------------
+
+class TestSteamStoreMalformedFields:
+    """Tests for defensive parsing of malformed Steam Store extended fields."""
+
+    @pytest.mark.asyncio
+    async def test_achievements_not_dict(self, mock_http):
+        """achievements=[] (list instead of dict) — achievement_count stays None."""
+        data = {
+            "646570": {
+                "success": True,
+                "data": {
+                    "name": "Test Game",
+                    "achievements": [],  # Invalid type
+                },
+            }
+        }
+        mock_http.get_with_metadata.return_value = (data, datetime.now(timezone.utc), 0)
+        client = SteamStoreClient(mock_http)
+        result = await client.get_app_details(646570)
+
+        assert isinstance(result, GameMetadata)
+        assert result.achievement_count is None
+
+    @pytest.mark.asyncio
+    async def test_achievements_missing_total(self, mock_http):
+        """achievements dict without 'total' key — achievement_count is None."""
+        data = {
+            "646570": {
+                "success": True,
+                "data": {
+                    "name": "Test Game",
+                    "achievements": {"highlighted": [{"name": "Win"}]},
+                },
+            }
+        }
+        mock_http.get_with_metadata.return_value = (data, datetime.now(timezone.utc), 0)
+        client = SteamStoreClient(mock_http)
+        result = await client.get_app_details(646570)
+
+        assert isinstance(result, GameMetadata)
+        assert result.achievement_count is None
+
+    @pytest.mark.asyncio
+    async def test_ratings_not_dict(self, mock_http):
+        """ratings='string' — ratings defaults to empty dict."""
+        data = {
+            "646570": {
+                "success": True,
+                "data": {
+                    "name": "Test Game",
+                    "ratings": "not a dict",
+                },
+            }
+        }
+        mock_http.get_with_metadata.return_value = (data, datetime.now(timezone.utc), 0)
+        client = SteamStoreClient(mock_http)
+        result = await client.get_app_details(646570)
+
+        assert isinstance(result, GameMetadata)
+        assert result.ratings == {}
+
+    @pytest.mark.asyncio
+    async def test_ratings_nested_value_not_dict(self, mock_http):
+        """Rating authority value is string, not dict — skipped gracefully."""
+        data = {
+            "646570": {
+                "success": True,
+                "data": {
+                    "name": "Test Game",
+                    "ratings": {
+                        "esrb": "E10+",  # Should be dict, not string
+                        "pegi": {"rating": "12", "descriptors": "Violence"},
+                    },
+                },
+            }
+        }
+        mock_http.get_with_metadata.return_value = (data, datetime.now(timezone.utc), 0)
+        client = SteamStoreClient(mock_http)
+        result = await client.get_app_details(646570)
+
+        assert isinstance(result, GameMetadata)
+        # PEGI should be parsed, ESRB skipped (not a dict)
+        assert "pegi" in result.ratings
+        assert "esrb" not in result.ratings
+
+    @pytest.mark.asyncio
+    async def test_pc_requirements_string(self, mock_http):
+        """pc_requirements is a bare string — falls through to empty defaults."""
+        data = {
+            "646570": {
+                "success": True,
+                "data": {
+                    "name": "Test Game",
+                    "pc_requirements": "Windows 7 required",  # Not dict or list
+                },
+            }
+        }
+        mock_http.get_with_metadata.return_value = (data, datetime.now(timezone.utc), 0)
+        client = SteamStoreClient(mock_http)
+        result = await client.get_app_details(646570)
+
+        assert isinstance(result, GameMetadata)
+        assert result.pc_requirements_min == ""
+        assert result.pc_requirements_rec == ""
+
+    @pytest.mark.asyncio
+    async def test_pc_requirements_dict_missing_keys(self, mock_http):
+        """pc_requirements dict with no minimum/recommended keys — empty strings."""
+        data = {
+            "646570": {
+                "success": True,
+                "data": {
+                    "name": "Test Game",
+                    "pc_requirements": {},  # Empty dict
+                },
+            }
+        }
+        mock_http.get_with_metadata.return_value = (data, datetime.now(timezone.utc), 0)
+        client = SteamStoreClient(mock_http)
+        result = await client.get_app_details(646570)
+
+        assert isinstance(result, GameMetadata)
+        assert result.pc_requirements_min == ""
+        assert result.pc_requirements_rec == ""
+
+    @pytest.mark.asyncio
+    async def test_controller_support_unexpected_value(self, mock_http):
+        """controller_support='gamepad' (unexpected) — stored but logged warning."""
+        data = {
+            "646570": {
+                "success": True,
+                "data": {
+                    "name": "Test Game",
+                    "controller_support": "gamepad",
+                },
+            }
+        }
+        mock_http.get_with_metadata.return_value = (data, datetime.now(timezone.utc), 0)
+        client = SteamStoreClient(mock_http)
+
+        import logging
+        from src.steam_api import logger as steam_logger
+        with patch.object(steam_logger, "warning") as mock_warn:
+            result = await client.get_app_details(646570)
+
+        assert isinstance(result, GameMetadata)
+        # Value is stored even though unexpected
+        assert result.controller_support == "gamepad"
+        # Warning should be logged
+        assert mock_warn.called
+
+    @pytest.mark.asyncio
+    async def test_supported_languages_malformed_html(self, mock_http):
+        """Malformed HTML in supported_languages — best-effort parsing."""
+        data = {
+            "646570": {
+                "success": True,
+                "data": {
+                    "name": "Test Game",
+                    "supported_languages": "<b>English</b>, <i>French</i>",
+                },
+            }
+        }
+        mock_http.get_with_metadata.return_value = (data, datetime.now(timezone.utc), 0)
+        client = SteamStoreClient(mock_http)
+        result = await client.get_app_details(646570)
+
+        assert isinstance(result, GameMetadata)
+        # Should still extract language names despite unusual HTML
+        assert len(result.supported_languages) >= 2
+
+    @pytest.mark.asyncio
+    async def test_website_empty_string(self, mock_http):
+        """website='' — developer_website should be None (not empty string)."""
+        data = {
+            "646570": {
+                "success": True,
+                "data": {
+                    "name": "Test Game",
+                    "website": "",
+                },
+            }
+        }
+        mock_http.get_with_metadata.return_value = (data, datetime.now(timezone.utc), 0)
+        client = SteamStoreClient(mock_http)
+        result = await client.get_app_details(646570)
+
+        assert isinstance(result, GameMetadata)
+        assert result.developer_website is None
+
+    @pytest.mark.asyncio
+    async def test_all_extended_fields_missing(self, mock_http):
+        """No extended fields at all — all defaults, no crash."""
+        data = {
+            "646570": {
+                "success": True,
+                "data": {
+                    "name": "Bare Minimum Game",
+                    # No achievements, ratings, languages, requirements, controller, website
+                },
+            }
+        }
+        mock_http.get_with_metadata.return_value = (data, datetime.now(timezone.utc), 0)
+        client = SteamStoreClient(mock_http)
+        result = await client.get_app_details(646570)
+
+        assert isinstance(result, GameMetadata)
+        assert result.achievement_count is None
+        assert result.ratings == {}
+        assert result.supported_languages == []
+        assert result.developer_website is None
+        assert result.pc_requirements_min == ""
+        assert result.pc_requirements_rec == ""
+        assert result.controller_support is None
