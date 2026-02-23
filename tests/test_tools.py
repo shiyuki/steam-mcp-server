@@ -5,7 +5,7 @@ import pytest
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch, MagicMock
 
-from src.schemas import SearchResult, GameMetadata, APIError
+from src.schemas import SearchResult, GameMetadata, APIError, CommercialData
 
 
 def _make_search_genre(steamspy_mock):
@@ -172,3 +172,188 @@ class TestFetchMetadataValidation:
 
         assert result["error_code"] == 404
         assert result["error_type"] == "not_found"
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: fetch_commercial detail_level and fetch_commercial_batch tests
+# ---------------------------------------------------------------------------
+
+def _make_fetch_commercial_extended(gamalytic_mock):
+    """Create standalone fetch_commercial with detail_level support and mocked GamalyticClient."""
+    async def fetch_commercial(appid: int, detail_level: str = "full") -> str:
+        if appid <= 0:
+            return json.dumps({"error": "appid must be positive", "error_type": "validation"})
+        if detail_level not in ("full", "summary"):
+            return json.dumps({"error": "detail_level must be 'full' or 'summary'", "error_type": "validation"})
+        result = await gamalytic_mock.get_commercial_data(appid, detail_level=detail_level)
+        if isinstance(result, APIError):
+            return json.dumps(result.model_dump())
+        return json.dumps(result.model_dump())
+    return fetch_commercial
+
+
+def _make_fetch_commercial_batch(gamalytic_mock):
+    """Create standalone fetch_commercial_batch with mocked GamalyticClient."""
+    async def fetch_commercial_batch(appids: str, detail_level: str = "summary") -> str:
+        appids_str = appids.strip()
+        if not appids_str:
+            return json.dumps({"error": "appids is required", "error_type": "validation"})
+        if detail_level not in ("full", "summary"):
+            return json.dumps({"error": "detail_level must be 'full' or 'summary'", "error_type": "validation"})
+        try:
+            appid_list = [int(a.strip()) for a in appids_str.split(",") if a.strip()]
+            if not appid_list:
+                return json.dumps({"error": "appids list is empty", "error_type": "validation"})
+            if any(a <= 0 for a in appid_list):
+                return json.dumps({"error": "All appids must be positive", "error_type": "validation"})
+        except ValueError:
+            return json.dumps({"error": "appids must be comma-separated integers", "error_type": "validation"})
+        results = await gamalytic_mock.get_commercial_batch(appid_list, detail_level=detail_level)
+        return json.dumps([r.model_dump() for r in results])
+    return fetch_commercial_batch
+
+
+def _make_commercial_data(appid=646570):
+    """Create a minimal CommercialData for testing."""
+    return CommercialData(
+        appid=appid,
+        name="Test Game",
+        price=24.99,
+        revenue_min=8000000,
+        revenue_max=12000000,
+        confidence="high",
+        source="gamalytic",
+        fetched_at=datetime.now(timezone.utc),
+    )
+
+
+class TestFetchCommercialExtended:
+    """Tests for fetch_commercial tool with detail_level support."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_commercial_detail_level_summary(self):
+        """detail_level='summary' passes through to get_commercial_data."""
+        mock = AsyncMock()
+        mock.get_commercial_data.return_value = _make_commercial_data()
+        fn = _make_fetch_commercial_extended(mock)
+
+        result = json.loads(await fn(646570, detail_level="summary"))
+
+        assert "error_type" not in result
+        mock.get_commercial_data.assert_called_once_with(646570, detail_level="summary")
+
+    @pytest.mark.asyncio
+    async def test_fetch_commercial_detail_level_invalid(self):
+        """detail_level='invalid' returns validation error."""
+        fn = _make_fetch_commercial_extended(AsyncMock())
+        result = json.loads(await fn(646570, detail_level="invalid"))
+
+        assert result["error_type"] == "validation"
+        assert "detail_level" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_fetch_commercial_default_detail_level(self):
+        """No detail_level param defaults to 'full'."""
+        mock = AsyncMock()
+        mock.get_commercial_data.return_value = _make_commercial_data()
+        fn = _make_fetch_commercial_extended(mock)
+
+        await fn(646570)
+
+        mock.get_commercial_data.assert_called_once_with(646570, detail_level="full")
+
+
+class TestFetchCommercialBatch:
+    """Tests for fetch_commercial_batch tool."""
+
+    @pytest.mark.asyncio
+    async def test_batch_valid_appids(self):
+        """Valid comma-separated AppIDs returns array of 2 results."""
+        mock = AsyncMock()
+        mock.get_commercial_batch.return_value = [
+            _make_commercial_data(646570),
+            _make_commercial_data(2379780),
+        ]
+        fn = _make_fetch_commercial_batch(mock)
+
+        result = json.loads(await fn("646570,2379780"))
+
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert result[0]["appid"] == 646570
+        assert result[1]["appid"] == 2379780
+
+    @pytest.mark.asyncio
+    async def test_batch_empty_string(self):
+        """Empty appids string returns validation error."""
+        fn = _make_fetch_commercial_batch(AsyncMock())
+        result = json.loads(await fn(""))
+
+        assert result["error_type"] == "validation"
+        assert "appids" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_batch_invalid_format(self):
+        """Non-integer appids returns validation error."""
+        fn = _make_fetch_commercial_batch(AsyncMock())
+        result = json.loads(await fn("abc,def"))
+
+        assert result["error_type"] == "validation"
+
+    @pytest.mark.asyncio
+    async def test_batch_negative_appid(self):
+        """Negative appid in batch returns validation error."""
+        fn = _make_fetch_commercial_batch(AsyncMock())
+        result = json.loads(await fn("-1,646570"))
+
+        assert result["error_type"] == "validation"
+        assert "positive" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_batch_detail_level_default_summary(self):
+        """Batch default detail_level is 'summary'."""
+        mock = AsyncMock()
+        mock.get_commercial_batch.return_value = [_make_commercial_data()]
+        fn = _make_fetch_commercial_batch(mock)
+
+        await fn("646570")
+
+        mock.get_commercial_batch.assert_called_once_with([646570], detail_level="summary")
+
+    @pytest.mark.asyncio
+    async def test_batch_error_forwarded(self):
+        """APIError in batch results is serialized properly."""
+        mock = AsyncMock()
+        mock.get_commercial_batch.return_value = [
+            _make_commercial_data(646570),
+            APIError(error_code=404, error_type="not_found", message="Not found"),
+        ]
+        fn = _make_fetch_commercial_batch(mock)
+
+        result = json.loads(await fn("646570,999"))
+
+        assert len(result) == 2
+        assert result[1]["error_code"] == 404
+        assert result[1]["error_type"] == "not_found"
+
+    @pytest.mark.asyncio
+    async def test_batch_whitespace_appids(self):
+        """AppIDs with spaces around commas are handled correctly."""
+        mock = AsyncMock()
+        mock.get_commercial_batch.return_value = [_make_commercial_data()]
+        fn = _make_fetch_commercial_batch(mock)
+
+        await fn("  646570  ")
+
+        mock.get_commercial_batch.assert_called_once_with([646570], detail_level="summary")
+
+    @pytest.mark.asyncio
+    async def test_batch_detail_level_full(self):
+        """Explicit detail_level='full' passes through to batch."""
+        mock = AsyncMock()
+        mock.get_commercial_batch.return_value = [_make_commercial_data()]
+        fn = _make_fetch_commercial_batch(mock)
+
+        await fn("646570", detail_level="full")
+
+        mock.get_commercial_batch.assert_called_once_with([646570], detail_level="full")

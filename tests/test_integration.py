@@ -10,7 +10,8 @@ from unittest.mock import AsyncMock, MagicMock
 from src.http_client import CachedAPIClient
 from src.cache import TTLCache
 from src.rate_limiter import HostRateLimiter
-from src.steam_api import SteamSpyClient, SteamStoreClient
+from src.steam_api import SteamSpyClient, SteamStoreClient, GamalyticClient
+from src.schemas import CommercialData, GameMetadata, APIError
 
 
 class TestCacheIntegration:
@@ -292,3 +293,96 @@ class TestErrorBehavior:
         assert api_client.client.get.call_count == 3
 
         await api_client.close()
+
+
+# ---- Phase 8: Live API integration tests ----
+# Run with: uv run pytest tests/test_integration.py -v -m integration
+
+class TestGamalyticLive:
+    """Live tests against Gamalytic API."""
+
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_gamalytic_extended_fields_slay_the_spire(self):
+        """Verify Gamalytic returns extended fields for Slay the Spire (646570)."""
+        cache = TTLCache(default_ttl=60)
+        rate_limiter = HostRateLimiter()
+        http = CachedAPIClient(cache=cache, rate_limiter=rate_limiter)
+        client = GamalyticClient(http)
+        result = await client.get_commercial_data(646570)
+        assert isinstance(result, CommercialData)
+        assert result.copies_sold is not None
+        assert result.copies_sold > 0
+        assert result.followers is not None
+        assert result.accuracy is not None
+        assert 0.0 <= result.accuracy <= 1.0
+        assert len(result.history) > 0
+        assert result.history[0].entry_type == "launch"
+        assert len(result.country_data) > 0
+        assert len(result.country_data) <= 10
+        await http.close()
+
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_gamalytic_detail_level_summary(self):
+        """Verify summary mode strips heavy arrays."""
+        cache = TTLCache(default_ttl=60)
+        rate_limiter = HostRateLimiter()
+        http = CachedAPIClient(cache=cache, rate_limiter=rate_limiter)
+        client = GamalyticClient(http)
+        result = await client.get_commercial_data(646570, detail_level="summary")
+        assert isinstance(result, CommercialData)
+        assert result.history == []
+        assert len(result.country_data) <= 3
+        assert result.copies_sold is not None
+        await http.close()
+
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_gamalytic_batch_mode(self):
+        """Verify batch mode fetches multiple AppIDs."""
+        cache = TTLCache(default_ttl=60)
+        rate_limiter = HostRateLimiter()
+        http = CachedAPIClient(cache=cache, rate_limiter=rate_limiter)
+        client = GamalyticClient(http)
+        results = await client.get_commercial_batch([646570, 2379780])
+        assert len(results) == 2
+        await http.close()
+
+
+class TestSteamStoreLive:
+    """Live tests against Steam Store API."""
+
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_steam_store_extended_fields(self):
+        """Verify Steam Store returns extended fields for Slay the Spire."""
+        cache = TTLCache(default_ttl=60)
+        rate_limiter = HostRateLimiter()
+        http = CachedAPIClient(cache=cache, rate_limiter=rate_limiter)
+        from src.steam_api import SteamStoreClient
+        client = SteamStoreClient(http)
+        result = await client.get_app_details(646570)
+        assert result is not None
+        assert result.achievement_count is not None
+        assert result.achievement_count > 0
+        assert len(result.supported_languages) > 0
+        await http.close()
+
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_steam_store_languages_structured(self):
+        """Verify supported_languages returns structured entries."""
+        cache = TTLCache(default_ttl=60)
+        rate_limiter = HostRateLimiter()
+        http = CachedAPIClient(cache=cache, rate_limiter=rate_limiter)
+        from src.steam_api import SteamStoreClient
+        client = SteamStoreClient(http)
+        result = await client.get_app_details(646570)
+        assert result is not None
+        langs = result.supported_languages
+        assert len(langs) > 0
+        # LanguageEntry objects have .language and .full_audio attributes
+        assert all(hasattr(lang, "language") for lang in langs)
+        assert all(hasattr(lang, "full_audio") for lang in langs)
+        await http.close()
