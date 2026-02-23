@@ -49,6 +49,29 @@ def strip_html(html: str) -> str:
     return parser.get_text()
 
 
+def parse_supported_languages(raw: str) -> list[dict]:
+    """Parse Steam supported_languages HTML into structured list.
+
+    Input format: "English<strong>*</strong>, French<strong>*</strong>, German, ..."
+    with trailing note: "<br><strong>*</strong>languages with full audio support"
+
+    Returns:
+        List of {"language": str, "full_audio": bool} dicts
+    """
+    if not raw:
+        return []
+    # Remove the trailing note line
+    clean = re.sub(r'<br\s*/?>\s*<strong>\*</strong>[^,]*$', '', raw, flags=re.IGNORECASE | re.DOTALL)
+    parts = [p.strip() for p in clean.split(",") if p.strip()]
+    result = []
+    for part in parts:
+        has_audio = bool(re.search(r'<strong>\*</strong>', part, re.IGNORECASE))
+        name = strip_html(part).strip().rstrip("*").strip()
+        if name:
+            result.append({"language": name, "full_audio": has_audio})
+    return result
+
+
 def parse_steam_date(date_str: str) -> str | None:
     """Parse Steam date string to ISO format YYYY-MM-DD.
 
@@ -881,11 +904,11 @@ class SteamStoreClient:
             GameMetadata with game details, or APIError on failure
         """
         try:
-            # Use get_with_metadata for freshness tracking (24 hour cache TTL)
+            # Use get_with_metadata for freshness tracking (7 day cache TTL)
             data, fetched_at, cache_age = await self.http.get_with_metadata(
                 f"{self.BASE_URL}/appdetails",
                 params={"appids": str(appid)},
-                cache_ttl=86400
+                cache_ttl=604800  # 7 days — platforms/ratings/achievements rarely change
             )
             # Response: {"12345": {"success": true, "data": {...}}}
             app_data = data.get(str(appid), {})
@@ -927,8 +950,18 @@ class SteamStoreClient:
                 "dlc_count": 0,
                 "content_descriptors": [],
                 "supported_languages_count": 0,
-                "supported_languages_raw": ""
+                "supported_languages_raw": "",
+                "achievement_count": None,
+                "ratings": {},
+                "supported_languages": [],
+                "developer_website": None,
+                "pc_requirements_min": "",
+                "pc_requirements_rec": "",
+                "controller_support": None,
             }
+
+            # Pre-initialize languages_raw so Phase 8 block can reference it even if the main try/except exits early
+            languages_raw = ""
 
             # Parse new fields with defensive try/except to prevent individual field failures from crashing
             try:
@@ -1023,6 +1056,58 @@ class SteamStoreClient:
             except Exception as e:
                 # Log the error but continue with defaults - old fields must still be returned
                 logger.warning(f"Failed to parse extended fields for AppID {appid}: {e}. Returning with defaults.")
+
+            # Phase 8 extended fields — each has its own try/except to remain isolated
+            try:
+                achievements_data = details.get("achievements", {})
+                if isinstance(achievements_data, dict):
+                    new_fields["achievement_count"] = achievements_data.get("total")
+            except Exception as e:
+                logger.warning(f"AppID {appid}: achievement_count parse error: {e}")
+
+            try:
+                ratings_raw = details.get("ratings", {})
+                if isinstance(ratings_raw, dict):
+                    parsed_ratings = {}
+                    for authority, rating_data in ratings_raw.items():
+                        if isinstance(rating_data, dict):
+                            parsed_ratings[authority] = {
+                                "rating": rating_data.get("rating", ""),
+                                "descriptors": rating_data.get("descriptors", ""),
+                            }
+                    new_fields["ratings"] = parsed_ratings
+            except Exception as e:
+                logger.warning(f"AppID {appid}: ratings parse error: {e}")
+
+            try:
+                if languages_raw:
+                    new_fields["supported_languages"] = parse_supported_languages(languages_raw)
+            except Exception as e:
+                logger.warning(f"AppID {appid}: supported_languages parse error: {e}")
+
+            try:
+                new_fields["developer_website"] = details.get("website") or None
+            except Exception as e:
+                logger.warning(f"AppID {appid}: developer_website parse error: {e}")
+
+            try:
+                pc_req_data = details.get("pc_requirements", {})
+                if isinstance(pc_req_data, dict):
+                    new_fields["pc_requirements_min"] = strip_html(pc_req_data.get("minimum", ""))
+                    new_fields["pc_requirements_rec"] = strip_html(pc_req_data.get("recommended", ""))
+                elif isinstance(pc_req_data, list):
+                    # Some games return empty list instead of dict
+                    pass  # Keep defaults (empty strings)
+            except Exception as e:
+                logger.warning(f"AppID {appid}: pc_requirements parse error: {e}")
+
+            try:
+                new_fields["controller_support"] = details.get("controller_support") or None
+                # Validate: should be "full" or "partial" or None
+                if new_fields["controller_support"] not in (None, "full", "partial"):
+                    logger.warning(f"AppID {appid}: unexpected controller_support value: {new_fields['controller_support']}")
+            except Exception as e:
+                logger.warning(f"AppID {appid}: controller_support parse error: {e}")
 
             return GameMetadata(
                 appid=appid,
