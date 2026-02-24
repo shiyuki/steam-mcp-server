@@ -709,9 +709,9 @@ def register_tools(mcp: FastMCP):
 
     # --- Phase 9: Market Analysis Tools ---
 
-    async def _fetch_game_list_for_analysis(tags):
-        """Fetch flat game dict list from SteamSpy/Steam Store for the given tags."""
-        games, data_source = await _fetch_game_list_steamspy(_steamspy, _steam_store, tags)
+    async def _fetch_game_list_for_analysis(tags, appids=None):
+        """Fetch flat game dict list from SteamSpy/Steam Store for the given tags or appids."""
+        games, data_source = await _fetch_game_list_steamspy(_steamspy, _steam_store, tags, appids=appids)
         return games
 
     @mcp.tool()
@@ -821,6 +821,7 @@ def register_tools(mcp: FastMCP):
     async def evaluate_game(
         appid: int = 0,
         genre: str = "",
+        genre_appids: str = "",
         price_tier: str = "",
     ) -> str:
         """Evaluate a Steam game against genre benchmarks with percentile rankings.
@@ -838,8 +839,11 @@ def register_tools(mcp: FastMCP):
 
         Args:
             appid: Steam AppID of the game to evaluate (required, must be positive).
-            genre: Genre to evaluate against (required). Single tag or comma-separated
-                   for intersection (e.g., "Roguelike, Deckbuilder").
+            genre: Genre to evaluate against. Single tag or comma-separated for intersection
+                   (e.g., "Roguelike, Deckbuilder"). Mutually exclusive with genre_appids.
+            genre_appids: Comma-separated Steam AppIDs to use as the baseline game list.
+                          Alternative to genre for custom baseline lists.
+                          Mutually exclusive with genre.
             price_tier: Optional price tier filter for percentile comparison.
                         Values: "f2p", "0.01_4.99", "5_9.99", "10_14.99", "15_19.99",
                         "20_29.99", "30_plus". Empty = full genre (default).
@@ -852,12 +856,31 @@ def register_tools(mcp: FastMCP):
         if appid <= 0:
             return json.dumps({"error": "appid must be positive", "error_type": "validation"})
 
-        if not genre.strip():
-            return json.dumps({"error": "genre is required", "error_type": "validation"})
+        genre = genre.strip()
+        genre_appids_str = genre_appids.strip()
 
-        genre_tags = [t.strip() for t in genre.split(",") if t.strip()]
+        if not genre and not genre_appids_str:
+            return json.dumps({"error": "Either genre or genre_appids must be provided", "error_type": "validation"})
 
-        logger.info("evaluate_game: appid=%d, genre=%s, price_tier=%s", appid, genre, price_tier or "all")
+        if genre and genre_appids_str:
+            return json.dumps({"error": "Provide either genre or genre_appids, not both", "error_type": "validation"})
+
+        genre_tags = [t.strip() for t in genre.split(",") if t.strip()] if genre else []
+
+        # Parse genre_appids if provided
+        genre_appid_list: list[int] | None = None
+        if genre_appids_str:
+            try:
+                genre_appid_list = [int(a.strip()) for a in genre_appids_str.split(",") if a.strip()]
+                if not genre_appid_list:
+                    return json.dumps({"error": "genre_appids list is empty", "error_type": "validation"})
+                if any(a <= 0 for a in genre_appid_list):
+                    return json.dumps({"error": "All genre_appids must be positive", "error_type": "validation"})
+            except ValueError:
+                return json.dumps({"error": "genre_appids must be comma-separated integers", "error_type": "validation"})
+
+        logger.info("evaluate_game: appid=%d, genre=%s, genre_appids=%d, price_tier=%s",
+                    appid, genre or "N/A", len(genre_appid_list or []), price_tier or "all")
 
         try:
             # Step 1: Get genre baseline via analyze_market_phase1
@@ -866,7 +889,7 @@ def register_tools(mcp: FastMCP):
                 steam_store=_steam_store,
                 gamalytic=_gamalytic,
                 tags=genre_tags,
-                appids=None,
+                appids=genre_appid_list,
                 metrics=None,
                 exclude=None,
                 top_n=10,
@@ -925,8 +948,11 @@ def register_tools(mcp: FastMCP):
                     {"error": f"Game AppID {appid} not found or has no data", "error_type": "not_found"}
                 )
 
-            # Step 3: Get genre game list
-            genre_games = await _fetch_game_list_for_analysis(genre_tags)
+            # Step 3: Get genre game list (tag-based or appids-based)
+            if genre_appid_list:
+                genre_games = await _fetch_game_list_for_analysis([], appids=genre_appid_list)
+            else:
+                genre_games = await _fetch_game_list_for_analysis(genre_tags)
             if isinstance(genre_games, dict) and "error" in genre_games:
                 return json.dumps(genre_games)
 

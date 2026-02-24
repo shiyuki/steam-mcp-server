@@ -652,16 +652,56 @@ async def _fetch_game_list_steamspy(
     steamspy: "SteamSpyClient",
     steam_store: "SteamStoreClient",
     tags: list[str],
+    appids: list[int] | None = None,
 ) -> tuple[list[dict], str]:
-    """Fetch game list from SteamSpy (single tag) or Steam Store (multi-tag).
+    """Fetch game list from SteamSpy (single tag) or Steam Store (multi-tag), or per-appid.
 
     Returns (game_dicts, data_source_str).
 
+    When appids provided and tags empty: fetches per-appid engagement data concurrently.
     For single-tag: calls steamspy.search_by_tag. If result >= STEAMSPY_SUPPLEMENT_THRESHOLD,
     also supplements with Steam Store data.
     For multi-tag: uses Steam Store search.
+    Tags take priority when both tags and appids are provided.
     """
+    import asyncio
     from src.schemas import APIError as APIErrorSchema
+
+    # Appids-only path: fetch per-appid engagement data concurrently
+    if appids and not tags:
+        logger.info(f"Appids-only fetch: fetching engagement data for {len(appids)} appids")
+
+        async def _fetch_one(appid: int) -> dict | None:
+            try:
+                result = await steamspy.get_engagement_data(appid)
+                if isinstance(result, APIErrorSchema):
+                    logger.debug(f"SteamSpy engagement fetch failed for appid {appid}: {result.message}")
+                    return None
+                return {
+                    "appid": result.appid,
+                    "name": result.name,
+                    "developer": result.developer,
+                    "publisher": result.publisher,
+                    "owners": result.owners_midpoint,
+                    "ccu": result.ccu,
+                    "price": result.price,
+                    "review_score": result.review_score,
+                    "median_forever": result.median_forever,
+                    "average_forever": result.average_forever,
+                    "revenue": None,
+                    "followers": None,
+                    "copies_sold": None,
+                    "tags": result.tags,
+                    "release_date": None,
+                }
+            except Exception as exc:
+                logger.debug(f"Appid fetch exception for {appid}: {exc}")
+                return None
+
+        tasks = [_fetch_one(appid) for appid in appids]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        games = [r for r in results if isinstance(r, dict)]
+        return games, "steamspy_appids"
 
     if len(tags) == 1:
         tag = tags[0]
@@ -776,14 +816,14 @@ async def analyze_market_phase1(
     Games list is returned without revenue data (SteamSpy doesn't have it).
     """
     fetch_start = time.monotonic()
-    games, data_source = await _fetch_game_list_steamspy(steamspy, steam_store, tags)
+    games, data_source = await _fetch_game_list_steamspy(steamspy, steam_store, tags, appids=appids)
     fetch_ms = round((time.monotonic() - fetch_start) * 1000)
 
     if not games:
         return {
             "error": "No games found for specified tags.",
             "total_games": 0,
-            "market_label": market_label or ", ".join(tags),
+            "market_label": market_label or ", ".join(tags) or f"Custom ({len(appids or [])} games)",
             "phase": 1,
         }
 
@@ -1822,18 +1862,19 @@ async def compare_markets_analysis(
 
     for idx, market_input in enumerate(market_inputs):
         tags = market_input.get("tags") or []
-        if not tags:
-            warnings.append(f"Market {idx + 1} has no tags — skipping.")
+        appids = market_input.get("appids") or []
+        if not tags and not appids:
+            warnings.append(f"Market {idx + 1} has no tags or appids — skipping.")
             continue
 
-        label = market_input.get("label") or ", ".join(tags)
+        label = market_input.get("label") or ", ".join(tags) or f"Custom ({len(appids)} games)"
         metrics = market_input.get("metrics")
         exclude = market_input.get("exclude")
         top_n = market_input.get("top_n", 10)
 
         # Fetch game list
         fetch_start = time.monotonic()
-        games, data_source = await _fetch_game_list_steamspy(steamspy, steam_store, tags)
+        games, data_source = await _fetch_game_list_steamspy(steamspy, steam_store, tags, appids=appids if not tags else None)
         fetch_ms = round((time.monotonic() - fetch_start) * 1000)
 
         if not games:
