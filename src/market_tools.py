@@ -17,7 +17,9 @@ if TYPE_CHECKING:
     from src.steam_api import GamalyticClient, SteamSpyClient, SteamStoreClient
 
 from src.analytics import (
+    PRICE_BRACKETS,
     STANDARD_BIASES,
+    _assign_price_bracket,
     _assign_revenue_tier,
     _gini_coefficient,
     _get_top_tags,
@@ -883,3 +885,635 @@ async def analyze_market_phase2(
         result["compute_time"]["data_fetch_ms"] = fetch_ms
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Evaluate Game — Sub-computation Functions
+# ---------------------------------------------------------------------------
+
+def _compute_percentiles(game: dict, genre_games: list[dict]) -> "GamePercentiles":
+    """Compute percentile rank for 7 metrics against the genre population.
+
+    Uses _percentile_rank (less-than definition): percentage of genre games
+    strictly below the target game's value. Returns None per metric when the
+    population for that metric is empty.
+    """
+    populations: dict[str, list[float]] = {
+        "revenue": [g["revenue"] for g in genre_games if g.get("revenue") is not None],
+        "review_score": [g["review_score"] for g in genre_games if g.get("review_score") is not None],
+        "median_playtime": [g["median_forever"] for g in genre_games if g.get("median_forever") is not None],
+        "ccu": [g["ccu"] for g in genre_games if g.get("ccu") is not None],
+        "followers": [g["followers"] for g in genre_games if g.get("followers") is not None],
+        "copies_sold": [g["copies_sold"] for g in genre_games if g.get("copies_sold") is not None],
+        "review_count": [
+            g.get("positive", 0) + g.get("negative", 0)
+            for g in genre_games
+            if g.get("positive") is not None
+        ],
+    }
+
+    game_values: dict[str, float | None] = {
+        "revenue": game.get("revenue"),
+        "review_score": game.get("review_score"),
+        "median_playtime": game.get("median_forever"),
+        "ccu": game.get("ccu"),
+        "followers": game.get("followers"),
+        "copies_sold": game.get("copies_sold"),
+        "review_count": (
+            (game.get("positive", 0) + game.get("negative", 0))
+            if game.get("positive") is not None
+            else None
+        ),
+    }
+
+    return GamePercentiles(
+        revenue=_percentile_rank(game_values["revenue"], populations["revenue"]),
+        review_score=_percentile_rank(game_values["review_score"], populations["review_score"]),
+        median_playtime=_percentile_rank(game_values["median_playtime"], populations["median_playtime"]),
+        ccu=_percentile_rank(game_values["ccu"], populations["ccu"]),
+        followers=_percentile_rank(game_values["followers"], populations["followers"]),
+        copies_sold=_percentile_rank(game_values["copies_sold"], populations["copies_sold"]),
+        review_count=_percentile_rank(game_values["review_count"], populations["review_count"]),
+    )
+
+
+def _compute_strengths_weaknesses(
+    game: dict, genre_games: list[dict]
+) -> tuple[list[str], list[str]]:
+    """Identify strengths and weaknesses using standard deviation analysis.
+
+    A metric is a strength if the game is > 1.0 stdev above the mean.
+    A metric is a weakness if the game is < -1.0 stdev below the mean.
+    """
+    populations: dict[str, list[float]] = {
+        "revenue": [g["revenue"] for g in genre_games if g.get("revenue") is not None],
+        "review_score": [g["review_score"] for g in genre_games if g.get("review_score") is not None],
+        "median_playtime": [g["median_forever"] for g in genre_games if g.get("median_forever") is not None],
+        "ccu": [g["ccu"] for g in genre_games if g.get("ccu") is not None],
+        "followers": [g["followers"] for g in genre_games if g.get("followers") is not None],
+        "copies_sold": [g["copies_sold"] for g in genre_games if g.get("copies_sold") is not None],
+        "review_count": [
+            g.get("positive", 0) + g.get("negative", 0)
+            for g in genre_games
+            if g.get("positive") is not None
+        ],
+    }
+
+    game_values: dict[str, float | None] = {
+        "revenue": game.get("revenue"),
+        "review_score": game.get("review_score"),
+        "median_playtime": game.get("median_forever"),
+        "ccu": game.get("ccu"),
+        "followers": game.get("followers"),
+        "copies_sold": game.get("copies_sold"),
+        "review_count": (
+            (game.get("positive", 0) + game.get("negative", 0))
+            if game.get("positive") is not None
+            else None
+        ),
+    }
+
+    strengths: list[str] = []
+    weaknesses: list[str] = []
+
+    for metric, value in game_values.items():
+        pop = populations[metric]
+        deviation = _std_deviations_from_mean(value, pop)
+        if deviation is None:
+            continue
+        if deviation > 1.0:
+            strengths.append(metric)
+        elif deviation < -1.0:
+            weaknesses.append(metric)
+
+    return strengths, weaknesses
+
+
+def _compute_opportunity_score(
+    percentiles: "GamePercentiles",
+    strengths: list[str],
+    weaknesses: list[str],
+    genre_health: "MarketHealthScores | None",
+) -> tuple[float, float, float]:
+    """Compute position, potential, and opportunity scores (all 0-100).
+
+    Position score: How well the game performs NOW vs. genre peers.
+    Potential score: Room to grow based on market health and current gaps.
+    Opportunity score: Composite = position * 0.5 + potential * 0.5.
+
+    Returns (position_score, potential_score, opportunity_score).
+    """
+    # Position score: average of available percentiles
+    percentile_values = [
+        v for v in [
+            percentiles.revenue, percentiles.review_score, percentiles.median_playtime,
+            percentiles.ccu, percentiles.followers, percentiles.copies_sold,
+            percentiles.review_count,
+        ]
+        if v is not None
+    ]
+    if percentile_values:
+        position_score = round(statistics.mean(percentile_values), 1)
+    else:
+        position_score = 50.0  # neutral when no data
+
+    # Potential score: headroom + market growth signals.
+    # Calibrated so neutral market (growth=50) + mid-pack (position=50) => potential=50.
+    growth_factor = genre_health.growth / 100 if genre_health else 0.5
+    headroom = (100 - position_score) / 100
+    # weakness_factor: many fixable gaps => more growth room
+    weakness_factor = min(len(weaknesses) / 3, 1.0)
+    potential_raw = (growth_factor * 0.5 + headroom * 0.3 + weakness_factor * 0.2) * 100
+    potential_score = round(max(0.0, min(100.0, potential_raw)), 1)
+
+    # Opportunity score (composite):
+    # Weights: position 0.5 + potential 0.3 + market_growth 0.2.
+    # Growth component ensures top performers in growing markets get > 70.
+    # Calibrated tiers: 90-100 exceptional, 75-89 strong, 60-74 moderate, 40-59 neutral.
+    growth_component = genre_health.growth if genre_health else 50.0
+    opportunity_raw = position_score * 0.5 + potential_score * 0.3 + growth_component * 0.2
+    opportunity_score = round(max(0.0, min(100.0, opportunity_raw)), 1)
+
+    return position_score, potential_score, opportunity_score
+
+
+def _find_competitors(
+    game: dict,
+    genre_games: list[dict],
+    commercial_data=None,
+    n: int = 5,
+) -> list["CompetitorComparison"]:
+    """Identify top competitor games via audience_overlap or tag-based fallback.
+
+    Primary path: audience_overlap from Gamalytic commercial_data.
+    Fallback path: Jaccard tag similarity + revenue tier match + price proximity.
+    """
+    target_appid = game.get("appid")
+
+    # --- Primary: audience_overlap from Gamalytic ---
+    audience_overlap = getattr(commercial_data, "audience_overlap", None) or []
+    if audience_overlap:
+        # Sort by overlap_pct descending, take top n
+        sorted_overlap = sorted(
+            audience_overlap,
+            key=lambda e: (e.overlap_pct or 0),
+            reverse=True,
+        )[:n]
+        competitors = []
+        for entry in sorted_overlap:
+            if entry.appid is None:
+                continue
+            # Find matching game in genre_games for extra data
+            match = next((g for g in genre_games if g.get("appid") == entry.appid), None)
+            competitors.append(CompetitorComparison(
+                appid=entry.appid,
+                name=entry.name or (match.get("name", "") if match else ""),
+                revenue=entry.revenue or (match.get("revenue") if match else None),
+                review_score=entry.score or (match.get("review_score") if match else None),
+                price=match.get("price") if match else None,
+                ccu=match.get("ccu") if match else None,
+                owners=match.get("owners") if match else None,
+                followers=entry.followers or (match.get("followers") if match else None),
+                similarity_score=round(entry.overlap_pct or 0, 2),
+                overlap_source="audience_overlap",
+                shared_tags=[],
+            ))
+        return competitors
+
+    # --- Fallback: tag similarity scoring ---
+    game_tags = set(_get_top_tags(game.get("tags", {}), top_n=20))
+    game_revenue = game.get("revenue")
+    game_tier = _assign_revenue_tier(game_revenue)
+    game_price = game.get("price") or 0.0
+
+    scored: list[tuple[float, dict, list[str]]] = []
+
+    for g in genre_games:
+        g_appid = g.get("appid")
+        if g_appid == target_appid:
+            continue
+
+        g_tags = set(_get_top_tags(g.get("tags", {}), top_n=20))
+        # Jaccard similarity
+        union = game_tags | g_tags
+        intersection = game_tags & g_tags
+        tag_score = len(intersection) / len(union) if union else 0.0
+
+        # Revenue tier match
+        g_tier = _assign_revenue_tier(g.get("revenue"))
+        tier_match = 1.0 if (game_tier and g_tier and game_tier == g_tier) else 0.5
+
+        # Price proximity
+        g_price = g.get("price") or 0.0
+        denom = max(game_price, g_price, 0.01)
+        price_score = min(game_price, g_price) / denom
+
+        total_score = tag_score * 0.6 + tier_match * 0.3 + price_score * 0.1
+        shared = sorted(intersection)
+        scored.append((total_score, g, shared))
+
+    # Sort by total score descending, take top n
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = scored[:n]
+
+    competitors = []
+    for score, g, shared_tags in top:
+        competitors.append(CompetitorComparison(
+            appid=g.get("appid", 0),
+            name=g.get("name", ""),
+            revenue=g.get("revenue"),
+            review_score=g.get("review_score"),
+            price=g.get("price"),
+            ccu=g.get("ccu"),
+            owners=g.get("owners"),
+            followers=g.get("followers"),
+            similarity_score=round(score, 3),
+            overlap_source="tag_fallback",
+            shared_tags=shared_tags,
+        ))
+
+    return competitors
+
+
+def _compute_tag_insights(
+    game: dict,
+    genre_games: list[dict],
+    primary_tags: set[str],
+) -> list["TagInsight"]:
+    """Classify each non-primary game tag as positive_differentiator or niche_risk.
+
+    Compares tag revenue multiplier vs genre average. Tags with more games than
+    the minimum threshold get a computed multiplier; others get "neutral".
+    """
+    # Compute genre average revenue
+    all_revenues = [g["revenue"] for g in genre_games if g.get("revenue") is not None]
+    genre_avg = _safe_mean(all_revenues)
+    if not genre_avg:
+        return []
+
+    # Build tag -> list of revenues across genre
+    min_games = max(3, len(all_revenues) // 30)
+    tag_revenues: dict[str, list[float]] = defaultdict(list)
+    for g in genre_games:
+        if g.get("revenue") is None:
+            continue
+        for tag in _get_top_tags(g.get("tags", {}), top_n=20):
+            if tag in primary_tags:
+                continue
+            tag_revenues[tag].append(g["revenue"])
+
+    # Classify each tag on the target game
+    game_tags = _get_top_tags(game.get("tags", {}), top_n=30)
+    insights: list[TagInsight] = []
+
+    for tag in game_tags:
+        if tag in primary_tags:
+            continue
+        revs = tag_revenues.get(tag, [])
+        game_count = len(revs)
+
+        if game_count >= min_games:
+            tag_avg = statistics.mean(revs)
+            multiplier = round(tag_avg / genre_avg, 3) if genre_avg else 1.0
+        else:
+            multiplier = 1.0  # insufficient data -> neutral
+
+        if multiplier > 1.0:
+            classification = "positive_differentiator"
+        elif multiplier < 1.0:
+            classification = "niche_risk"
+        else:
+            classification = "neutral"
+
+        insights.append(TagInsight(
+            tag=tag,
+            multiplier=multiplier,
+            game_count=game_count,
+            classification=classification,
+        ))
+
+    # Sort by multiplier descending (best differentiators first)
+    insights.sort(key=lambda t: t.multiplier, reverse=True)
+    return insights
+
+
+def _build_genre_fit(
+    game_tags: list[str],
+    genre_top_tags: list[dict],
+    tag_insights: list["TagInsight"],
+) -> dict:
+    """Assess how well the game's tag profile matches genre norms.
+
+    Returns dict with unique_tags, missing_common_tags, differentiators, niche_risks.
+    """
+    game_tag_set = set(game_tags)
+    # Genre top tags (common = appears in >25% of genre games)
+    common_genre_tags = {
+        t["tag"]
+        for t in genre_top_tags
+        if t.get("pct_of_games", 0) >= 25.0
+    }
+
+    unique_tags = sorted(game_tag_set - {t["tag"] for t in genre_top_tags[:20]})
+    missing_common_tags = sorted(common_genre_tags - game_tag_set)
+
+    differentiators = [ti.model_dump() for ti in tag_insights if ti.classification == "positive_differentiator"]
+    niche_risks = [ti.model_dump() for ti in tag_insights if ti.classification == "niche_risk"]
+
+    return {
+        "unique_tags": unique_tags,
+        "missing_common_tags": missing_common_tags,
+        "differentiators": differentiators,
+        "niche_risks": niche_risks,
+    }
+
+
+def _build_pricing_context(game: dict, genre_games: list[dict]) -> dict:
+    """Show where the game sits on the genre's price-revenue curve.
+
+    Returns dict with game_price, genre_price_stats, price_bracket,
+    bracket_avg_revenue, bracket_success_rate, and sweet_spot.
+    """
+    _SUCCESS_THRESHOLD = 100_000
+
+    game_price = game.get("price")
+    game_bracket = _assign_price_bracket(game_price)
+
+    # Genre price stats
+    all_prices = [g["price"] for g in genre_games if g.get("price") is not None]
+    price_stats = {
+        "mean": round(statistics.mean(all_prices), 2) if all_prices else None,
+        "median": round(statistics.median(all_prices), 2) if all_prices else None,
+        "min": round(min(all_prices), 2) if all_prices else None,
+        "max": round(max(all_prices), 2) if all_prices else None,
+    }
+
+    # Per-bracket revenue stats
+    bracket_data: dict[str, dict] = {}
+    for label, min_p, max_p in PRICE_BRACKETS:
+        bracket_games = [
+            g for g in genre_games
+            if g.get("price") is not None and _assign_price_bracket(g["price"]) == label
+        ]
+        revenues = [g["revenue"] for g in bracket_games if g.get("revenue") is not None]
+        count = len(bracket_games)
+        avg_rev = round(statistics.mean(revenues), 2) if revenues else None
+        if revenues:
+            success_count = sum(1 for r in revenues if r >= _SUCCESS_THRESHOLD)
+            success_rate = round(success_count / len(revenues) * 100, 1)
+        else:
+            success_rate = None
+        bracket_data[label] = {
+            "count": count,
+            "avg_revenue": avg_rev,
+            "success_rate": success_rate,
+        }
+
+    # Current game bracket stats
+    game_bracket_info = bracket_data.get(game_bracket, {}) if game_bracket else {}
+    bracket_avg_revenue = game_bracket_info.get("avg_revenue")
+    bracket_success_rate = game_bracket_info.get("success_rate")
+
+    # Sweet spot: bracket with highest avg_revenue (that has enough games)
+    valid_brackets = [
+        (label, data)
+        for label, data in bracket_data.items()
+        if data["count"] >= 3 and data["avg_revenue"] is not None
+    ]
+    sweet_spot = None
+    if valid_brackets:
+        best_label, best_data = max(valid_brackets, key=lambda x: x[1]["avg_revenue"])
+        sweet_spot = {
+            "bracket": best_label,
+            "avg_revenue": best_data["avg_revenue"],
+        }
+
+    return {
+        "game_price": game_price,
+        "genre_price_stats": price_stats,
+        "price_bracket": game_bracket,
+        "bracket_avg_revenue": bracket_avg_revenue,
+        "bracket_success_rate": bracket_success_rate,
+        "sweet_spot": sweet_spot,
+    }
+
+
+def _build_review_sentiment(reviews_data: dict | None) -> dict | None:
+    """Extract a medium-depth review sentiment summary from ReviewsData dict.
+
+    Returns None if reviews_data is None.
+    """
+    if reviews_data is None:
+        return None
+
+    # Handle both dict and ReviewsData schema objects
+    if hasattr(reviews_data, "aggregates"):
+        # ReviewsData schema object
+        aggregates = reviews_data.aggregates
+        sentiment_periods = reviews_data.sentiment or []
+        snippets = reviews_data.snippets or []
+        reviews = reviews_data.reviews or []
+    elif isinstance(reviews_data, dict):
+        aggregates = reviews_data.get("aggregates") or {}
+        sentiment_periods = reviews_data.get("sentiment") or []
+        snippets = reviews_data.get("snippets") or []
+        reviews = reviews_data.get("reviews") or []
+    else:
+        return None
+
+    # Extract aggregates
+    if isinstance(aggregates, dict):
+        overall_score = aggregates.get("review_score_desc", "")
+        positive_pct = aggregates.get("positive_ratio")
+        total_reviews = aggregates.get("total_reviews", 0)
+    else:
+        overall_score = getattr(aggregates, "review_score_desc", "")
+        positive_pct = getattr(aggregates, "positive_ratio", None)
+        total_reviews = getattr(aggregates, "total_reviews", 0)
+
+    # Take first 3 sentiment periods
+    top_sentiment = []
+    for p in sentiment_periods[:3]:
+        if isinstance(p, dict):
+            top_sentiment.append(p)
+        else:
+            top_sentiment.append(p.model_dump())
+
+    # Top snippets or reviews
+    top_snippets = []
+    if snippets:
+        for s in snippets[:3]:
+            if isinstance(s, dict):
+                top_snippets.append(s)
+            else:
+                top_snippets.append(s.model_dump())
+    elif reviews:
+        for r in reviews[:3]:
+            if isinstance(r, dict):
+                top_snippets.append({"text": r.get("text", ""), "voted_up": r.get("voted_up", True)})
+            else:
+                top_snippets.append({"text": getattr(r, "text", ""), "voted_up": getattr(r, "voted_up", True)})
+
+    return {
+        "overall_score": overall_score,
+        "positive_pct": positive_pct,
+        "total_reviews": total_reviews,
+        "sentiment_periods": top_sentiment,
+        "top_snippets": top_snippets,
+    }
+
+
+def _build_historical_performance(commercial_data) -> list[dict] | None:
+    """Extract monthly performance data points from Gamalytic history.
+
+    Returns None if commercial_data is None or history is empty.
+    """
+    if commercial_data is None:
+        return None
+    history = getattr(commercial_data, "history", None) or []
+    if not history:
+        return None
+
+    result = []
+    for entry in history:
+        result.append({
+            "timestamp": getattr(entry, "timestamp", None),
+            "revenue": getattr(entry, "revenue", None),
+            "players": getattr(entry, "gamalytic_players", None),
+            "reviews": getattr(entry, "reviews", None),
+            "followers": getattr(entry, "followers", None),
+        })
+    return result if result else None
+
+
+# ---------------------------------------------------------------------------
+# Evaluate Game — Main Orchestration
+# ---------------------------------------------------------------------------
+
+async def evaluate_game_analysis(
+    appid: int,
+    genre_tags: list[str],
+    genre_games: list[dict],
+    genre_analysis: dict | None,
+    game_data: dict,
+    commercial_data=None,
+    reviews_data: dict | None = None,
+    price_tier: str | None = None,
+) -> dict:
+    """Evaluate a specific game against its genre benchmarks.
+
+    Computes percentile rankings, strengths/weaknesses, opportunity score,
+    competitor identification, tag insights, genre fit, pricing context,
+    review sentiment, and historical performance.
+
+    Returns a flat dict matching EvaluateGameResult schema.
+    """
+    total_start = time.monotonic()
+    warnings: list[str] = []
+
+    # Step 1: Build game profile
+    game_profile = _build_game_profile(game_data)
+
+    # Step 2: Filter genre games by price tier if requested
+    working_games = genre_games
+    if price_tier:
+        tier_games = [g for g in genre_games if _assign_price_bracket(g.get("price")) == price_tier]
+        if len(tier_games) >= MIN_GAMES_THRESHOLD:
+            working_games = tier_games
+        else:
+            warnings.append(
+                f"Price tier '{price_tier}' has only {len(tier_games)} games "
+                f"(minimum {MIN_GAMES_THRESHOLD}). Using full genre pool."
+            )
+
+    # Step 3: Compute percentiles
+    percentiles = _compute_percentiles(game_data, working_games)
+
+    # Step 4: Compute strengths and weaknesses
+    strengths, weaknesses = _compute_strengths_weaknesses(game_data, working_games)
+
+    # Step 5: Get health scores from genre_analysis
+    genre_health: MarketHealthScores | None = None
+    if genre_analysis is not None:
+        health_dict = genre_analysis.get("health_scores")
+        if health_dict:
+            if isinstance(health_dict, dict):
+                genre_health = MarketHealthScores(**health_dict)
+            elif isinstance(health_dict, MarketHealthScores):
+                genre_health = health_dict
+
+    # Step 6: Compute opportunity scores
+    position_score, potential_score, opportunity_score = _compute_opportunity_score(
+        percentiles, strengths, weaknesses, genre_health
+    )
+
+    # Step 7: Find competitors
+    competitors = _find_competitors(game_data, working_games, commercial_data=commercial_data, n=5)
+
+    # Step 8: Compute tag insights
+    primary_tags_set = set(genre_tags)
+    tag_insights = _compute_tag_insights(game_data, working_games, primary_tags_set)
+
+    # Step 9: Build genre fit analysis
+    game_tags_list = _get_top_tags(game_data.get("tags", {}), top_n=30)
+    genre_top_tags = _compute_tag_frequency(working_games, primary_tags=primary_tags_set, top_n=20)
+    genre_fit = _build_genre_fit(game_tags_list, genre_top_tags, tag_insights)
+
+    # Step 10: Build pricing context
+    pricing_context = _build_pricing_context(game_data, working_games)
+
+    # Step 11: Build review sentiment
+    review_sentiment = _build_review_sentiment(reviews_data)
+
+    # Step 12: Build historical performance
+    historical_performance = _build_historical_performance(commercial_data)
+
+    # Step 13: Build genre baseline summary
+    revenues = [g["revenue"] for g in working_games if g.get("revenue") is not None]
+    games_with_revenue = len(revenues)
+    coverage_pct = round(games_with_revenue / len(working_games) * 100, 1) if working_games else 0.0
+    genre_baseline = {
+        "total_games": len(working_games),
+        "games_with_revenue": games_with_revenue,
+        "avg_revenue": round(statistics.mean(revenues), 2) if revenues else None,
+        "median_revenue": round(statistics.median(revenues), 2) if revenues else None,
+        "coverage_pct": coverage_pct,
+    }
+
+    # Step 14: Build methodology
+    total_ms = round((time.monotonic() - total_start) * 1000)
+    compute_time = ComputeTimingInfo(total_ms=total_ms)
+    methodology = {
+        "data_source": "steamspy+gamalytic" if commercial_data else "steamspy",
+        "genre_tags": genre_tags,
+        "genre_games_analyzed": len(working_games),
+        "competitor_method": "audience_overlap" if getattr(commercial_data, "audience_overlap", None) else "tag_fallback",
+        "biases": list(STANDARD_BIASES),
+        "notes": [],
+    }
+
+    # Step 15: Assemble EvaluateGameResult and return as dict
+    result_obj = EvaluateGameResult(
+        appid=appid,
+        name=game_data.get("name", ""),
+        genre=", ".join(genre_tags),
+        game_profile=game_profile,
+        percentiles=percentiles,
+        strengths=strengths,
+        weaknesses=weaknesses,
+        position_score=position_score,
+        potential_score=potential_score,
+        opportunity_score=opportunity_score,
+        competitors=competitors,
+        tag_insights=tag_insights,
+        genre_fit=genre_fit,
+        review_sentiment=review_sentiment,
+        pricing_context=pricing_context,
+        historical_performance=historical_performance,
+        genre_baseline=genre_baseline,
+        compute_time=compute_time,
+        warnings=warnings,
+        methodology=methodology,
+    )
+
+    return result_obj.model_dump()
