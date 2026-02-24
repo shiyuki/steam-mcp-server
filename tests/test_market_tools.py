@@ -502,17 +502,18 @@ class TestRunMarketAnalysis:
         assert revenues == sorted(revenues, reverse=True)
 
     def test_skipped_metrics_present(self):
-        """Skipped metrics list is present in result."""
-        games = make_games(20)  # only 20 games -> many metrics skipped
+        """Skipped metrics list is present in result (empty when all metrics unlock at N>=20)."""
+        games = make_games(20)  # N=20 unlocks all metrics -> no skipped metrics
         result = _run_market_analysis(games, tags=["Action"])
         assert "skipped_metrics" in result
         assert isinstance(result["skipped_metrics"], list)
-        assert len(result["skipped_metrics"]) > 0
+        # With single-tier gate at N>=20, all metrics are available; skipped list is empty
+        assert len(result["skipped_metrics"]) == 0
 
-    def test_skipped_has_reason(self):
-        """Each skipped metric has a non-empty reason string."""
+    def test_skipped_has_reason_when_excluded(self):
+        """Each skipped metric (via exclude param) has a non-empty reason string."""
         games = make_games(20)
-        result = _run_market_analysis(games, tags=["Action"])
+        result = _run_market_analysis(games, tags=["Action"], exclude=["temporal_trends"])
         for skipped in result["skipped_metrics"]:
             assert "reason" in skipped
             assert len(skipped["reason"]) > 0
@@ -1004,3 +1005,68 @@ class TestAnalyzeMarketSingle:
 
         assert "continuation_token" not in result
         assert "error" not in result
+
+
+# ---------------------------------------------------------------------------
+# TestOpportunityScoreRework
+# ---------------------------------------------------------------------------
+
+class TestOpportunityScoreRework:
+    """Opportunity score rewards top performers."""
+
+    def test_top_performer_scores_high(self):
+        """A game with 90+ position in growing market should get 80+ opportunity."""
+        from src.market_tools import _compute_opportunity_score
+
+        percentiles = GamePercentiles(
+            revenue=95.0, review_score=90.0, median_playtime=88.0,
+            ccu=92.0, followers=None, copies_sold=None, review_count=85.0,
+        )
+        health = MarketHealthScores(
+            competition=60.0, growth=65.0, saturation=40.0,
+            accessibility=55.0, overall=60.0,
+        )
+        position, potential, opportunity = _compute_opportunity_score(
+            percentiles, ["top_revenue", "top_reviews", "high_playtime", "strong_ccu"],
+            [], health
+        )
+        assert position >= 85.0
+        assert opportunity >= 80.0, f"Top performer got {opportunity}, expected 80+"
+
+    def test_mid_pack_moderate_opportunity(self):
+        """A mid-range game in neutral market should get 45-65 opportunity."""
+        from src.market_tools import _compute_opportunity_score
+
+        percentiles = GamePercentiles(
+            revenue=50.0, review_score=50.0, median_playtime=50.0,
+            ccu=50.0, followers=None, copies_sold=None, review_count=50.0,
+        )
+        health = MarketHealthScores(
+            competition=50.0, growth=50.0, saturation=50.0,
+            accessibility=50.0, overall=50.0,
+        )
+        position, potential, opportunity = _compute_opportunity_score(
+            percentiles, ["one_strength"], ["one_weakness"], health
+        )
+        assert 45.0 <= opportunity <= 65.0, f"Mid-pack got {opportunity}, expected 45-65"
+
+
+# ---------------------------------------------------------------------------
+# TestCustomBaselineBypass
+# ---------------------------------------------------------------------------
+
+class TestCustomBaselineBypass:
+    """Custom baselines bypass MIN_GAMES_THRESHOLD via skip_min_check."""
+
+    def test_skip_min_check_allows_small_list(self):
+        """_run_market_analysis with skip_min_check=True accepts <20 games."""
+        games = make_games(5)
+        result = _run_market_analysis(games, tags=["test"], skip_min_check=True)
+        assert "error" not in result
+        assert result["total_games"] == 5
+
+    def test_without_skip_min_check_rejects_small_list(self):
+        """_run_market_analysis without skip_min_check rejects <20 games."""
+        games = make_games(5)
+        result = _run_market_analysis(games, tags=["test"])
+        assert "error" in result

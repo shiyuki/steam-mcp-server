@@ -1346,12 +1346,18 @@ def _compute_opportunity_score(
     """Compute position, potential, and opportunity scores (all 0-100).
 
     Position score: How well the game performs NOW vs. genre peers.
-    Potential score: Room to grow based on market health and current gaps.
-    Opportunity score: Composite = position * 0.5 + potential * 0.5.
+    Potential score: Market-level opportunity (growth, accessibility, competition).
+    Opportunity score: Composite heavily weighted toward position.
+
+    Calibration targets:
+    - Top performer in growing market: 85-95 (exceptional)
+    - Top performer in stagnant market: 75-85 (strong)
+    - Mid-pack in growing market: 55-65 (moderate)
+    - Low performer in declining market: 20-35 (weak)
 
     Returns (position_score, potential_score, opportunity_score).
     """
-    # Position score: average of available percentiles
+    # Position score: average of available percentiles (unchanged)
     percentile_values = [
         v for v in [
             percentiles.revenue, percentiles.review_score, percentiles.median_playtime,
@@ -1363,23 +1369,27 @@ def _compute_opportunity_score(
     if percentile_values:
         position_score = round(statistics.mean(percentile_values), 1)
     else:
-        position_score = 50.0  # neutral when no data
+        position_score = 50.0
 
-    # Potential score: headroom + market growth signals.
-    # Calibrated so neutral market (growth=50) + mid-pack (position=50) => potential=50.
-    growth_factor = genre_health.growth / 100 if genre_health else 0.5
-    headroom = (100 - position_score) / 100
-    # weakness_factor: many fixable gaps => more growth room
-    weakness_factor = min(len(weaknesses) / 3, 1.0)
-    potential_raw = (growth_factor * 0.5 + headroom * 0.3 + weakness_factor * 0.2) * 100
+    # Potential score: market-level signals (NOT inverse of position)
+    # This measures "how good is this MARKET for games" not "room for THIS game to grow"
+    if genre_health:
+        # Growth (0-100): is the market growing?
+        growth_signal = genre_health.growth / 100
+        # Accessibility (0-100): can new players easily enter?
+        accessibility_signal = genre_health.accessibility / 100 if genre_health.accessibility else 0.5
+        # Competition (0-100): HIGH = distributed (good for entrants)
+        competition_signal = genre_health.competition / 100 if genre_health.competition else 0.5
+        potential_raw = (growth_signal * 0.5 + accessibility_signal * 0.25 + competition_signal * 0.25) * 100
+    else:
+        potential_raw = 50.0
     potential_score = round(max(0.0, min(100.0, potential_raw)), 1)
 
-    # Opportunity score (composite):
-    # Weights: position 0.5 + potential 0.3 + market_growth 0.2.
-    # Growth component ensures top performers in growing markets get > 70.
-    # Calibrated tiers: 90-100 exceptional, 75-89 strong, 60-74 moderate, 40-59 neutral.
-    growth_component = genre_health.growth if genre_health else 50.0
-    opportunity_raw = position_score * 0.5 + potential_score * 0.3 + growth_component * 0.2
+    # Opportunity score: position-dominant composite
+    # Position 0.65 + Potential 0.25 + strength_bonus 0.10
+    # strength_bonus rewards games with many strengths (max 1.0 at 4+ strengths)
+    strength_bonus = min(len(strengths) / 4, 1.0) * 100
+    opportunity_raw = position_score * 0.65 + potential_score * 0.25 + strength_bonus * 0.10
     opportunity_score = round(max(0.0, min(100.0, opportunity_raw)), 1)
 
     return position_score, potential_score, opportunity_score
