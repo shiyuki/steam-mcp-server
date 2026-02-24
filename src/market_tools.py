@@ -557,8 +557,6 @@ def _run_market_analysis(
         "total_games": len(games),
         "games_with_revenue": games_with_revenue,
         "coverage_pct": coverage_pct,
-        "phase": 1,
-        "continuation_token": None,
         # Analytics metrics
         "concentration": metric_results.get("concentration"),
         "temporal_trends": metric_results.get("temporal_trends"),

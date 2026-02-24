@@ -305,6 +305,8 @@ class TestSearchGenreFallback:
             name=engagement.name,
             developer=engagement.developer,
             publisher=engagement.publisher,
+            owners_min=engagement.owners_min,
+            owners_max=engagement.owners_max,
             owners_midpoint=engagement.owners_midpoint,
             ccu=engagement.ccu,
             price=engagement.price,
@@ -320,6 +322,8 @@ class TestSearchGenreFallback:
 
         assert game.appid == 736190
         assert game.name == "Chinese Parents"
+        assert game.owners_min == 1000000
+        assert game.owners_max == 2000000
         assert game.owners_midpoint == 1500000.0
         assert game.ccu == 287
         assert game.price == 5.49
@@ -413,6 +417,78 @@ class TestDataSourceField:
 
 class TestMultiTagSearch:
     """Test comma-separated multi-tag intersection search."""
+
+    @pytest.mark.asyncio
+    async def test_fallback_passes_owners_range(self):
+        """Steam Store fallback should populate owners_min/max from EngagementData."""
+        from src.tools import register_tools
+        from mcp.server.fastmcp import FastMCP
+        import src.tools as tools_module
+
+        mcp = FastMCP("test")
+        register_tools(mcp)
+
+        spy_error = APIError(error_code=502, error_type="api_error", message="SteamSpy down")
+        tag_map = {"rpg": 29}
+        search_result = (1, [111])
+
+        engagement = EngagementData(
+            fetched_at=datetime.now(timezone.utc), cache_age_seconds=0,
+            appid=111, name="Game A", ccu=50,
+            owners_min=0, owners_max=20000, owners_midpoint=10000.0,
+            average_forever=10.0, average_2weeks=2.0,
+            median_forever=8.0, median_2weeks=1.5,
+            positive=100, negative=10, total_reviews=110, price=9.99,
+        )
+
+        with patch.object(tools_module._steamspy, "search_by_tag", return_value=spy_error), \
+             patch.object(tools_module._steam_store, "get_tag_map", return_value=tag_map), \
+             patch.object(tools_module._steam_store, "search_by_tag_ids", return_value=search_result), \
+             patch.object(tools_module._steamspy, "get_engagement_data", return_value=engagement):
+            tools = {t.name: t for t in mcp._tool_manager.list_tools()}
+            result_json = await tools["search_genre"].fn(genre="RPG", limit=10, sort_by="owners")
+            result = json.loads(result_json)
+
+            assert len(result["games"]) == 1
+            game = result["games"][0]
+            assert game["owners_min"] == 0
+            assert game["owners_max"] == 20000
+            assert game["owners_midpoint"] == 10000.0
+
+    @pytest.mark.asyncio
+    async def test_multi_tag_passes_owners_range(self):
+        """Multi-tag search should populate owners_min/max from EngagementData."""
+        from src.tools import register_tools
+        from mcp.server.fastmcp import FastMCP
+        import src.tools as tools_module
+
+        mcp = FastMCP("test")
+        register_tools(mcp)
+
+        tag_map = {"cute": 4726, "horror": 1667}
+        search_result = (1, [222])
+
+        engagement = EngagementData(
+            fetched_at=datetime.now(timezone.utc), cache_age_seconds=0,
+            appid=222, name="Cute Horror Game", ccu=100,
+            owners_min=200000, owners_max=500000, owners_midpoint=350000.0,
+            average_forever=5.0, average_2weeks=1.0,
+            median_forever=3.0, median_2weeks=0.5,
+            positive=500, negative=20, total_reviews=520, price=14.99,
+        )
+
+        with patch.object(tools_module._steam_store, "get_tag_map", return_value=tag_map), \
+             patch.object(tools_module._steam_store, "search_by_tag_ids", return_value=search_result), \
+             patch.object(tools_module._steamspy, "get_engagement_data", return_value=engagement):
+            tools = {t.name: t for t in mcp._tool_manager.list_tools()}
+            result_json = await tools["search_genre"].fn(genre="Cute, Horror", limit=10, sort_by="owners")
+            result = json.loads(result_json)
+
+            assert len(result["games"]) == 1
+            game = result["games"][0]
+            assert game["owners_min"] == 200000
+            assert game["owners_max"] == 500000
+            assert game["owners_midpoint"] == 350000.0
 
     @pytest.mark.asyncio
     async def test_multi_tag_resolves_all_tags(self):

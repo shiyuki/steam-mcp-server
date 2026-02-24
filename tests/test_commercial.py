@@ -1561,3 +1561,136 @@ class TestMalformedGamalyticFields:
 
         assert isinstance(result, CommercialData)
         assert result.accuracy is None
+
+
+class TestListGamesByTag:
+    """Tests for GamalyticClient.list_games_by_tag bulk list endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_single_page_returns_all_games(self):
+        """Tag with fewer games than limit returns all in one page."""
+        mock_http = AsyncMock()
+        mock_http.get_with_metadata.return_value = (
+            {
+                "pages": 1,
+                "total": 3,
+                "result": [
+                    {"steamId": 588650, "name": "Dead Cells", "revenue": 85945035, "copiesSold": 6894914},
+                    {"steamId": 646570, "name": "Slay the Spire", "revenue": 60000000, "copiesSold": 4000000},
+                    {"steamId": 1145360, "name": "Hades", "revenue": 50000000, "copiesSold": 3500000},
+                ],
+                "next": {"limit": 200, "page": 0},
+                "prev": {"limit": 200, "page": 0},
+            },
+            datetime.now(timezone.utc),
+            0,
+        )
+
+        client = GamalyticClient(mock_http)
+        result = await client.list_games_by_tag("Roguelike Deckbuilder")
+
+        assert not isinstance(result, APIError)
+        assert len(result) == 3
+        assert result[0]["steamId"] == 588650
+        assert result[0]["revenue"] == 85945035
+        mock_http.get_with_metadata.assert_called_once()
+        assert "tags" in str(mock_http.get_with_metadata.call_args)
+
+    @pytest.mark.asyncio
+    async def test_multi_page_pagination(self):
+        """Paginated fetch across multiple pages collects all results."""
+        mock_http = AsyncMock()
+        page1_response = {
+            "pages": 2, "total": 3,
+            "result": [
+                {"steamId": 1, "name": "Game1", "revenue": 100},
+                {"steamId": 2, "name": "Game2", "revenue": 90},
+            ],
+            "next": {"limit": 2, "page": 2},
+        }
+        page2_response = {
+            "pages": 2, "total": 3,
+            "result": [
+                {"steamId": 3, "name": "Game3", "revenue": 80},
+            ],
+            "next": {"limit": 2, "page": 0},
+        }
+        mock_http.get_with_metadata.side_effect = [
+            (page1_response, datetime.now(timezone.utc), 0),
+            (page2_response, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.list_games_by_tag("Roguelike", limit_per_page=2)
+
+        assert len(result) == 3
+        assert [g["steamId"] for g in result] == [1, 2, 3]
+        assert mock_http.get_with_metadata.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_zero_results_returns_empty_list(self):
+        """Tag with no matching games returns empty list."""
+        mock_http = AsyncMock()
+        mock_http.get_with_metadata.return_value = (
+            {"pages": 0, "total": 0, "result": []},
+            datetime.now(timezone.utc),
+            0,
+        )
+
+        client = GamalyticClient(mock_http)
+        result = await client.list_games_by_tag("Rogue-like")
+
+        assert not isinstance(result, APIError)
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_max_pages_cap(self):
+        """max_pages parameter stops pagination early."""
+        mock_http = AsyncMock()
+        mock_http.get_with_metadata.return_value = (
+            {
+                "pages": 50, "total": 10000,
+                "result": [{"steamId": i, "name": f"G{i}", "revenue": 100} for i in range(200)],
+                "next": {"limit": 200, "page": 2},
+            },
+            datetime.now(timezone.utc),
+            0,
+        )
+
+        client = GamalyticClient(mock_http)
+        result = await client.list_games_by_tag("Action", max_pages=1)
+
+        assert len(result) == 200
+        assert mock_http.get_with_metadata.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_http_error_returns_api_error(self):
+        """HTTP error with no partial results returns APIError."""
+        mock_http = AsyncMock()
+        mock_http.get_with_metadata.side_effect = httpx.HTTPStatusError(
+            "429", request=httpx.Request("GET", "http://test"), response=httpx.Response(429)
+        )
+
+        client = GamalyticClient(mock_http)
+        result = await client.list_games_by_tag("Roguelike")
+
+        assert isinstance(result, APIError)
+        assert result.error_code == 429
+
+    @pytest.mark.asyncio
+    async def test_steamid_normalized_to_int(self):
+        """steamId values are normalized to int regardless of API response type."""
+        mock_http = AsyncMock()
+        mock_http.get_with_metadata.return_value = (
+            {
+                "pages": 1, "total": 1,
+                "result": [{"steamId": "588650", "name": "Dead Cells", "revenue": 85945035}],
+            },
+            datetime.now(timezone.utc),
+            0,
+        )
+
+        client = GamalyticClient(mock_http)
+        result = await client.list_games_by_tag("Roguelike")
+
+        assert result[0]["steamId"] == 588650  # int, not string

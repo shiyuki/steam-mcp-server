@@ -961,12 +961,8 @@ class TestMCPToolValidation:
     input strings), matching the patterns in tools.py register_tools functions.
     """
 
-    def _parse_analyze_market_inputs(self, genre="", appids="", continuation_token=""):
+    def _parse_analyze_market_inputs(self, genre="", appids=""):
         """Simulate analyze_market tool validation logic from tools.py."""
-        errors = []
-        if continuation_token.strip():
-            return {"phase": 2, "continuation": True}
-
         genre = genre.strip()
         appids_str = appids.strip()
 

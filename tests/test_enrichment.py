@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 from src.schemas import GameMetadata, SearchResult, GameSummary, APIError
 from src.steam_api import strip_html, parse_steam_date, SteamSpyClient, SteamStoreClient
+from src.tools import _validate_game_tags
 
 
 class TestStripHtml:
@@ -130,6 +131,8 @@ class TestSearchGenreEnrichment:
         assert game1.name == "Slay the Spire"
         assert game1.developer == "Mega Crit"
         assert game1.publisher == "Humble Bundle"
+        assert game1.owners_min == 5_000_000
+        assert game1.owners_max == 10_000_000
         assert game1.owners_midpoint == 7_500_000  # midpoint of 5M-10M
         assert game1.ccu == 5000
         assert game1.price == 24.99  # converted from cents
@@ -781,3 +784,190 @@ class TestBackwardCompatibility:
         assert game.review_score is None
         assert game.positive == 0
         assert game.negative == 0
+
+
+class TestValidateGameTags:
+    """Test _validate_game_tags helper for tag cross-validation."""
+
+    def test_all_tags_match(self):
+        """All searched tags found in game's top tags."""
+        game_tags = {"Horror": 500, "Cute": 400, "Dating Sim": 300, "Visual Novel": 200}
+        matches, missing = _validate_game_tags(["Horror", "Cute"], game_tags)
+        assert matches is True
+        assert missing == []
+
+    def test_some_tags_missing(self):
+        """Some searched tags not in game's top tags."""
+        game_tags = {"Cute": 500, "Dating Sim": 400, "Visual Novel": 300}
+        matches, missing = _validate_game_tags(["Cute", "Horror", "Dating Sim"], game_tags)
+        assert matches is False
+        assert missing == ["Horror"]
+
+    def test_empty_tags_returns_none(self):
+        """Empty game tags returns (None, [])."""
+        matches, missing = _validate_game_tags(["Horror"], {})
+        assert matches is None
+        assert missing == []
+
+    def test_case_insensitive(self):
+        """Tag matching is case-insensitive."""
+        game_tags = {"horror": 500, "CUTE": 400}
+        matches, missing = _validate_game_tags(["Horror", "Cute"], game_tags)
+        assert matches is True
+        assert missing == []
+
+    def test_top_n_limit(self):
+        """Tags beyond top_n are not considered."""
+        # Create 25 tags; searched tag is at position 21 (outside top 20)
+        game_tags = {f"Tag{i}": 1000 - i for i in range(25)}
+        game_tags["Rare"] = 5  # Very low weight, outside top 20
+        matches, missing = _validate_game_tags(["Rare"], game_tags, top_n=20)
+        assert matches is False
+        assert missing == ["Rare"]
+
+    def test_top_n_includes_tag(self):
+        """Tags within top_n are found."""
+        game_tags = {"Horror": 999, "Cute": 998}
+        matches, missing = _validate_game_tags(["Horror"], game_tags, top_n=20)
+        assert matches is True
+        assert missing == []
+
+    def test_multiple_missing(self):
+        """Multiple missing tags are all reported."""
+        game_tags = {"Indie": 500}
+        matches, missing = _validate_game_tags(["Horror", "Cute", "Dating Sim"], game_tags)
+        assert matches is False
+        assert set(missing) == {"Horror", "Cute", "Dating Sim"}
+
+
+class TestGameSummaryCrossValidationFields:
+    """Test GameSummary serialization with new cross-validation fields."""
+
+    def test_defaults_none_for_steamspy_path(self):
+        """SteamSpy path: tag_matches=None, tags_missing=[] by default."""
+        summary = GameSummary(appid=123)
+        assert summary.tag_matches is None
+        assert summary.tags_missing == []
+
+    def test_validated_game(self):
+        """Game with all tags validated."""
+        summary = GameSummary(appid=123, tag_matches=True, tags_missing=[])
+        assert summary.tag_matches is True
+        assert summary.tags_missing == []
+
+    def test_flagged_game(self):
+        """Game with missing tags."""
+        summary = GameSummary(appid=123, tag_matches=False, tags_missing=["Horror"])
+        assert summary.tag_matches is False
+        assert summary.tags_missing == ["Horror"]
+
+    def test_model_dump_includes_fields(self):
+        """New fields appear in model_dump output."""
+        summary = GameSummary(appid=123, tag_matches=False, tags_missing=["Horror", "Cute"])
+        d = summary.model_dump()
+        assert d["tag_matches"] is False
+        assert d["tags_missing"] == ["Horror", "Cute"]
+
+    def test_model_dump_defaults(self):
+        """Default values appear in model_dump output."""
+        summary = GameSummary(appid=123)
+        d = summary.model_dump()
+        assert d["tag_matches"] is None
+        assert d["tags_missing"] == []
+
+
+class TestSearchResultCrossValidation:
+    """Test SearchResult cross_validation field."""
+
+    def test_cross_validation_default_none(self):
+        """SteamSpy path: cross_validation is None by default."""
+        result = SearchResult(
+            appids=[1], tag="RPG", total_found=1,
+            fetched_at=datetime.now(timezone.utc),
+        )
+        assert result.cross_validation is None
+
+    def test_cross_validation_populated(self):
+        """Steam Store path: cross_validation dict is populated."""
+        cv = {"validated": 10, "matched": 9, "flagged": 1, "no_data": 0, "searched_tags": ["Horror", "Cute"]}
+        result = SearchResult(
+            appids=[1], tag="Horror, Cute", total_found=1,
+            fetched_at=datetime.now(timezone.utc),
+            cross_validation=cv,
+        )
+        assert result.cross_validation == cv
+        assert result.cross_validation["flagged"] == 1
+
+    def test_model_dump_includes_cross_validation(self):
+        """cross_validation appears in model_dump output."""
+        cv = {"validated": 5, "matched": 5, "flagged": 0, "no_data": 2, "searched_tags": ["Indie"]}
+        result = SearchResult(
+            appids=[], tag="Indie", total_found=0,
+            fetched_at=datetime.now(timezone.utc),
+            cross_validation=cv,
+        )
+        d = result.model_dump()
+        assert d["cross_validation"] == cv
+
+
+class TestGameSummaryOwnersRange:
+    """Test owners_min/owners_max fields expose SteamSpy bucket range."""
+
+    def test_floor_bucket_range(self):
+        """Floor bucket (0..20K) exposes min=0, max=20000."""
+        summary = GameSummary(appid=1, owners_min=0, owners_max=20000, owners_midpoint=10000)
+        assert summary.owners_min == 0
+        assert summary.owners_max == 20000
+        assert summary.owners_midpoint == 10000
+
+    def test_mid_bucket_range(self):
+        """Mid bucket exposes actual range."""
+        summary = GameSummary(appid=1, owners_min=200000, owners_max=500000, owners_midpoint=350000)
+        assert summary.owners_min == 200000
+        assert summary.owners_max == 500000
+
+    def test_defaults_zero(self):
+        """Defaults to 0 when not provided."""
+        summary = GameSummary(appid=1)
+        assert summary.owners_min == 0
+        assert summary.owners_max == 0
+        assert summary.owners_midpoint == 0
+
+    def test_model_dump_includes_range(self):
+        """owners_min/max appear in model_dump output."""
+        summary = GameSummary(appid=1, owners_min=50000, owners_max=100000, owners_midpoint=75000)
+        d = summary.model_dump()
+        assert d["owners_min"] == 50000
+        assert d["owners_max"] == 100000
+        assert d["owners_midpoint"] == 75000
+
+    @pytest.mark.asyncio
+    async def test_parse_game_data_returns_range(self):
+        """_parse_game_data includes owners_min/max in returned dict."""
+        mock_http = AsyncMock()
+        client = SteamSpyClient(mock_http)
+
+        parsed = client._parse_game_data({
+            "appid": 123,
+            "owners": "200,000 .. 500,000",
+        })
+        assert parsed["owners_min"] == 200000
+        assert parsed["owners_max"] == 500000
+        assert parsed["owners_midpoint"] == 350000
+
+    @pytest.mark.asyncio
+    async def test_floor_bucket_through_search(self):
+        """Floor bucket games in search results expose the actual range."""
+        mock_http = AsyncMock()
+        bulk_data = {
+            "1": {"appid": 1, "owners": "0 .. 20,000"},
+        }
+        mock_http.get_with_metadata.return_value = (bulk_data, datetime.now(timezone.utc), 0)
+
+        client = SteamSpyClient(mock_http)
+        result = await client.search_by_tag("Test", limit=None)
+
+        game = result.games[0]
+        assert game.owners_min == 0
+        assert game.owners_max == 20000
+        assert game.owners_midpoint == 10000
