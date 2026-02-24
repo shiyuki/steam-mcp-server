@@ -12,8 +12,7 @@ from src.steam_api import SteamSpyClient, SteamStoreClient, GamalyticClient, Ste
 from src.schemas import APIError, SearchResult, GameSummary, EngagementData
 from src.logging_config import get_logger
 from src.market_tools import (
-    analyze_market_phase1,
-    analyze_market_phase2,
+    analyze_market_single,
     evaluate_game_analysis,
     compare_markets_analysis,
     _fetch_game_list_steamspy,
@@ -723,7 +722,6 @@ def register_tools(mcp: FastMCP):
         top_n: int = 10,
         include_raw: bool = False,
         market_label: str = "",
-        continuation_token: str = "",
     ) -> str:
         """Compute full market analytics for a Steam genre or custom game list.
 
@@ -731,10 +729,9 @@ def register_tools(mcp: FastMCP):
         score-revenue correlation, publisher analysis, release timing, sub-genres,
         competitive density, health scores, and top games in a single response.
 
-        Two-phase response pattern:
-        - Phase 1 (default): Returns SteamSpy-based analytics + continuation_token
-        - Phase 2 (with token): Adds Gamalytic cross-validation data
-        Claude should auto-continue Phase 2 after presenting Phase 1 results.
+        Enriches with Gamalytic revenue data automatically via two-tier enrichment
+        (bulk for tag-based, per-game for appid-based). Revenue-significant games get
+        deep enrichment with full commercial data and SteamSpy tag weights.
 
         Args:
             genre: Steam tag (e.g., "Roguelike") or comma-separated tags for intersection
@@ -748,21 +745,12 @@ def register_tools(mcp: FastMCP):
             top_n: Number of top games to include (default 10). Set higher for full leaderboard.
             include_raw: If true, embed full game-level data array in response.
             market_label: Custom label for this market (auto-generated if empty).
-            continuation_token: Pass token from Phase 1 response to get Phase 2 (Gamalytic enrichment).
 
         Returns:
             JSON with flat analytics structure: total_games, coverage, each metric result at
-            top level, health_scores, top_games, skipped_metrics, methodology, compute_time.
+            top level, health_scores, top_games, skipped_metrics, methodology, compute_time,
+            enrichment (Gamalytic enrichment stats).
         """
-        # Phase 2: continuation
-        if continuation_token.strip():
-            try:
-                result = await analyze_market_phase2(_gamalytic, continuation_token.strip())
-                return json.dumps(result, default=str)
-            except Exception as e:
-                logger.error("analyze_market phase 2 failed: %s", e)
-                return json.dumps({"error": str(e), "error_type": "phase2_error"})
-
         # Input validation
         genre = genre.strip()
         appids_str = appids.strip()
@@ -800,7 +788,7 @@ def register_tools(mcp: FastMCP):
         )
 
         try:
-            result = await analyze_market_phase1(
+            result = await analyze_market_single(
                 steamspy=_steamspy,
                 steam_store=_steam_store,
                 gamalytic=_gamalytic,
@@ -883,8 +871,8 @@ def register_tools(mcp: FastMCP):
                     appid, genre or "N/A", len(genre_appid_list or []), price_tier or "all")
 
         try:
-            # Step 1: Get genre baseline via analyze_market_phase1
-            genre_result = await analyze_market_phase1(
+            # Step 1: Get genre baseline via analyze_market_single
+            genre_result = await analyze_market_single(
                 steamspy=_steamspy,
                 steam_store=_steam_store,
                 gamalytic=_gamalytic,
@@ -895,6 +883,7 @@ def register_tools(mcp: FastMCP):
                 top_n=10,
                 include_raw=False,
                 market_label="",
+                skip_min_check=bool(genre_appid_list),
             )
 
             if "error" in genre_result:

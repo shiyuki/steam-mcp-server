@@ -5,7 +5,6 @@ Testable independently without MCP wiring.
 """
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import statistics
@@ -64,6 +63,16 @@ ANALYSIS_CACHE_TTL = 4 * 3600          # 4 hours in seconds
 GAMALYTIC_QUOTA_WARN_THRESHOLD = 500   # soft warning threshold
 GAMALYTIC_QUOTA_HARD_WARN = 800        # hard warning threshold
 MIN_GAMES_THRESHOLD = 20               # minimum games for meaningful analysis
+GAMALYTIC_SAMPLE_SIZE = 200            # max games for per-game fallback enrichment
+BULK_MATCH_THRESHOLD = 0.6             # minimum AppID overlap ratio for bulk enrichment trust
+GAMALYTIC_REVENUE_THRESHOLD_PCT = 0.1  # games with >0.1% of total genre revenue get Tier 2 deep enrichment
+GAMALYTIC_TAG_NORMALIZATIONS = {       # Steam tag -> Gamalytic tag when names diverge
+    "rogue-like": "roguelike",
+    "rogue-lite": "roguelite",
+    "hack-and-slash": "hack and slash",
+    "beat-em-up": "beat em up",
+    "4x": "4X",
+}
 
 # ---------------------------------------------------------------------------
 # Analysis-Level Cache
@@ -419,6 +428,7 @@ def _run_market_analysis(
     include_raw: bool = False,
     market_label: str = "",
     data_source: str = "steamspy",
+    skip_min_check: bool = False,
 ) -> dict:
     """Core pure-function market analysis. No I/O, no async.
 
@@ -426,11 +436,15 @@ def _run_market_analysis(
     analytics metrics, health scores, and top games.
 
     Returns a flat result dict that can be serialized directly to AnalyzeMarketResult.
+
+    Args:
+        skip_min_check: If True, bypass MIN_GAMES_THRESHOLD check.
+            Used by evaluate_game with custom genre_appids baselines.
     """
     total_start = time.monotonic()
 
     # Step 1: Check minimum threshold
-    if len(games) < MIN_GAMES_THRESHOLD:
+    if not skip_min_check and len(games) < MIN_GAMES_THRESHOLD:
         return {
             "error": f"Insufficient data: {len(games)} games found (minimum {MIN_GAMES_THRESHOLD} required for meaningful analysis).",
             "total_games": len(games),
@@ -576,31 +590,6 @@ def _run_market_analysis(
         result["raw_data"] = games
 
     return result
-
-
-# ---------------------------------------------------------------------------
-# Continuation Token Helpers
-# ---------------------------------------------------------------------------
-
-def _make_continuation_token(games: list[dict], tags: list[str], params: dict) -> str:
-    """Encode game appids + tags + params into a compact base64 continuation token."""
-    payload = {
-        "appids": [g.get("appid") for g in games],
-        "tags": tags,
-        "params": params,
-        "v": 1,
-    }
-    raw = json.dumps(payload, separators=(",", ":"))
-    return base64.urlsafe_b64encode(raw.encode()).decode()
-
-
-def _decode_continuation_token(token: str) -> dict | None:
-    """Decode continuation token. Returns None on any parse error."""
-    try:
-        raw = base64.urlsafe_b64decode(token.encode()).decode()
-        return json.loads(raw)
-    except Exception:
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -837,11 +826,319 @@ async def _enrich_with_gamalytic(
     return list(enriched_games), warnings
 
 
+async def _enrich_with_gamalytic_bulk(
+    games: list[dict],
+    gamalytic: "GamalyticClient",
+    steamspy: "SteamSpyClient | None" = None,
+    primary_tag: str | None = None,
+) -> tuple[list[dict], list[str], dict]:
+    """Enrich game dicts with Gamalytic revenue data using two-tier bulk enrichment.
+
+    Strategy:
+    1. If primary_tag is provided, try bulk fetch via gamalytic.list_games_by_tag(tag) [Tier 1]
+    2. Cross-validate: check top-10 SteamSpy games (by owners) against Gamalytic results
+    3. If match_rate >= BULK_MATCH_THRESHOLD (0.6): merge by AppID (bulk path)
+    4. If match_rate < 0.6 OR no tag: fall back to per-game enrichment for top GAMALYTIC_SAMPLE_SIZE
+    5. After Tier 1 merge, identify games with >0.1% of total genre revenue [Tier 2]
+    6. For Tier 2 games: fetch full CommercialData (40+ fields) + SteamSpy tag weights,
+       deep-merge over Tier 1 data
+
+    The steamspy parameter is needed for Tier 2 SteamSpy tag weight fetches. If None,
+    Tier 2 skips tag weight enrichment (but still does Gamalytic deep enrichment).
+
+    Returns:
+        (enriched_games, warnings, enrichment_meta) where enrichment_meta is a dict with:
+        - method: "bulk" | "per_game_fallback" | "per_game" (no tag)
+        - matched: int (games with Gamalytic revenue merged in Tier 1)
+        - tier2_count: int (games that got deep Tier 2 enrichment)
+        - tier2_threshold: float (revenue threshold used, e.g., 0.1)
+        - total_revenue: float (sum of all Tier 1 revenue for threshold calculation)
+        - total_gamalytic: int (games in Gamalytic response)
+        - match_rate: float (AppID overlap ratio for top-10 check)
+        - tag_used: str | None (Gamalytic tag that worked, may differ from input)
+    """
+    import asyncio
+    from src.schemas import APIError as APIErrorSchema
+
+    warnings: list[str] = []
+    enrichment_meta = {
+        "method": "per_game",
+        "matched": 0,
+        "tier2_count": 0,
+        "tier2_threshold": GAMALYTIC_REVENUE_THRESHOLD_PCT,
+        "total_revenue": 0.0,
+        "total_gamalytic": 0,
+        "match_rate": 0.0,
+        "tag_used": None,
+    }
+
+    # --- Path 1: No tag provided (custom AppID list) -> per-game fallback ---
+    if not primary_tag:
+        sorted_by_owners = sorted(games, key=lambda g: g.get("owners") or 0, reverse=True)
+        top_games = sorted_by_owners[:GAMALYTIC_SAMPLE_SIZE]
+        remaining = sorted_by_owners[GAMALYTIC_SAMPLE_SIZE:]
+        enriched, enrich_warnings = await _enrich_with_gamalytic(top_games, gamalytic)
+        matched = sum(1 for g in enriched if g.get("revenue") is not None)
+        enrichment_meta.update({
+            "method": "per_game",
+            "matched": matched,
+            "total_gamalytic": len(top_games),
+        })
+        return enriched + remaining, enrich_warnings, enrichment_meta
+
+    # --- Path 2: Tag provided -> try bulk endpoint ---
+    tag_to_try = primary_tag
+    gamalytic_games = None
+
+    # Try exact tag name first
+    result = await gamalytic.list_games_by_tag(tag_to_try)
+    if isinstance(result, APIErrorSchema):
+        logger.warning(f"Gamalytic bulk list failed for tag '{tag_to_try}': {result.message}")
+    elif len(result) == 0:
+        # Tag returned 0 games — try normalized form
+        normalized = GAMALYTIC_TAG_NORMALIZATIONS.get(tag_to_try.lower())
+        if normalized and normalized.lower() != tag_to_try.lower():
+            logger.info(f"Gamalytic 0 results for '{tag_to_try}', trying normalized '{normalized}'")
+            result2 = await gamalytic.list_games_by_tag(normalized)
+            if not isinstance(result2, APIErrorSchema) and len(result2) > 0:
+                gamalytic_games = result2
+                tag_to_try = normalized
+                logger.info(f"Normalized tag '{normalized}' returned {len(gamalytic_games)} games")
+        if gamalytic_games is None:
+            # Also try stripping hyphens as a generic fallback
+            stripped = tag_to_try.replace("-", "").replace("_", " ")
+            if stripped.lower() != tag_to_try.lower():
+                logger.info(f"Gamalytic 0 results, trying stripped '{stripped}'")
+                result3 = await gamalytic.list_games_by_tag(stripped)
+                if not isinstance(result3, APIErrorSchema) and len(result3) > 0:
+                    gamalytic_games = result3
+                    tag_to_try = stripped
+    else:
+        gamalytic_games = result
+
+    # If bulk fetch failed entirely, fall back to per-game
+    if gamalytic_games is None or len(gamalytic_games) == 0:
+        logger.info(f"Gamalytic bulk unavailable for tag '{primary_tag}', falling back to per-game enrichment")
+        warnings.append(f"Gamalytic bulk list returned no results for tag '{primary_tag}'. Used per-game fallback.")
+        sorted_by_owners = sorted(games, key=lambda g: g.get("owners") or 0, reverse=True)
+        top_games = sorted_by_owners[:GAMALYTIC_SAMPLE_SIZE]
+        remaining = sorted_by_owners[GAMALYTIC_SAMPLE_SIZE:]
+        enriched, enrich_warnings = await _enrich_with_gamalytic(top_games, gamalytic)
+        matched = sum(1 for g in enriched if g.get("revenue") is not None)
+        enrichment_meta.update({
+            "method": "per_game_fallback",
+            "matched": matched,
+            "total_gamalytic": len(top_games),
+            "tag_used": None,
+        })
+        return enriched + remaining, warnings + enrich_warnings, enrichment_meta
+
+    # --- Cross-validation: check AppID overlap ---
+    gamalytic_lookup = {g.get("steamId"): g for g in gamalytic_games if g.get("steamId")}
+    enrichment_meta["total_gamalytic"] = len(gamalytic_lookup)
+    enrichment_meta["tag_used"] = tag_to_try
+
+    # Take top 10 SteamSpy games by owners and check how many appear in Gamalytic
+    sorted_by_owners = sorted(games, key=lambda g: g.get("owners") or 0, reverse=True)
+    top_10_appids = [g.get("appid") for g in sorted_by_owners[:10] if g.get("appid")]
+    if top_10_appids:
+        matches = sum(1 for appid in top_10_appids if appid in gamalytic_lookup)
+        match_rate = matches / len(top_10_appids)
+    else:
+        match_rate = 0.0
+    enrichment_meta["match_rate"] = round(match_rate, 2)
+
+    if match_rate < BULK_MATCH_THRESHOLD:
+        logger.warning(
+            f"Gamalytic bulk cross-validation failed: {match_rate:.0%} AppID overlap "
+            f"(threshold: {BULK_MATCH_THRESHOLD:.0%}). Tag naming may differ between "
+            f"SteamSpy '{primary_tag}' and Gamalytic '{tag_to_try}'. Falling back to per-game."
+        )
+        warnings.append(
+            f"Gamalytic tag mismatch: only {match_rate:.0%} of top SteamSpy games found in "
+            f"Gamalytic '{tag_to_try}' results. Used per-game fallback for top {GAMALYTIC_SAMPLE_SIZE}."
+        )
+        top_games = sorted_by_owners[:GAMALYTIC_SAMPLE_SIZE]
+        remaining = sorted_by_owners[GAMALYTIC_SAMPLE_SIZE:]
+        enriched, enrich_warnings = await _enrich_with_gamalytic(top_games, gamalytic)
+        matched = sum(1 for g in enriched if g.get("revenue") is not None)
+        enrichment_meta.update({
+            "method": "per_game_fallback",
+            "matched": matched,
+        })
+        return enriched + remaining, warnings + enrich_warnings, enrichment_meta
+
+    # --- TIER 1: Bulk merge (cross-validation passed) ---
+    logger.info(
+        f"Gamalytic bulk cross-validation passed: {match_rate:.0%} overlap. "
+        f"Merging {len(gamalytic_lookup)} Gamalytic records into {len(games)} SteamSpy games."
+    )
+
+    enriched_games = []
+    matched_count = 0
+    for game in games:
+        appid = game.get("appid")
+        gam_data = gamalytic_lookup.get(appid) if appid else None
+        if gam_data:
+            enriched = dict(game)
+            # Merge revenue (Gamalytic has single revenue int from bulk endpoint)
+            raw_revenue = gam_data.get("revenue")
+            if raw_revenue is not None and raw_revenue > 0:
+                enriched["revenue"] = raw_revenue  # Direct revenue value from bulk endpoint
+                matched_count += 1
+            # Merge copiesSold
+            copies = gam_data.get("copiesSold")
+            if copies is not None:
+                enriched["copies_sold"] = int(copies)
+            # Merge reviewScore (only if SteamSpy doesn't have it)
+            gam_score = gam_data.get("reviewScore")
+            if gam_score is not None and not enriched.get("review_score"):
+                enriched["review_score"] = float(gam_score)
+            # Merge price from Gamalytic if missing
+            gam_price = gam_data.get("price")
+            if gam_price is not None and not enriched.get("price"):
+                enriched["price"] = float(gam_price)
+            # Merge releaseDate if missing
+            gam_release = gam_data.get("releaseDate")
+            if gam_release is not None and not enriched.get("release_date"):
+                enriched["release_date"] = gam_release
+            enriched_games.append(enriched)
+        else:
+            enriched_games.append(game)
+
+    enrichment_meta["matched"] = matched_count
+
+    # Quota tracking (bulk uses 1 quota unit per page, not per game)
+    pages_used = (len(gamalytic_games) + 199) // 200
+    quota_warning = increment_gamalytic_counter(pages_used)
+    if quota_warning:
+        warnings.append(quota_warning)
+
+    # --- TIER 2: Deep per-game enrichment for revenue-significant games ---
+    # Calculate total revenue from Tier 1 merged data
+    total_revenue = sum(g.get("revenue") or 0 for g in enriched_games)
+    enrichment_meta["total_revenue"] = total_revenue
+
+    if total_revenue > 0:
+        revenue_threshold = total_revenue * (GAMALYTIC_REVENUE_THRESHOLD_PCT / 100.0)
+        tier2_appids = [
+            g["appid"] for g in enriched_games
+            if g.get("appid") and (g.get("revenue") or 0) > revenue_threshold
+        ]
+
+        if tier2_appids:
+            logger.info(
+                f"Tier 2: {len(tier2_appids)} games exceed {GAMALYTIC_REVENUE_THRESHOLD_PCT}% "
+                f"of total revenue ({total_revenue:,.0f}). "
+                f"Threshold: {revenue_threshold:,.0f}. Fetching full CommercialData + SteamSpy tags."
+            )
+
+            # Fetch full Gamalytic CommercialData for Tier 2 games
+            commercial_results = await gamalytic.get_commercial_batch(tier2_appids, detail_level="full")
+
+            # Fetch SteamSpy tag weights for Tier 2 games (provides tags dict for genre validation)
+            tag_results = []
+            if steamspy is not None:
+                tag_tasks = [steamspy.get_engagement_data(appid) for appid in tier2_appids]
+                tag_results = await asyncio.gather(*tag_tasks, return_exceptions=True)
+            else:
+                tag_results = [None] * len(tier2_appids)
+
+            # Build lookup: appid -> (CommercialData, EngagementData)
+            tier2_commercial = {}
+            tier2_tags = {}
+            for appid, comm_result in zip(tier2_appids, commercial_results):
+                if not isinstance(comm_result, APIErrorSchema) and not isinstance(comm_result, Exception):
+                    tier2_commercial[appid] = comm_result
+            for appid, tag_result in zip(tier2_appids, tag_results):
+                if tag_result is not None and not isinstance(tag_result, Exception) and not isinstance(tag_result, APIErrorSchema):
+                    tier2_tags[appid] = tag_result
+
+            # Deep-merge Tier 2 data over Tier 1 for each qualifying game
+            tier2_count = 0
+            for i, game in enumerate(enriched_games):
+                appid = game.get("appid")
+                if appid not in tier2_commercial and appid not in tier2_tags:
+                    continue
+
+                enriched = dict(game)
+                tier2_count += 1
+
+                # Deep-merge CommercialData fields (overwrites Tier 1 bulk fields with richer per-game data)
+                comm = tier2_commercial.get(appid)
+                if comm:
+                    # Revenue: use per-game midpoint (more precise than bulk single int)
+                    rev = _commercial_data_to_revenue(comm)
+                    if rev is not None:
+                        enriched["revenue"] = rev
+                    # Extended fields only available from per-game endpoint
+                    if getattr(comm, "copies_sold", None) is not None:
+                        enriched["copies_sold"] = comm.copies_sold
+                    if getattr(comm, "followers", None) is not None:
+                        enriched["followers"] = comm.followers
+                    if getattr(comm, "review_score", None) is not None:
+                        enriched["review_score"] = comm.review_score
+                    if getattr(comm, "gamalytic_owners", None) is not None:
+                        enriched["gamalytic_owners"] = comm.gamalytic_owners
+                    if getattr(comm, "gamalytic_players", None) is not None:
+                        enriched["gamalytic_players"] = comm.gamalytic_players
+                    if getattr(comm, "gamalytic_reviews", None) is not None:
+                        enriched["gamalytic_reviews"] = comm.gamalytic_reviews
+                    if getattr(comm, "accuracy", None) is not None:
+                        enriched["gamalytic_accuracy"] = comm.accuracy
+                    if getattr(comm, "gamalytic_is_early_access", None) is not None:
+                        enriched["is_early_access"] = comm.gamalytic_is_early_access
+                    # Heavy arrays: history, country_data, audience_overlap, also_played, estimate_details, dlc
+                    if getattr(comm, "history", None):
+                        enriched["gamalytic_history"] = [
+                            {"timestamp": e.timestamp, "revenue": e.revenue, "reviews": e.reviews,
+                             "price": e.price, "score": e.score, "followers": e.followers}
+                            for e in comm.history if e.timestamp
+                        ]
+                    if getattr(comm, "audience_overlap", None):
+                        enriched["audience_overlap"] = [
+                            {"appid": e.appid, "name": e.name, "overlap_pct": e.overlap_pct}
+                            for e in comm.audience_overlap
+                        ]
+                    if getattr(comm, "also_played", None):
+                        enriched["also_played"] = [
+                            {"appid": e.appid, "name": e.name, "overlap_pct": e.overlap_pct}
+                            for e in comm.also_played
+                        ]
+                    if getattr(comm, "country_data", None):
+                        enriched["country_data"] = [
+                            {"country": e.country_code, "share_pct": e.share_pct}
+                            for e in comm.country_data
+                        ]
+
+                # Deep-merge SteamSpy tag weights (critical for genre membership validation in plan 09-11)
+                engagement = tier2_tags.get(appid)
+                if engagement and hasattr(engagement, "tags") and engagement.tags:
+                    enriched["tags"] = dict(engagement.tags)  # {"TagName": weight_int, ...}
+
+                enriched_games[i] = enriched
+
+            enrichment_meta["tier2_count"] = tier2_count
+
+            # Tier 2 quota tracking
+            tier2_quota = increment_gamalytic_counter(len(tier2_appids))
+            if tier2_quota:
+                warnings.append(tier2_quota)
+
+            logger.info(
+                f"Tier 2 complete: {tier2_count} games deep-enriched "
+                f"({len(tier2_commercial)} Gamalytic, {len(tier2_tags)} SteamSpy tags)"
+            )
+
+    enrichment_meta["method"] = "bulk"
+    return enriched_games, warnings, enrichment_meta
+
+
 # ---------------------------------------------------------------------------
-# Two-Phase Orchestration
+# Single-Phase Orchestration
 # ---------------------------------------------------------------------------
 
-async def analyze_market_phase1(
+async def analyze_market_single(
     steamspy: "SteamSpyClient",
     steam_store: "SteamStoreClient",
     gamalytic: "GamalyticClient",
@@ -852,11 +1149,22 @@ async def analyze_market_phase1(
     top_n: int = 10,
     include_raw: bool = False,
     market_label: str = "",
+    skip_min_check: bool = False,
 ) -> dict:
-    """Phase 1: Fetch SteamSpy data, run analysis, return result + continuation_token.
+    """Single-phase market analysis: fetch games, enrich with two-tier Gamalytic, compute analytics.
 
-    Phase 1 result has phase=1 with continuation_token for Phase 2 (Gamalytic enrichment).
-    Games list is returned without revenue data (SteamSpy doesn't have it).
+    Enrichment strategy (two-tier):
+    - Tier 1: Bulk fetch via Gamalytic /steam-games/list?tags=X for ALL games.
+      Provides: revenue, copiesSold, reviewScore, price, releaseDate.
+      Cross-validated by AppID overlap (>=60% match required).
+    - Tier 2: For games with >0.1% of total genre revenue, fetch full CommercialData
+      from /game/{appid} (40+ fields including followers, history, audience_overlap)
+      AND SteamSpy tag weights from get_engagement_data (for genre membership validation).
+    - Fallback: Per-game enrichment for top 200 when tag names don't align or no tag provided.
+
+    Args:
+        skip_min_check: If True, bypass MIN_GAMES_THRESHOLD in _run_market_analysis.
+            Used by evaluate_game with custom genre_appids baselines.
     """
     fetch_start = time.monotonic()
     games, data_source = await _fetch_game_list_steamspy(steamspy, steam_store, tags, appids=appids)
@@ -867,12 +1175,29 @@ async def analyze_market_phase1(
             "error": "No games found for specified tags.",
             "total_games": 0,
             "market_label": market_label or ", ".join(tags) or f"Custom ({len(appids or [])} games)",
-            "phase": 1,
         }
 
-    # Build result dict
+    # Two-tier Gamalytic enrichment: bulk for tag-based, per-game for appid-based
+    enrich_start = time.monotonic()
+    # Use first tag as primary for bulk lookup (multi-tag uses Steam Store path, not SteamSpy tag)
+    primary_tag = tags[0] if tags and len(tags) == 1 else None
+    enriched_games, enrich_warnings, enrichment_meta = await _enrich_with_gamalytic_bulk(
+        games, gamalytic, steamspy=steamspy, primary_tag=primary_tag
+    )
+    enrich_ms = round((time.monotonic() - enrich_start) * 1000)
+
+    # Update data_source to reflect enrichment
+    matched = enrichment_meta.get("matched", 0)
+    method = enrichment_meta.get("method", "none")
+    tier2 = enrichment_meta.get("tier2_count", 0)
+    if matched > 0:
+        data_source = f"{data_source}+gamalytic_{method}({matched}/{len(enriched_games)})"
+        if tier2 > 0:
+            data_source += f"+tier2({tier2})"
+
+    # Run analysis on all games
     result = _run_market_analysis(
-        games=games,
+        games=enriched_games,
         tags=tags,
         metrics=metrics,
         exclude=exclude,
@@ -880,96 +1205,34 @@ async def analyze_market_phase1(
         include_raw=include_raw,
         market_label=market_label,
         data_source=data_source,
+        skip_min_check=skip_min_check,
     )
 
     if "error" in result:
-        result["phase"] = 1
         return result
 
-    # Add fetch timing
+    # Add timing info
     if result.get("compute_time"):
         result["compute_time"]["data_fetch_ms"] = fetch_ms
+        result["compute_time"]["gamalytic_enrich_ms"] = enrich_ms
 
-    # Build continuation token (encodes game list + params for Phase 2)
-    params = {
-        "metrics": metrics,
-        "exclude": exclude,
-        "top_n": top_n,
-        "include_raw": include_raw,
-        "market_label": market_label,
-    }
-    token = _make_continuation_token(games, tags, params)
-    result["continuation_token"] = token
-    result["phase"] = 1
-
-    return result
-
-
-async def analyze_market_phase2(
-    gamalytic: "GamalyticClient",
-    continuation_token: str,
-    steamspy: "SteamSpyClient | None" = None,
-    steam_store: "SteamStoreClient | None" = None,
-) -> dict:
-    """Phase 2: Gamalytic enrichment of Phase 1 result.
-
-    Decodes continuation_token to recover game list and params, then enriches
-    with Gamalytic revenue data and re-runs analysis.
-    """
-    payload = _decode_continuation_token(continuation_token)
-    if payload is None:
-        return {
-            "error": "Invalid or expired continuation_token.",
-            "phase": 2,
-        }
-
-    appids = payload.get("appids", [])
-    tags = payload.get("tags", [])
-    params = payload.get("params", {})
-
-    if not appids:
-        return {
-            "error": "continuation_token contains no game data.",
-            "phase": 2,
-        }
-
-    # Re-construct game dicts from appids (minimal structure for enrichment)
-    games = [{"appid": appid, "revenue": None} for appid in appids]
-
-    # Enrich with Gamalytic
-    fetch_start = time.monotonic()
-    enriched_games, warnings = await _enrich_with_gamalytic(games, gamalytic)
-    fetch_ms = round((time.monotonic() - fetch_start) * 1000)
-
-    # Re-run analysis with enriched data
-    result = _run_market_analysis(
-        games=enriched_games,
-        tags=tags,
-        metrics=params.get("metrics"),
-        exclude=params.get("exclude"),
-        top_n=params.get("top_n", 10),
-        include_raw=params.get("include_raw", False),
-        market_label=params.get("market_label", ""),
-        data_source="steamspy+gamalytic",
-    )
-
-    if "error" in result:
-        result["phase"] = 2
-        return result
-
-    result["phase"] = 2
-    result["continuation_token"] = None  # Phase 2 is terminal
-    result["gamalytic_enrichment"] = {
-        "games_enriched": len(enriched_games),
-        "fetch_ms": fetch_ms,
+    # Add enrichment metadata
+    result["enrichment"] = {
+        "method": method,
+        "gamalytic_matched": matched,
+        "gamalytic_total": enrichment_meta.get("total_gamalytic", 0),
+        "match_rate": enrichment_meta.get("match_rate", 0.0),
+        "tag_used": enrichment_meta.get("tag_used"),
+        "total_games": len(enriched_games),
+        "tier2_count": tier2,
+        "tier2_threshold": enrichment_meta.get("tier2_threshold", GAMALYTIC_REVENUE_THRESHOLD_PCT),
+        "total_revenue": enrichment_meta.get("total_revenue", 0.0),
     }
 
-    if warnings:
+    # Surface enrichment warnings
+    if enrich_warnings:
         existing_warnings = result.get("warnings", [])
-        result["warnings"] = existing_warnings + warnings
-
-    if result.get("compute_time"):
-        result["compute_time"]["data_fetch_ms"] = fetch_ms
+        result["warnings"] = existing_warnings + enrich_warnings
 
     return result
 

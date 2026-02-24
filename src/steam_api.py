@@ -1754,6 +1754,102 @@ class GamalyticClient:
             for r in results
         ]
 
+    async def list_games_by_tag(
+        self,
+        tag: str,
+        fields: str = "steamId,name,revenue,copiesSold,reviewScore,price,releaseDate,genres",
+        limit_per_page: int = 200,
+        max_pages: int | None = None,
+    ) -> list[dict] | APIError:
+        """Fetch games by tag from Gamalytic bulk list endpoint with pagination.
+
+        Uses GET /steam-games/list?tags={tag}&limit={limit}&page={N}&fields={fields}&sort=revenue&sort_mode=desc
+        Paginates through ALL pages (or up to max_pages) at the HostRateLimiter rate (5 req/s).
+
+        Args:
+            tag: Steam tag name (e.g., "Roguelike", "Roguelike Deckbuilder"). Multi-word OK.
+                Hyphenated forms (e.g., "Rogue-like") are NOT recognized by Gamalytic.
+            fields: Comma-separated field names for response. Default includes all useful fields.
+            limit_per_page: Games per page (max 200). Default 200 for efficiency.
+            max_pages: Optional cap on pages fetched. None = fetch all pages.
+
+        Returns:
+            List of game dicts with requested fields (steamId as int), or APIError on failure.
+            Each dict has keys matching the fields parameter (steamId, name, revenue, etc.)
+        """
+        all_games: list[dict] = []
+        page = 1
+
+        try:
+            while True:
+                data, _, _ = await self.http.get_with_metadata(
+                    f"{self.BASE_URL}/steam-games/list",
+                    params={
+                        "tags": tag,
+                        "limit": str(limit_per_page),
+                        "page": str(page),
+                        "fields": fields,
+                        "sort": "revenue",
+                        "sort_mode": "desc",
+                    },
+                    cache_ttl=3600,  # 1 hour cache — bulk data is stable
+                )
+
+                # Parse response: {"pages": N, "total": M, "result": [...], "next": {...}}
+                results = data.get("result", [])
+                total_pages = data.get("pages", 0)
+                total_games = data.get("total", 0)
+
+                if page == 1:
+                    logger.info(
+                        f"Gamalytic list_games_by_tag '{tag}': {total_games} total games, "
+                        f"{total_pages} pages at {limit_per_page}/page"
+                    )
+
+                if not results:
+                    break
+
+                for game in results:
+                    # Normalize steamId to int (API returns it as int already, but be safe)
+                    steam_id = game.get("steamId")
+                    if steam_id is not None:
+                        game["steamId"] = int(steam_id)
+                    all_games.append(game)
+
+                # Check pagination bounds
+                if page >= total_pages:
+                    break
+                if max_pages is not None and page >= max_pages:
+                    logger.info(f"Gamalytic list: reached max_pages={max_pages}, stopping at {len(all_games)} games")
+                    break
+
+                page += 1
+
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            logger.warning(f"Gamalytic list API error {status} for tag '{tag}'")
+            if all_games:
+                # Partial results: return what we have with a warning logged
+                logger.warning(f"Returning {len(all_games)} partial results from {page - 1} pages")
+                return all_games
+            return APIError(
+                error_code=status,
+                error_type="rate_limit" if status == 429 else "api_error",
+                message=f"Gamalytic list API error: {status} for tag '{tag}'"
+            )
+        except Exception as e:
+            logger.error(f"Gamalytic list_games_by_tag error for tag '{tag}': {e}")
+            if all_games:
+                return all_games
+            return APIError(
+                error_code=502,
+                error_type="api_error",
+                message=f"Gamalytic list endpoint failed for tag '{tag}': {e}"
+            )
+
+        logger.info(f"Gamalytic list_games_by_tag '{tag}': fetched {len(all_games)} games across {page} pages")
+        return all_games
+
 
 class SteamReviewClient:
     """Client for Steam Review API with cursor pagination and stats computation."""
