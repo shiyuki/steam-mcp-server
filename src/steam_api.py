@@ -2251,10 +2251,6 @@ class SteamReviewClient:
             ("last_90d", now_ts - 90 * DAY, now_ts, 90.0),
         ])
 
-        def _compute_period_metrics(reviews_in_period: list[dict], days: float | None) -> SentimentPeriod:
-            """Compute SentimentPeriod metrics for a slice of reviews."""
-            raise NotImplementedError  # Replaced below
-
         def _build_sentiment_period(period_name: str, reviews_in: list[dict], days: float | None) -> SentimentPeriod:
             pos_count = sum(1 for r in reviews_in if r.get("voted_up", False))
             neg_count = len(reviews_in) - pos_count

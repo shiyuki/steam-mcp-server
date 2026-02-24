@@ -1328,3 +1328,200 @@ class TestAppidsInput:
         result = validate("", "abc, 200")
         assert result["error_type"] == "validation"
         assert "integers" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# TestSupplementAndMultiTag
+# ---------------------------------------------------------------------------
+
+class TestSupplementAndMultiTag:
+    """6 tests for the supplement path (single-tag >= 1900 games) and multi-tag path
+    in _fetch_game_list_steamspy, covering success and error cases."""
+
+    def _make_search_result_with_n_games(self, n: int, tag: str = "Roguelike") -> object:
+        """Return a SearchResult mock with n GameSummary objects."""
+        from src.schemas import GameSummary, SearchResult
+        games = []
+        for i in range(1, n + 1):
+            games.append(GameSummary(
+                appid=i,
+                name=f"Game {i}",
+                developer="Dev",
+                publisher="Pub",
+                ccu=100,
+                owners_min=1000,
+                owners_max=5000,
+                owners_midpoint=3000.0,
+                average_forever=10.0,
+                average_2weeks=1.0,
+                median_forever=8.0,
+                median_2weeks=0.5,
+                positive=200,
+                negative=10,
+                price=9.99,
+            ))
+        return SearchResult(
+            tag=tag,
+            appids=[g.appid for g in games],
+            total_found=n,
+            games=games,
+            data_source="steamspy",
+            fetched_at="2026-01-01T00:00:00Z",
+            cache_age_seconds=0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_supplement_path_resolves_tag_and_enriches(self):
+        """Supplement path: >= STEAMSPY_SUPPLEMENT_THRESHOLD games triggers Steam Store supplement.
+        New appids are enriched via SteamSpy engagement data and merged into games list."""
+        from src.market_tools import STEAMSPY_SUPPLEMENT_THRESHOLD
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+
+        # SteamSpy returns 1950 games (above threshold)
+        n_steamspy = STEAMSPY_SUPPLEMENT_THRESHOLD + 50  # 1950
+        search_result = self._make_search_result_with_n_games(n_steamspy, "Roguelike")
+
+        # appids 1..1950 are from SteamSpy; store returns appids [1, 1951, 1952]
+        # appid 1 is already in SteamSpy results, 1951 and 1952 are new
+        mock_steamspy.search_by_tag = AsyncMock(return_value=search_result)
+        mock_steam_store.get_tag_map = AsyncMock(return_value={"roguelike": 12345})
+        mock_steam_store.search_by_tag_ids = AsyncMock(return_value=(2500, [1, 1951, 1952]))
+        mock_steamspy.get_engagement_data = AsyncMock(side_effect=lambda appid: _make_engagement_data(appid))
+
+        games, data_source = await _fetch_game_list_steamspy(
+            mock_steamspy, mock_steam_store, tags=["Roguelike"], appids=None
+        )
+
+        # 1950 original + 2 new (appid 1 was filtered as duplicate)
+        assert len(games) == n_steamspy + 2
+        assert data_source == "steamspy+steam_store"
+
+        # New appids should be present
+        appids_in_result = {g["appid"] for g in games}
+        assert 1951 in appids_in_result
+        assert 1952 in appids_in_result
+
+        # search_by_tag_ids called with integer tag ID (not string), correct param name
+        mock_steam_store.search_by_tag_ids.assert_called_once_with([12345], count=50)
+
+    @pytest.mark.asyncio
+    async def test_supplement_path_tag_map_failure_graceful(self):
+        """Supplement path: get_tag_map() returning APIError is handled gracefully.
+        Original SteamSpy games returned unchanged with no crash."""
+        from src.market_tools import STEAMSPY_SUPPLEMENT_THRESHOLD
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+
+        n_steamspy = STEAMSPY_SUPPLEMENT_THRESHOLD + 50
+        search_result = self._make_search_result_with_n_games(n_steamspy, "Roguelike")
+
+        mock_steamspy.search_by_tag = AsyncMock(return_value=search_result)
+        mock_steam_store.get_tag_map = AsyncMock(
+            return_value=APIError(error_code=503, error_type="api_error", message="Tag map unavailable")
+        )
+        # search_by_tag_ids should NOT be called
+        mock_steam_store.search_by_tag_ids = AsyncMock()
+
+        games, data_source = await _fetch_game_list_steamspy(
+            mock_steamspy, mock_steam_store, tags=["Roguelike"], appids=None
+        )
+
+        # Original SteamSpy games returned unchanged
+        assert len(games) == n_steamspy
+        # data_source not changed to steamspy+steam_store
+        assert data_source == "steamspy"
+        # search_by_tag_ids never called since tag_map failed
+        mock_steam_store.search_by_tag_ids.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_supplement_path_tag_not_found_graceful(self):
+        """Supplement path: tag name missing from tag_map returns original SteamSpy games."""
+        from src.market_tools import STEAMSPY_SUPPLEMENT_THRESHOLD
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+
+        n_steamspy = STEAMSPY_SUPPLEMENT_THRESHOLD + 50
+        search_result = self._make_search_result_with_n_games(n_steamspy, "Roguelike")
+
+        mock_steamspy.search_by_tag = AsyncMock(return_value=search_result)
+        # Tag map does NOT contain "roguelike"
+        mock_steam_store.get_tag_map = AsyncMock(return_value={"action": 1, "indie": 2})
+        mock_steam_store.search_by_tag_ids = AsyncMock()
+
+        games, data_source = await _fetch_game_list_steamspy(
+            mock_steamspy, mock_steam_store, tags=["Roguelike"], appids=None
+        )
+
+        assert len(games) == n_steamspy
+        assert data_source == "steamspy"
+        mock_steam_store.search_by_tag_ids.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_multi_tag_resolves_all_tags_to_ids(self):
+        """Multi-tag path: all tag names resolved to IDs, search called with integer IDs,
+        resulting appids enriched via SteamSpy engagement data."""
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+
+        mock_steam_store.get_tag_map = AsyncMock(return_value={
+            "roguelike": 12345,
+            "deckbuilder": 67890,
+        })
+        # Returns tuple[int, list[int]]
+        mock_steam_store.search_by_tag_ids = AsyncMock(return_value=(150, [1001, 1002, 1003]))
+        mock_steamspy.get_engagement_data = AsyncMock(side_effect=lambda appid: _make_engagement_data(appid))
+
+        games, data_source = await _fetch_game_list_steamspy(
+            mock_steamspy, mock_steam_store, tags=["Roguelike", "Deckbuilder"], appids=None
+        )
+
+        assert len(games) == 3
+        assert data_source == "steam_store"
+        appids_in_result = {g["appid"] for g in games}
+        assert appids_in_result == {1001, 1002, 1003}
+
+        # search_by_tag_ids called with both integer IDs, correct param name
+        mock_steam_store.search_by_tag_ids.assert_called_once_with([12345, 67890], count=50)
+
+    @pytest.mark.asyncio
+    async def test_multi_tag_missing_tag_returns_empty(self):
+        """Multi-tag path: any tag missing from tag_map returns empty list gracefully."""
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+
+        # "deckbuilder" is not in tag map
+        mock_steam_store.get_tag_map = AsyncMock(return_value={"roguelike": 12345})
+        mock_steam_store.search_by_tag_ids = AsyncMock()
+
+        games, data_source = await _fetch_game_list_steamspy(
+            mock_steamspy, mock_steam_store, tags=["Roguelike", "Deckbuilder"], appids=None
+        )
+
+        assert games == []
+        assert data_source == "steam_store"
+        mock_steam_store.search_by_tag_ids.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_multi_tag_search_failure_returns_empty(self):
+        """Multi-tag path: search_by_tag_ids returning APIError returns empty list gracefully."""
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+
+        mock_steam_store.get_tag_map = AsyncMock(return_value={
+            "roguelike": 12345,
+            "deckbuilder": 67890,
+        })
+        mock_steam_store.search_by_tag_ids = AsyncMock(
+            return_value=APIError(error_code=503, error_type="api_error", message="Steam Store unavailable")
+        )
+
+        games, data_source = await _fetch_game_list_steamspy(
+            mock_steamspy, mock_steam_store, tags=["Roguelike", "Deckbuilder"], appids=None
+        )
+
+        assert games == []
+        assert data_source == "steam_store"
