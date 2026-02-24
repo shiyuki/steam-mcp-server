@@ -37,6 +37,7 @@ from src.analytics import (
     get_computable_metrics,
 )
 from src.logging_config import get_logger
+from src.steam_api import _ms_to_iso
 from src.schemas import (
     AnalyzeMarketResult,
     CompareMarketsResult,
@@ -808,6 +809,9 @@ async def _enrich_with_gamalytic(
             enriched["followers"] = getattr(commercial, "followers", None)
             if not enriched.get("review_score") and getattr(commercial, "review_score", None):
                 enriched["review_score"] = commercial.review_score
+            # Merge release_date from CommercialData
+            if commercial.release_date and not enriched.get("release_date"):
+                enriched["release_date"] = commercial.release_date
             return enriched
         except Exception as exc:
             logger.debug(f"Gamalytic enrichment failed for appid {appid}: {exc}")
@@ -936,12 +940,11 @@ async def _enrich_with_gamalytic_bulk(
     enrichment_meta["total_gamalytic"] = len(gamalytic_lookup)
     enrichment_meta["tag_used"] = tag_to_try
 
-    # Take top 10 SteamSpy games by owners and check how many appear in Gamalytic
-    sorted_by_owners = sorted(games, key=lambda g: g.get("owners") or 0, reverse=True)
-    top_10_appids = [g.get("appid") for g in sorted_by_owners[:10] if g.get("appid")]
-    if top_10_appids:
-        matches = sum(1 for appid in top_10_appids if appid in gamalytic_lookup)
-        match_rate = matches / len(top_10_appids)
+    # Cross-validation: check AppID overlap across the full dataset (not top-10 sample)
+    all_appids = [g.get("appid") for g in games if g.get("appid")]
+    if all_appids:
+        matches = sum(1 for appid in all_appids if appid in gamalytic_lookup)
+        match_rate = matches / len(all_appids)
     else:
         match_rate = 0.0
     enrichment_meta["match_rate"] = round(match_rate, 2)
@@ -953,9 +956,10 @@ async def _enrich_with_gamalytic_bulk(
             f"SteamSpy '{primary_tag}' and Gamalytic '{tag_to_try}'. Falling back to per-game."
         )
         warnings.append(
-            f"Gamalytic tag mismatch: only {match_rate:.0%} of top SteamSpy games found in "
+            f"Gamalytic tag mismatch: only {match_rate:.0%} of full dataset found in "
             f"Gamalytic '{tag_to_try}' results. Used per-game fallback for top {GAMALYTIC_SAMPLE_SIZE}."
         )
+        sorted_by_owners = sorted(games, key=lambda g: g.get("owners") or 0, reverse=True)
         top_games = sorted_by_owners[:GAMALYTIC_SAMPLE_SIZE]
         remaining = sorted_by_owners[GAMALYTIC_SAMPLE_SIZE:]
         enriched, enrich_warnings = await _enrich_with_gamalytic(top_games, gamalytic)
@@ -996,10 +1000,10 @@ async def _enrich_with_gamalytic_bulk(
             gam_price = gam_data.get("price")
             if gam_price is not None and not enriched.get("price"):
                 enriched["price"] = float(gam_price)
-            # Merge releaseDate if missing
+            # Merge releaseDate if missing (convert ms epoch to ISO YYYY-MM-DD)
             gam_release = gam_data.get("releaseDate")
             if gam_release is not None and not enriched.get("release_date"):
-                enriched["release_date"] = gam_release
+                enriched["release_date"] = _ms_to_iso(gam_release)
             enriched_games.append(enriched)
         else:
             enriched_games.append(game)

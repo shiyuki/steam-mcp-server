@@ -1276,6 +1276,14 @@ class GamalyticClient:
             except Exception:
                 pass
 
+            release_date_iso = None
+            try:
+                raw = data.get("releaseDate")
+                if raw is not None:
+                    release_date_iso = _ms_to_iso(raw)
+            except Exception:
+                pass
+
             # --- History array parsing ---
             history_entries = []
             try:
@@ -1440,6 +1448,7 @@ class GamalyticClient:
                 gamalytic_reviews=gamalytic_reviews,
                 gamalytic_is_early_access=gamalytic_is_early_access,
                 gamalytic_ea_date=gamalytic_ea_date,
+                release_date=release_date_iso,
                 history=history_entries,
                 country_data=country_entries,
                 audience_overlap=overlap_entries,

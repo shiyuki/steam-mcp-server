@@ -159,6 +159,7 @@ class CommercialData(CachedResponse):
     gamalytic_reviews: int | None = None
     gamalytic_is_early_access: bool | None = None
     gamalytic_ea_date: str | None = None  # ISO date
+    release_date: str | None = None  # ISO date from Gamalytic releaseDate field
     history: list["GamalyticHistoryEntry"] = Field(default_factory=list)
     country_data: list["CountryDataEntry"] = Field(default_factory=list)
     audience_overlap: list["CompetitorEntry"] = Field(default_factory=list)
