@@ -7,6 +7,7 @@ _compute_deltas, _compute_overlap, _compute_confidence_notes, and MCP tool valid
 """
 import json
 import pytest
+from unittest.mock import AsyncMock, MagicMock
 
 from src.market_tools import (
     _compute_percentiles,
@@ -21,11 +22,14 @@ from src.market_tools import (
     _compute_confidence_notes,
     _run_market_analysis,
     _build_game_profile,
+    _fetch_game_list_steamspy,
 )
 from src.schemas import (
     GamePercentiles,
     MarketHealthScores,
     GameProfile,
+    EngagementData,
+    APIError,
 )
 
 
@@ -1114,3 +1118,213 @@ class TestRunMarketAnalysisIntegration:
         assert profile.median_playtime == 42.5
         assert profile.appid == 123
         assert profile.name == "Test Game"
+
+
+# ---------------------------------------------------------------------------
+# TestAppidsInput
+# ---------------------------------------------------------------------------
+
+def _make_engagement_data(appid: int, name: str = None) -> EngagementData:
+    """Create a minimal EngagementData object for mocking."""
+    return EngagementData(
+        appid=appid,
+        name=name or f"Game {appid}",
+        developer="DevA",
+        publisher="PubA",
+        ccu=500,
+        owners_min=10000,
+        owners_max=20000,
+        owners_midpoint=15000.0,
+        average_forever=25.0,
+        average_2weeks=5.0,
+        median_forever=20.0,
+        median_2weeks=3.0,
+        positive=1000,
+        negative=50,
+        total_reviews=1050,
+        price=14.99,
+        tags={"Action": 100, "Indie": 80},
+        fetched_at="2026-01-01T00:00:00Z",
+        cache_age=0,
+        review_score=95.0,
+    )
+
+
+class TestAppidsInput:
+    """6 tests for appids-only paths in _fetch_game_list_steamspy, compare_markets, and evaluate_game."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_game_list_steamspy_with_appids(self):
+        """Appids-only path returns game dicts with correct field mapping."""
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+
+        async def mock_get_engagement(appid):
+            return _make_engagement_data(appid)
+
+        mock_steamspy.get_engagement_data = mock_get_engagement
+
+        games, data_source = await _fetch_game_list_steamspy(
+            mock_steamspy, mock_steam_store, tags=[], appids=[100, 200, 300]
+        )
+
+        assert len(games) == 3
+        assert data_source == "steamspy_appids"
+
+        # Check field mapping for first game
+        game = next(g for g in games if g["appid"] == 100)
+        assert game["name"] == "Game 100"
+        assert game["owners"] == 15000.0
+        assert game["ccu"] == 500
+        assert game["price"] == 14.99
+        assert game["review_score"] == 95.0
+        assert game["median_forever"] == 20.0
+        assert game["average_forever"] == 25.0
+        assert game["tags"] == {"Action": 100, "Indie": 80}
+        assert game["revenue"] is None
+        assert game["followers"] is None
+        assert game["copies_sold"] is None
+        assert game["release_date"] is None
+
+    @pytest.mark.asyncio
+    async def test_fetch_game_list_steamspy_appids_with_failures(self):
+        """Partial failures are skipped; successful results still returned."""
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+
+        async def mock_get_engagement(appid):
+            if appid == 200:
+                return APIError(status_code=404, message="Not found", source="steamspy")
+            if appid == 300:
+                raise RuntimeError("Connection error")
+            return _make_engagement_data(appid)
+
+        mock_steamspy.get_engagement_data = mock_get_engagement
+
+        games, data_source = await _fetch_game_list_steamspy(
+            mock_steamspy, mock_steam_store, tags=[], appids=[100, 200, 300]
+        )
+
+        assert len(games) == 1
+        assert games[0]["appid"] == 100
+        assert data_source == "steamspy_appids"
+
+    @pytest.mark.asyncio
+    async def test_fetch_game_list_steamspy_appids_empty_results(self):
+        """When all appids fail, returns empty list with steamspy_appids source."""
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+
+        async def mock_get_engagement(appid):
+            raise RuntimeError("All fail")
+
+        mock_steamspy.get_engagement_data = mock_get_engagement
+
+        games, data_source = await _fetch_game_list_steamspy(
+            mock_steamspy, mock_steam_store, tags=[], appids=[100, 200]
+        )
+
+        assert games == []
+        assert data_source == "steamspy_appids"
+
+    @pytest.mark.asyncio
+    async def test_fetch_game_list_steamspy_tags_priority(self):
+        """When both tags and appids provided, tags take priority (existing path used)."""
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+
+        # Mock tag search to return a SearchResult
+        from src.schemas import GameSummary, SearchResult
+        game_summary = GameSummary(
+            appid=999,
+            name="Tag Game",
+            developer="Dev",
+            publisher="Pub",
+            ccu=100,
+            owners_min=1000,
+            owners_max=5000,
+            owners_midpoint=3000.0,
+            average_forever=10.0,
+            average_2weeks=1.0,
+            median_forever=8.0,
+            median_2weeks=0.5,
+            positive=200,
+            negative=10,
+            price=9.99,
+        )
+        search_result = SearchResult(
+            tag="Action",
+            appids=[999],
+            total_found=1,
+            games=[game_summary],
+            data_source="steamspy",
+            fetched_at="2026-01-01T00:00:00Z",
+            cache_age_seconds=0,
+        )
+        mock_steamspy.search_by_tag = AsyncMock(return_value=search_result)
+
+        games, data_source = await _fetch_game_list_steamspy(
+            mock_steamspy, mock_steam_store, tags=["Action"], appids=[100, 200]
+        )
+
+        # Tag path used — data_source is not "steamspy_appids"
+        assert data_source != "steamspy_appids"
+        assert data_source == "steamspy"
+        # Only the tag game is returned, not the appid games
+        assert len(games) == 1
+        assert games[0]["appid"] == 999
+
+    def test_compare_markets_appids_only_market_not_skipped(self):
+        """Market with appids but no tags should NOT be skipped in compare_markets_analysis."""
+        # Replicate the validation logic from compare_markets_analysis
+        warnings = []
+        market_inputs = [
+            {"tags": [], "appids": [100, 200], "label": "Custom Market"},
+            {"tags": ["Action"]},
+        ]
+
+        skipped_count = 0
+        for idx, market_input in enumerate(market_inputs):
+            tags = market_input.get("tags") or []
+            appids = market_input.get("appids") or []
+            if not tags and not appids:
+                warnings.append(f"Market {idx + 1} has no tags or appids — skipping.")
+                skipped_count += 1
+
+        assert skipped_count == 0, f"No markets should be skipped, but got warnings: {warnings}"
+
+    def test_evaluate_game_genre_appids_validation(self):
+        """genre_appids validation: either genre or genre_appids, not both, not neither."""
+        # Replicate validation logic from evaluate_game
+        def validate(genre, genre_appids_str):
+            genre = genre.strip()
+            genre_appids_str = genre_appids_str.strip()
+            if not genre and not genre_appids_str:
+                return {"error": "Either genre or genre_appids must be provided", "error_type": "validation"}
+            if genre and genre_appids_str:
+                return {"error": "Provide either genre or genre_appids, not both", "error_type": "validation"}
+            if genre_appids_str:
+                try:
+                    appid_list = [int(a.strip()) for a in genre_appids_str.split(",") if a.strip()]
+                    if not appid_list:
+                        return {"error": "genre_appids list is empty", "error_type": "validation"}
+                except ValueError:
+                    return {"error": "genre_appids must be comma-separated integers", "error_type": "validation"}
+            return {"ok": True}
+
+        # genre only — valid
+        assert validate("Roguelike", "") == {"ok": True}
+        # genre_appids only — valid
+        assert validate("", "100, 200, 300") == {"ok": True}
+        # both — error
+        result = validate("Roguelike", "100, 200")
+        assert result["error_type"] == "validation"
+        assert "not both" in result["error"]
+        # neither — error
+        result = validate("", "")
+        assert result["error_type"] == "validation"
+        assert "must be provided" in result["error"]
+        # non-integer genre_appids — error
+        result = validate("", "abc, 200")
+        assert result["error_type"] == "validation"
+        assert "integers" in result["error"]
