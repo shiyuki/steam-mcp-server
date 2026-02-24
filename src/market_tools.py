@@ -5,6 +5,7 @@ Testable independently without MCP wiring.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import statistics
@@ -39,6 +40,7 @@ from src.analytics import (
 from src.logging_config import get_logger
 from src.steam_api import _ms_to_iso
 from src.schemas import (
+    APIError,
     AnalyzeMarketResult,
     CompareMarketsResult,
     CompetitorComparison,
@@ -1279,10 +1281,39 @@ async def analyze_market_single(
         if tier2 > 0:
             data_source += f"+tier2({tier2})"
 
+    # Independent tag weight fetch for genre validation
+    # Fetch tags for top-N revenue/owner-significant games that lack tag data
+    if tags and len(tags) == 1 and steamspy is not None:
+        games_needing_tags = [
+            g for g in enriched_games
+            if g.get("appid") and (not g.get("tags") or not isinstance(g.get("tags"), dict) or not g["tags"])
+        ]
+        games_needing_tags.sort(key=lambda g: (g.get("revenue") or 0, g.get("owners") or 0), reverse=True)
+        TAG_FETCH_LIMIT = 50
+        tag_fetch_targets = games_needing_tags[:TAG_FETCH_LIMIT]
+        if tag_fetch_targets:
+            tag_tasks = [steamspy.get_engagement_data(g["appid"]) for g in tag_fetch_targets]
+            tag_results = await asyncio.gather(*tag_tasks, return_exceptions=True)
+            tag_lookup = {}
+            for g, result in zip(tag_fetch_targets, tag_results):
+                if (result is not None
+                    and not isinstance(result, Exception)
+                    and not isinstance(result, APIError)
+                    and hasattr(result, "tags") and result.tags):
+                    tag_lookup[g["appid"]] = dict(result.tags)
+            if tag_lookup:
+                for i, game in enumerate(enriched_games):
+                    appid = game.get("appid")
+                    if appid in tag_lookup:
+                        updated = dict(game)
+                        updated["tags"] = tag_lookup[appid]
+                        enriched_games[i] = updated
+                logger.info(f"Independent tag fetch: populated tags for {len(tag_lookup)}/{len(tag_fetch_targets)} games")
+
     # Genre membership validation for revenue-significant games (in-memory, zero API calls)
-    # Uses SteamSpy tag weights populated by Tier 2 enrichment
+    # Uses SteamSpy tag weights populated by Tier 2 enrichment or independent tag fetch
     validation_flags = []
-    if tags and len(tags) == 1 and enrichment_meta.get("tier2_count", 0) > 0:
+    if tags and len(tags) == 1:
         validation_flags = _validate_genre_membership(enriched_games, tags[0])
         if validation_flags:
             flagged = [f for f in validation_flags if not f["genre_valid"]]
