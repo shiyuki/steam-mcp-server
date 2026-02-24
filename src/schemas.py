@@ -690,3 +690,141 @@ class LanguageEntry(BaseModel):
     """Structured language support entry from Steam Store data."""
     language: str
     full_audio: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Phase 9: Market Analysis Tools schemas (additive — existing schemas unchanged)
+# ---------------------------------------------------------------------------
+
+class GameProfile(BaseModel):
+    """Full profile for a top game in market analysis results."""
+    appid: int
+    name: str = ""
+    revenue: float | None = None
+    review_score: float | None = None
+    release_date: str | None = None
+    owners: float | None = None          # owners_midpoint
+    ccu: int | None = None
+    median_playtime: float | None = None  # hours
+    followers: int | None = None          # from Gamalytic
+    copies_sold: int | None = None        # from Gamalytic
+    price: float | None = None
+    tags: dict[str, int] = Field(default_factory=dict)  # tag -> weight
+    developer: str = ""
+    publisher: str = ""
+
+
+class SkippedMetric(BaseModel):
+    """A metric that was skipped with reason for the skip."""
+    metric: str
+    reason: str
+
+
+class MarketHealthScores(BaseModel):
+    """Three 0-100 health scores for a market segment."""
+    growth: int = 50
+    competition: int = 50
+    accessibility: int = 50
+
+
+class ComputeTimingInfo(BaseModel):
+    """Per-metric and total execution timing information."""
+    total_ms: int = 0
+    per_metric: dict[str, int] = Field(default_factory=dict)
+    data_fetch_ms: int = 0
+
+
+class AnalyzeMarketResult(BaseModel):
+    """Top-level FLAT response for the analyze_market tool."""
+    # Query metadata
+    market_label: str = ""
+    total_games: int = 0
+    games_with_revenue: int = 0
+    coverage_pct: float = 0.0
+    phase: int = 1
+    continuation_token: str | None = None
+
+    # Analytics metrics (all at top level, None = insufficient data or not requested)
+    concentration: "ConcentrationResult | None" = None
+    temporal_trends: "TemporalTrendsResult | None" = None
+    price_brackets: "PriceBracketResult | None" = None
+    success_rates: "SuccessRateResult | None" = None
+    tag_multipliers: "TagMultiplierResult | None" = None
+    score_revenue: "ScoreRevenueResult | None" = None
+    publisher_analysis: "PublisherAnalysisResult | None" = None
+    release_timing: "ReleaseTimingResult | None" = None
+    sub_genres: "SubGenreResult | None" = None
+    competitive_density: "CompetitiveDensityResult | None" = None
+
+    # Derived analytics
+    descriptive_stats: dict | None = None
+    tag_frequency: list[dict] | None = None
+    health_scores: MarketHealthScores | None = None
+
+    # Game sample and enrichment
+    top_games: list[GameProfile] = Field(default_factory=list)
+    skipped_metrics: list[SkippedMetric] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    methodology: dict | None = None
+    compute_time: ComputeTimingInfo | None = None
+    raw_data: list[dict] | None = None
+    gamalytic_enrichment: dict | None = None
+    quota_warning: str | None = None
+
+
+class GamePercentiles(BaseModel):
+    """Per-metric percentile rankings for a single game vs its market."""
+    revenue: float | None = None
+    review_score: float | None = None
+    median_playtime: float | None = None
+    ccu: float | None = None
+    followers: float | None = None
+    copies_sold: float | None = None
+    review_count: float | None = None
+
+
+class CompetitorComparison(BaseModel):
+    """Side-by-side competitor stats for evaluate_game."""
+    appid: int
+    name: str = ""
+    revenue: float | None = None
+    review_score: float | None = None
+    price: float | None = None
+    ccu: int | None = None
+    owners: float | None = None
+    followers: int | None = None
+    similarity_score: float | None = None
+    overlap_source: str = ""
+    shared_tags: list[str] = Field(default_factory=list)
+
+
+class TagInsight(BaseModel):
+    """Tag multiplier vs genre baseline for evaluate_game."""
+    tag: str
+    multiplier: float
+    game_count: int = 0
+    classification: str = ""
+
+
+class EvaluateGameResult(BaseModel):
+    """Top-level response for the evaluate_game tool."""
+    appid: int
+    name: str = ""
+    genre: str = ""
+    game_profile: GameProfile | None = None
+    percentiles: GamePercentiles | None = None
+    strengths: list[str] = Field(default_factory=list)
+    weaknesses: list[str] = Field(default_factory=list)
+    position_score: float = 50.0
+    potential_score: float = 50.0
+    opportunity_score: float = 50.0
+    competitors: list[CompetitorComparison] = Field(default_factory=list)
+    tag_insights: list[TagInsight] = Field(default_factory=list)
+    genre_fit: dict | None = None
+    review_sentiment: dict | None = None
+    pricing_context: dict | None = None
+    historical_performance: list[dict] | None = None
+    genre_baseline: dict | None = None
+    compute_time: ComputeTimingInfo | None = None
+    warnings: list[str] = Field(default_factory=list)
+    methodology: dict | None = None
