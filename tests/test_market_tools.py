@@ -1070,3 +1070,255 @@ class TestCustomBaselineBypass:
         games = make_games(5)
         result = _run_market_analysis(games, tags=["test"])
         assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# TestGenreMembershipValidation
+# ---------------------------------------------------------------------------
+
+class TestGenreMembershipValidation:
+    """Test _validate_genre_membership in-memory tag validation."""
+
+    def test_validates_games_with_tag_data(self):
+        """Games with SteamSpy tag weights are validated against genre tag."""
+        from src.market_tools import _validate_genre_membership
+
+        games = [
+            {
+                "appid": 1, "name": "RogueHit", "revenue": 50_000_000,
+                "tags": {"Roguelike": 1000, "Action": 800, "Indie": 600},
+            },
+            {
+                "appid": 2, "name": "NotRogue", "revenue": 30_000_000,
+                "tags": {"Puzzle": 1000, "Casual": 800, "Match 3": 600},
+            },
+            {
+                "appid": 3, "name": "SmallGame", "revenue": 100,
+                "tags": {"RPG": 500},
+            },
+        ]
+
+        flags = _validate_genre_membership(games, "Roguelike")
+
+        # Total revenue ~80M + 100. Threshold = 80000100 * 0.001 = ~80000
+        # Game 1 (50M) and Game 2 (30M) exceed threshold; Game 3 (100) does not
+        assert len(flags) == 2
+
+        rogue_flag = next(f for f in flags if f["appid"] == 1)
+        assert rogue_flag["genre_valid"] is True
+        assert rogue_flag["tag_rank"] == 1  # "Roguelike" is highest-weighted tag
+
+        not_rogue_flag = next(f for f in flags if f["appid"] == 2)
+        assert not_rogue_flag["genre_valid"] is False
+        assert not_rogue_flag["tag_rank"] is None
+
+    def test_skips_games_without_tag_data(self):
+        """Games with empty tags dict (no Tier 2 enrichment) are skipped, not flagged."""
+        from src.market_tools import _validate_genre_membership
+
+        games = [
+            {"appid": 1, "name": "NoTags", "revenue": 50_000_000, "tags": {}},
+            {"appid": 2, "name": "NullTags", "revenue": 30_000_000, "tags": None},
+            {"appid": 3, "name": "HasTags", "revenue": 20_000_000, "tags": {"Roguelike": 500}},
+        ]
+
+        flags = _validate_genre_membership(games, "Roguelike")
+
+        # Only game 3 has tag data and exceeds threshold
+        assert len(flags) == 1
+        assert flags[0]["appid"] == 3
+        assert flags[0]["genre_valid"] is True
+
+    def test_case_insensitive_tag_matching(self):
+        """Genre tag matching is case-insensitive."""
+        from src.market_tools import _validate_genre_membership
+
+        games = [
+            {"appid": 1, "name": "Game1", "revenue": 1_000_000,
+             "tags": {"roguelike": 1000, "action": 800}},
+        ]
+
+        flags = _validate_genre_membership(games, "Roguelike")
+        assert len(flags) == 1
+        assert flags[0]["genre_valid"] is True
+
+    def test_returns_empty_for_no_revenue(self):
+        """Returns empty list when total revenue is zero."""
+        from src.market_tools import _validate_genre_membership
+
+        games = [
+            {"appid": 1, "name": "Free", "revenue": 0, "tags": {"Roguelike": 500}},
+        ]
+
+        flags = _validate_genre_membership(games, "Roguelike")
+        assert flags == []
+
+    def test_top_tags_shows_context(self):
+        """Validation flags include top 5 tags for context."""
+        from src.market_tools import _validate_genre_membership
+
+        games = [
+            {"appid": 1, "name": "Game1", "revenue": 1_000_000,
+             "tags": {"Action": 1000, "Adventure": 900, "RPG": 800, "Indie": 700,
+                      "Open World": 600, "Roguelike": 500}},
+        ]
+
+        flags = _validate_genre_membership(games, "Roguelike")
+        assert len(flags) == 1
+        assert flags[0]["genre_valid"] is True
+        assert flags[0]["tag_rank"] == 6  # 6th tag
+        assert len(flags[0]["top_tags"]) == 5
+        assert flags[0]["top_tags"][0] == "Action"
+
+
+# ---------------------------------------------------------------------------
+# TestMultiTagErrorSurfacing
+# ---------------------------------------------------------------------------
+
+class TestMultiTagErrorSurfacing:
+    """Test that invalid tags in multi-tag queries produce descriptive errors."""
+
+    @pytest.mark.asyncio
+    async def test_missing_tag_returns_error_with_names(self):
+        """Multi-tag query with invalid tag returns error naming the bad tag."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import analyze_market_single
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+
+        # Steam Store tag map is missing 'Deckbuilder' but has 'Roguelike'
+        mock_steam_store.get_tag_map = AsyncMock(return_value={"roguelike": 12345})
+        mock_steam_store.search_by_tag_ids = AsyncMock(return_value=(0, []))
+
+        result = await analyze_market_single(
+            steamspy=mock_steamspy,
+            steam_store=mock_steam_store,
+            gamalytic=mock_gamalytic,
+            tags=["Roguelike", "Deckbuilder"],
+        )
+
+        assert "error" in result
+        assert "Deckbuilder" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_all_tags_valid_proceeds_normally(self):
+        """Multi-tag query with all valid tags attempts to find games (no tag error)."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import analyze_market_single
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+
+        # Both tags exist in tag map
+        mock_steam_store.get_tag_map = AsyncMock(return_value={
+            "roguelike": 12345,
+            "deckbuilder": 67890,
+        })
+        # search_by_tag_ids returns 0 results (no games match intersection)
+        mock_steam_store.search_by_tag_ids = AsyncMock(return_value=(0, []))
+
+        result = await analyze_market_single(
+            steamspy=mock_steamspy,
+            steam_store=mock_steam_store,
+            gamalytic=mock_gamalytic,
+            tags=["Roguelike", "Deckbuilder"],
+        )
+
+        # No tag error — both tags were valid. Error is "no games found" (not tag error)
+        assert "error" in result
+        assert "not recognized" not in result["error"]  # tag error message absent
+        # The error should be about no games, not about bad tags
+        assert "No games found" in result["error"] or "no games" in result["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# TestValidationFlagsInResult
+# ---------------------------------------------------------------------------
+
+class TestValidationFlagsInResult:
+    """Test that analyze_market_single includes validation_flags when Tier 2 enrichment ran."""
+
+    @pytest.mark.asyncio
+    async def test_validation_flags_present_after_tier2(self):
+        """Result includes validation_flags for games checked by _validate_genre_membership."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.schemas import GameSummary, SearchResult, CommercialData, EngagementData
+        from src.market_tools import analyze_market_single
+        from datetime import datetime, timezone
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+
+        # 25 games, game 1 has >0.1% of revenue (will get Tier 2)
+        # Need 25 games to exceed MIN_GAMES_THRESHOLD (20)
+        games = [
+            GameSummary(
+                appid=1, name="BigGame", developer="Dev", publisher="Pub",
+                ccu=5000, owners_min=4000000, owners_max=6000000,
+                owners_midpoint=5000000.0, average_forever=50.0, average_2weeks=10.0,
+                median_forever=40.0, median_2weeks=8.0, positive=50000, negative=2000, price=29.99,
+            ),
+        ] + [
+            GameSummary(
+                appid=i, name=f"SmallGame{i}", developer="Dev", publisher="Pub",
+                ccu=100, owners_min=1000, owners_max=5000,
+                owners_midpoint=3000.0, average_forever=10.0, average_2weeks=1.0,
+                median_forever=8.0, median_2weeks=0.5, positive=200, negative=10, price=9.99,
+            )
+            for i in range(2, 26)
+        ]
+
+        mock_steamspy.search_by_tag = AsyncMock(return_value=SearchResult(
+            tag="Roguelike", appids=[g.appid for g in games], total_found=25,
+            games=games, data_source="steamspy",
+            fetched_at="2026-01-01T00:00:00Z", cache_age_seconds=0,
+        ))
+
+        # Gamalytic bulk: game 1 dominates revenue
+        gamalytic_games = [
+            {"steamId": 1, "name": "BigGame", "revenue": 90_000_000, "copiesSold": 5000000},
+        ] + [
+            {"steamId": i, "name": f"SmallGame{i}", "revenue": 100_000, "copiesSold": 5000}
+            for i in range(2, 26)
+        ]
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=gamalytic_games)
+
+        # Tier 2: full CommercialData for BigGame
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[
+            CommercialData(
+                appid=1, name="BigGame", price=29.99,
+                revenue_min=72_000_000, revenue_max=108_000_000,
+                confidence="high", source="gamalytic",
+                fetched_at=datetime.now(timezone.utc),
+                followers=500_000,
+            )
+        ])
+
+        # Tier 2: SteamSpy tag weights for BigGame
+        mock_steamspy.get_engagement_data = AsyncMock(return_value=EngagementData(
+            appid=1, name="BigGame", ccu=5000, owners_midpoint=5000000.0,
+            average_forever=50.0, average_2weeks=10.0,
+            positive=50000, negative=2000, total_reviews=52000, price=29.99,
+            review_score=96.2, tags={"Roguelike": 1000, "Action": 800, "Indie": 600},
+            owners_min=4000000, owners_max=6000000,
+            median_forever=40.0, median_2weeks=8.0,
+            developer="Dev", publisher="Pub",
+            fetched_at=datetime.now(timezone.utc),
+        ))
+
+        result = await analyze_market_single(
+            steamspy=mock_steamspy, steam_store=mock_steam_store,
+            gamalytic=mock_gamalytic, tags=["Roguelike"],
+        )
+
+        # Should have validation_flags because Tier 2 ran and provided tag data
+        assert "validation_flags" in result
+        assert len(result["validation_flags"]) >= 1
+        flag = result["validation_flags"][0]
+        assert flag["appid"] == 1
+        assert flag["genre_valid"] is True
+        assert flag["tag_rank"] == 1  # "Roguelike" is top tag

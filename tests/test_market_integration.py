@@ -1498,7 +1498,9 @@ class TestSupplementAndMultiTag:
         )
 
         assert games == []
-        assert data_source == "steam_store"
+        # data_source encodes the missing tag name for upstream error surfacing
+        assert data_source.startswith("steam_store:tag_error:")
+        assert "Deckbuilder" in data_source
         mock_steam_store.search_by_tag_ids.assert_not_called()
 
     @pytest.mark.asyncio

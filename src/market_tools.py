@@ -755,8 +755,8 @@ async def _fetch_game_list_steamspy(
                 tag_ids.append(tid)
 
         if missing_tags:
-            logger.warning(f"Tag(s) not found in Steam tag map: {missing_tags} — returning empty")
-            return [], "steam_store"
+            logger.warning(f"Tag(s) not found in Steam tag map: {missing_tags}")
+            return [], f"steam_store:tag_error:{','.join(missing_tags)}"
 
         # Fetch appids from Steam Store using all integer tag IDs (intersection)
         store_result = await steam_store.search_by_tag_ids(tag_ids, count=50)
@@ -1132,6 +1132,84 @@ async def _enrich_with_gamalytic_bulk(
     return enriched_games, warnings, enrichment_meta
 
 
+def _validate_genre_membership(
+    games: list[dict],
+    genre_tag: str,
+    revenue_threshold_pct: float = GAMALYTIC_REVENUE_THRESHOLD_PCT,
+) -> list[dict]:
+    """Validate genre membership for revenue-significant games using SteamSpy tag weights.
+
+    For each game that has SteamSpy tag weights (populated by Tier 2 enrichment in
+    _enrich_with_gamalytic_bulk), checks if the searched genre tag appears in the
+    game's top-20 tags. Games without tag data (tags={}) are skipped (not flagged).
+
+    This is a pure in-memory check — ZERO API calls. Tag weights come from
+    SteamSpy get_engagement_data fetched during Tier 2 enrichment.
+
+    Args:
+        games: List of enriched game dicts (with "tags" and "revenue" fields)
+        genre_tag: The genre tag to validate membership for (e.g., "Roguelike")
+        revenue_threshold_pct: Revenue threshold percentage (default: 0.1%)
+
+    Returns:
+        List of validation flag dicts, one per validated game:
+        [
+            {
+                "appid": int,
+                "name": str,
+                "revenue": float,
+                "revenue_pct": float,     # game's % of total genre revenue
+                "genre_valid": bool,       # True if genre tag found in top-20 tags
+                "tag_rank": int | None,    # position of genre tag in tag weights (1-based), None if not found
+                "top_tags": list[str],     # top 5 tags by weight for context
+            },
+            ...
+        ]
+    """
+    total_revenue = sum(g.get("revenue") or 0 for g in games)
+    if total_revenue <= 0:
+        return []
+
+    threshold = total_revenue * (revenue_threshold_pct / 100.0)
+    genre_lower = genre_tag.lower()
+
+    validation_flags = []
+    for game in games:
+        revenue = game.get("revenue") or 0
+        if revenue <= threshold:
+            continue
+
+        tags = game.get("tags")
+        if not tags or not isinstance(tags, dict):
+            # No tag data available (not Tier 2 enriched) — skip, don't flag
+            continue
+
+        # Sort tags by weight descending (SteamSpy returns {"TagName": weight_int})
+        sorted_tags = sorted(tags.items(), key=lambda t: t[1], reverse=True)
+        top_20_tag_names = [name for name, _ in sorted_tags[:20]]
+        top_20_lower = [name.lower() for name in top_20_tag_names]
+
+        # Check if genre tag appears in top-20 tags
+        genre_valid = genre_lower in top_20_lower
+        tag_rank = None
+        if genre_valid:
+            tag_rank = top_20_lower.index(genre_lower) + 1  # 1-based rank
+
+        top_5 = [name for name, _ in sorted_tags[:5]]
+
+        validation_flags.append({
+            "appid": game.get("appid"),
+            "name": game.get("name", "Unknown"),
+            "revenue": revenue,
+            "revenue_pct": round(revenue / total_revenue * 100, 2),
+            "genre_valid": genre_valid,
+            "tag_rank": tag_rank,
+            "top_tags": top_5,
+        })
+
+    return validation_flags
+
+
 # ---------------------------------------------------------------------------
 # Single-Phase Orchestration
 # ---------------------------------------------------------------------------
@@ -1169,8 +1247,12 @@ async def analyze_market_single(
     fetch_ms = round((time.monotonic() - fetch_start) * 1000)
 
     if not games:
+        error_msg = "No games found for specified tags."
+        if data_source.startswith("steam_store:tag_error:"):
+            bad_tags = data_source.split(":", 2)[2]
+            error_msg = f"Tag(s) not recognized: {bad_tags}. Check tag names against Steam's tag list (e.g., 'Roguelike Deckbuilder' not 'Deckbuilder')."
         return {
-            "error": "No games found for specified tags.",
+            "error": error_msg,
             "total_games": 0,
             "market_label": market_label or ", ".join(tags) or f"Custom ({len(appids or [])} games)",
         }
@@ -1193,6 +1275,25 @@ async def analyze_market_single(
         if tier2 > 0:
             data_source += f"+tier2({tier2})"
 
+    # Genre membership validation for revenue-significant games (in-memory, zero API calls)
+    # Uses SteamSpy tag weights populated by Tier 2 enrichment
+    validation_flags = []
+    if tags and len(tags) == 1 and enrichment_meta.get("tier2_count", 0) > 0:
+        validation_flags = _validate_genre_membership(enriched_games, tags[0])
+        if validation_flags:
+            flagged = [f for f in validation_flags if not f["genre_valid"]]
+            valid = [f for f in validation_flags if f["genre_valid"]]
+            logger.info(
+                f"Genre validation: {len(valid)} pass, {len(flagged)} flagged "
+                f"out of {len(validation_flags)} checked for tag '{tags[0]}'"
+            )
+            if flagged:
+                flagged_names = ", ".join(f["name"] for f in flagged[:5])
+                logger.warning(
+                    f"Genre membership flagged: {len(flagged)} revenue-significant games "
+                    f"don't have '{tags[0]}' in top-20 SteamSpy tags: {flagged_names}"
+                )
+
     # Run analysis on all games
     result = _run_market_analysis(
         games=enriched_games,
@@ -1208,6 +1309,10 @@ async def analyze_market_single(
 
     if "error" in result:
         return result
+
+    # Add validation flags to result (games flagged but NOT removed)
+    if validation_flags:
+        result["validation_flags"] = validation_flags
 
     # Add timing info
     if result.get("compute_time"):
@@ -2192,11 +2297,16 @@ async def compare_markets_analysis(
         fetch_ms = round((time.monotonic() - fetch_start) * 1000)
 
         if not games:
-            warnings.append(f"Market '{label}': no games found.")
+            if data_source.startswith("steam_store:tag_error:"):
+                bad_tags = data_source.split(":", 2)[2]
+                warning_msg = f"Market '{label}': tag(s) not recognized: {bad_tags}. Check tag names against Steam's tag list."
+            else:
+                warning_msg = f"Market '{label}': no games found."
+            warnings.append(warning_msg)
             analysis = {
                 "market_label": label,
                 "total_games": 0,
-                "error": "No games found for specified tags.",
+                "error": warning_msg,
             }
             market_analyses.append((label, analysis))
             market_game_sets.append((label, []))
