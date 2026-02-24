@@ -828,3 +828,45 @@ class EvaluateGameResult(BaseModel):
     compute_time: ComputeTimingInfo | None = None
     warnings: list[str] = Field(default_factory=list)
     methodology: dict | None = None
+
+
+# ---------------------------------------------------------------------------
+# Phase 9: Compare Markets schemas (additive — existing schemas unchanged)
+# ---------------------------------------------------------------------------
+
+class MarketComparisonEntry(BaseModel):
+    """Per-market entry in a compare_markets result."""
+    market_label: str = ""
+    analysis: dict | None = None
+    rank: int = 0
+
+
+class MetricDelta(BaseModel):
+    """Single metric comparison across markets."""
+    metric: str
+    values: dict[str, float | None] = Field(default_factory=dict)
+    winner: str = ""
+    delta_pct: float | None = None
+
+
+class OverlapInfo(BaseModel):
+    """Games appearing in multiple markets (pairwise or global)."""
+    pair: str = ""
+    overlap_count: int = 0
+    overlap_games: list[GameProfile] = Field(default_factory=list)
+    pct_of_smaller_market: float = 0.0
+
+
+class CompareMarketsResult(BaseModel):
+    """Top-level response for the compare_markets tool."""
+    market_count: int = 0
+    markets: list[MarketComparisonEntry] = Field(default_factory=list)
+    deltas: list[MetricDelta] = Field(default_factory=list)
+    health_score_comparison: dict[str, dict] = Field(default_factory=dict)
+    overall_ranking: list[dict] = Field(default_factory=list)
+    overlap: list[OverlapInfo] = Field(default_factory=list)
+    global_overlap: OverlapInfo | None = None
+    confidence_notes: list[str] = Field(default_factory=list)
+    compute_time: ComputeTimingInfo | None = None
+    warnings: list[str] = Field(default_factory=list)
+    methodology: dict | None = None
