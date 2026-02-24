@@ -667,37 +667,38 @@ async def _fetch_game_list_steamspy(
     import asyncio
     from src.schemas import APIError as APIErrorSchema
 
+    # Shared inner function: fetch SteamSpy engagement data for a single appid.
+    # Used by appids-only path, supplement path, and multi-tag path.
+    async def _fetch_one(appid: int) -> dict | None:
+        try:
+            result = await steamspy.get_engagement_data(appid)
+            if isinstance(result, APIErrorSchema):
+                logger.debug(f"SteamSpy engagement fetch failed for appid {appid}: {result.message}")
+                return None
+            return {
+                "appid": result.appid,
+                "name": result.name,
+                "developer": result.developer,
+                "publisher": result.publisher,
+                "owners": result.owners_midpoint,
+                "ccu": result.ccu,
+                "price": result.price,
+                "review_score": result.review_score,
+                "median_forever": result.median_forever,
+                "average_forever": result.average_forever,
+                "revenue": None,
+                "followers": None,
+                "copies_sold": None,
+                "tags": result.tags,
+                "release_date": None,
+            }
+        except Exception as exc:
+            logger.debug(f"Appid fetch exception for {appid}: {exc}")
+            return None
+
     # Appids-only path: fetch per-appid engagement data concurrently
     if appids and not tags:
         logger.info(f"Appids-only fetch: fetching engagement data for {len(appids)} appids")
-
-        async def _fetch_one(appid: int) -> dict | None:
-            try:
-                result = await steamspy.get_engagement_data(appid)
-                if isinstance(result, APIErrorSchema):
-                    logger.debug(f"SteamSpy engagement fetch failed for appid {appid}: {result.message}")
-                    return None
-                return {
-                    "appid": result.appid,
-                    "name": result.name,
-                    "developer": result.developer,
-                    "publisher": result.publisher,
-                    "owners": result.owners_midpoint,
-                    "ccu": result.ccu,
-                    "price": result.price,
-                    "review_score": result.review_score,
-                    "median_forever": result.median_forever,
-                    "average_forever": result.average_forever,
-                    "revenue": None,
-                    "followers": None,
-                    "copies_sold": None,
-                    "tags": result.tags,
-                    "release_date": None,
-                }
-            except Exception as exc:
-                logger.debug(f"Appid fetch exception for {appid}: {exc}")
-                return None
-
         tasks = [_fetch_one(appid) for appid in appids]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         games = [r for r in results if isinstance(r, dict)]
@@ -717,33 +718,75 @@ async def _fetch_game_list_steamspy(
         if len(games) >= STEAMSPY_SUPPLEMENT_THRESHOLD:
             logger.info(f"Large result set ({len(games)} games >= {STEAMSPY_SUPPLEMENT_THRESHOLD}): supplementing with Steam Store")
             try:
-                store_result = await steam_store.search_by_tag_ids([tag], limit=None)
-                if not isinstance(store_result, APIErrorSchema) and hasattr(store_result, "games"):
-                    # Merge by appid: prefer SteamSpy data, add any new games from Store
-                    existing_appids = {g["appid"] for g in games}
-                    store_games = [_game_summary_to_dict(g) for g in store_result.games]
-                    new_games = [g for g in store_games if g["appid"] not in existing_appids]
-                    games.extend(new_games)
-                    data_source = "steamspy+steam_store"
-                    logger.info(f"Supplement added {len(new_games)} additional games")
+                # Resolve tag name to integer tag ID via get_tag_map
+                tag_map = await steam_store.get_tag_map()
+                if isinstance(tag_map, APIErrorSchema):
+                    logger.warning(f"Steam Store tag map fetch failed: {tag_map.message} — skipping supplement")
+                else:
+                    tag_id = tag_map.get(tag.lower())
+                    if tag_id is None:
+                        logger.warning(f"Tag '{tag}' not found in Steam tag map ({len(tag_map)} tags) — skipping supplement")
+                    else:
+                        # Fetch appids from Steam Store using integer tag ID
+                        store_result = await steam_store.search_by_tag_ids([tag_id], count=50)
+                        if isinstance(store_result, APIErrorSchema):
+                            logger.warning(f"Steam Store supplement search failed: {store_result.message}")
+                        else:
+                            # search_by_tag_ids returns tuple[int, list[int]]
+                            total_count, store_appids = store_result
+                            existing_appids = {g["appid"] for g in games}
+                            new_appids = [a for a in store_appids if a not in existing_appids]
+                            if new_appids:
+                                # Enrich new appids with SteamSpy engagement data concurrently
+                                enrich_tasks = [_fetch_one(appid) for appid in new_appids]
+                                enrich_results = await asyncio.gather(*enrich_tasks, return_exceptions=True)
+                                new_games = [r for r in enrich_results if isinstance(r, dict)]
+                                games.extend(new_games)
+                                data_source = "steamspy+steam_store"
+                                logger.info(f"Supplement added {len(new_games)} additional games (of {len(new_appids)} new appids)")
             except Exception as exc:
                 logger.warning(f"Steam Store supplement failed: {exc}")
 
         return games, data_source
 
     else:
-        # Multi-tag: use Steam Store search
+        # Multi-tag: use Steam Store search with integer tag IDs
         logger.info(f"Multi-tag query ({len(tags)} tags): using Steam Store search")
-        try:
-            result = await steam_store.search_by_tag_ids(tags, limit=None)
-            if isinstance(result, APIErrorSchema):
-                logger.warning(f"Steam Store search failed for tags {tags}: {result.message}")
-                return [], "steam_store"
-            games = [_game_summary_to_dict(g) for g in result.games]
-            return games, "steam_store"
-        except Exception as exc:
-            logger.error(f"Multi-tag fetch failed: {exc}")
+        # Resolve all tag names to integer tag IDs via get_tag_map
+        tag_map = await steam_store.get_tag_map()
+        if isinstance(tag_map, APIErrorSchema):
+            logger.warning(f"Steam Store tag map fetch failed for multi-tag query: {tag_map.message}")
             return [], "steam_store"
+
+        tag_ids = []
+        missing_tags = []
+        for t in tags:
+            tid = tag_map.get(t.lower())
+            if tid is None:
+                missing_tags.append(t)
+            else:
+                tag_ids.append(tid)
+
+        if missing_tags:
+            logger.warning(f"Tag(s) not found in Steam tag map: {missing_tags} — returning empty")
+            return [], "steam_store"
+
+        # Fetch appids from Steam Store using all integer tag IDs (intersection)
+        store_result = await steam_store.search_by_tag_ids(tag_ids, count=50)
+        if isinstance(store_result, APIErrorSchema):
+            logger.warning(f"Steam Store multi-tag search failed: {store_result.message}")
+            return [], "steam_store"
+
+        # search_by_tag_ids returns tuple[int, list[int]]
+        total_count, store_appids = store_result
+        if not store_appids:
+            return [], "steam_store"
+
+        # Enrich appids with SteamSpy engagement data concurrently
+        enrich_tasks = [_fetch_one(appid) for appid in store_appids]
+        enrich_results = await asyncio.gather(*enrich_tasks, return_exceptions=True)
+        games = [r for r in enrich_results if isinstance(r, dict)]
+        return games, "steam_store"
 
 
 # ---------------------------------------------------------------------------
