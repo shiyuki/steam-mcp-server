@@ -328,10 +328,8 @@ def get_computable_metrics(n_games: int, requested: list[str] | None = None) -> 
     Always available (any N):
         descriptive_stats, tag_frequency
 
-    N >= 20 unlocks:
-        concentration, success_rates, price_brackets, publisher_analysis
-
-    N >= 50 unlocks all remaining:
+    N >= 20 unlocks all analytics metrics:
+        concentration, success_rates, price_brackets, publisher_analysis,
         temporal_trends, tag_multipliers, score_revenue, competitive_density,
         release_timing, sub_genres
 
@@ -340,16 +338,10 @@ def get_computable_metrics(n_games: int, requested: list[str] | None = None) -> 
     available: set[str] = {"descriptive_stats", "tag_frequency"}
 
     if n_games >= 20:
-        available |= {"concentration", "success_rates", "price_brackets", "publisher_analysis"}
-
-    if n_games >= 50:
         available |= {
-            "temporal_trends",
-            "tag_multipliers",
-            "score_revenue",
-            "competitive_density",
-            "release_timing",
-            "sub_genres",
+            "concentration", "success_rates", "price_brackets", "publisher_analysis",
+            "temporal_trends", "tag_multipliers", "score_revenue",
+            "competitive_density", "release_timing", "sub_genres",
         }
 
     if requested is not None:

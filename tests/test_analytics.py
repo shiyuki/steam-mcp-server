@@ -386,10 +386,6 @@ class TestSmartMetricSelection:
         assert "success_rates" in available
         assert "price_brackets" in available
         assert "publisher_analysis" in available
-        assert len(available) == 6
-
-    def test_at_50(self):
-        available = get_computable_metrics(50)
         assert "temporal_trends" in available
         assert "tag_multipliers" in available
         assert "score_revenue" in available
@@ -397,6 +393,18 @@ class TestSmartMetricSelection:
         assert "release_timing" in available
         assert "sub_genres" in available
         assert len(available) == 12
+
+    def test_at_50(self):
+        # Single tier: N>=50 returns the same 12 metrics as N>=20
+        assert get_computable_metrics(50) == get_computable_metrics(20)
+
+    def test_at_25_unlocks_all(self):
+        """Any N >= 20 unlocks all 10 analytics metrics (plus 2 always-on)."""
+        available = get_computable_metrics(25)
+        assert len(available) == 12
+        assert "temporal_trends" in available
+        assert "tag_multipliers" in available
+        assert "score_revenue" in available
 
     def test_requested_filter(self):
         requested = ["concentration", "tag_frequency", "nonexistent_metric"]
