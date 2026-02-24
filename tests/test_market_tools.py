@@ -1322,3 +1322,132 @@ class TestValidationFlagsInResult:
         assert flag["appid"] == 1
         assert flag["genre_valid"] is True
         assert flag["tag_rank"] == 1  # "Roguelike" is top tag
+
+
+# ---------------------------------------------------------------------------
+# TestEnrichmentPipelineFixes — 3 tests for UAT gap-1 fixes
+# ---------------------------------------------------------------------------
+
+class TestEnrichmentPipelineFixes:
+    """Tests for cross-validation, releaseDate conversion, and fallback release_date."""
+
+    @pytest.mark.asyncio
+    async def test_cross_validation_uses_all_appids(self):
+        """Cross-validation checks ALL AppIDs so 70% dataset overlap triggers bulk merge.
+
+        Setup:
+          - 100 games with owners ascending by appid (appid 100 has most owners).
+          - Gamalytic returns appids 1-70.
+          - Top-10 by owners = appids 91-100: NONE in Gamalytic (old code: 0% -> fallback).
+          - All-appids check: 70/100 = 0.7 (new code: 70% -> bulk).
+        """
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import _enrich_with_gamalytic_bulk
+
+        mock_gamalytic = MagicMock()
+        # Gamalytic returns appids 1-70 only (excludes the high-owner top-10 games)
+        gamalytic_games = [
+            {"steamId": i, "name": f"Game{i}", "revenue": 500_000, "copiesSold": 10000}
+            for i in range(1, 71)
+        ]
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=gamalytic_games)
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
+
+        # 100 SteamSpy games: owners ascending by appid (appid 100 has most owners)
+        # Top-10 by owners = appids 91-100 (NOT in Gamalytic), but 70 total overlap
+        steamspy_games = [
+            {"appid": i, "name": f"Game{i}", "owners": i * 1000, "revenue": None, "tags": {}}
+            for i in range(1, 101)
+        ]
+
+        enriched, warnings, meta = await _enrich_with_gamalytic_bulk(
+            steamspy_games, mock_gamalytic, primary_tag="Roguelike"
+        )
+
+        # With full-dataset cross-validation: 70/100 = 0.7 >= BULK_MATCH_THRESHOLD (0.6)
+        assert meta["method"] == "bulk", f"Expected bulk, got {meta['method']}"
+        assert meta["match_rate"] == 0.7
+
+    @pytest.mark.asyncio
+    async def test_bulk_release_date_converted_to_iso(self):
+        """Bulk-merged releaseDate is converted from ms epoch to ISO YYYY-MM-DD string.
+
+        Gamalytic sends releaseDate as Unix ms timestamp (e.g., 1609459200000 = 2021-01-01).
+        After bulk merge, enriched game release_date should be "2021-01-01", not the raw int.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import _enrich_with_gamalytic_bulk
+
+        mock_gamalytic = MagicMock()
+        # 2021-01-01 UTC in ms epoch
+        EPOCH_2021_01_01_MS = 1609459200000
+        gamalytic_games = [
+            {
+                "steamId": i,
+                "name": f"Game{i}",
+                "revenue": 500_000,
+                "copiesSold": 10000,
+                "releaseDate": EPOCH_2021_01_01_MS,
+            }
+            for i in range(1, 71)
+        ]
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=gamalytic_games)
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
+
+        steamspy_games = [
+            {"appid": i, "name": f"Game{i}", "owners": i * 1000, "revenue": None, "tags": {}}
+            for i in range(1, 101)
+        ]
+
+        enriched, warnings, meta = await _enrich_with_gamalytic_bulk(
+            steamspy_games, mock_gamalytic, primary_tag="Roguelike"
+        )
+
+        assert meta["method"] == "bulk"
+        # Check that games matched by Gamalytic have ISO date, not raw ms integer
+        matched_games = [g for g in enriched if g.get("release_date") is not None]
+        assert len(matched_games) > 0, "Expected some games to have release_date"
+        for game in matched_games:
+            assert game["release_date"] == "2021-01-01", (
+                f"Expected ISO '2021-01-01' but got {game['release_date']!r} "
+                f"(raw epoch was {EPOCH_2021_01_01_MS})"
+            )
+
+    @pytest.mark.asyncio
+    async def test_per_game_fallback_populates_release_date(self):
+        """Per-game fallback path (_enrich_one) populates release_date from CommercialData.
+
+        When CommercialData.release_date is set (ISO string from Gamalytic releaseDate),
+        _enrich_one merges it into the enriched game dict.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import _enrich_with_gamalytic_bulk
+        from src.schemas import CommercialData
+        from datetime import datetime, timezone
+
+        mock_gamalytic = MagicMock()
+        # Bulk fetch returns nothing (empty) -> cross-validation fails -> per-game fallback
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=[])
+
+        # Per-game fallback: CommercialData with release_date set
+        mock_gamalytic.get_commercial_data = AsyncMock(return_value=CommercialData(
+            appid=1, name="TestGame", price=14.99,
+            revenue_min=200_000, revenue_max=800_000,
+            confidence="medium", source="gamalytic",
+            fetched_at=datetime.now(timezone.utc),
+            release_date="2020-06-15",
+        ))
+
+        steamspy_games = [
+            {"appid": 1, "name": "TestGame", "owners": 50000, "revenue": None, "tags": {}},
+        ]
+
+        enriched, warnings, meta = await _enrich_with_gamalytic_bulk(
+            steamspy_games, mock_gamalytic, primary_tag=None
+        )
+
+        assert meta["method"] == "per_game"
+        game = enriched[0]
+        assert game.get("release_date") == "2020-06-15", (
+            f"Expected '2020-06-15' from CommercialData fallback, got {game.get('release_date')!r}"
+        )
