@@ -262,8 +262,7 @@ class SteamSpyClient:
         """Search for games by tag using SteamSpy API with enriched per-game summaries.
 
         Returns per-game summary data (name, owners, CCU, price, reviews, playtime) from
-        SteamSpy bulk endpoint. For niche tags (<5000 games), cross-validates via appdetails
-        to filter false positives. For per-game tag weights, use fetch_engagement(appid).
+        SteamSpy bulk endpoint. Uses bulk data directly for all tag sizes.
 
         Args:
             tag: Tag to search for (e.g., "roguelike", "indie")
@@ -273,19 +272,16 @@ class SteamSpyClient:
         Returns:
             SearchResult with enriched game summaries, or APIError on failure
         """
-        # Normalize tag before API call
         original_tag = tag
         tag = normalize_tag(tag)
 
         try:
-            # Use get_with_metadata for freshness tracking (1 hour cache TTL)
             data, fetched_at, cache_age = await self.http.get_with_metadata(
                 self.BASE_URL,
                 params={"request": "tag", "tag": tag},
                 cache_ttl=3600
             )
 
-            # Check for bowling fallback before processing
             if self._detect_steamspy_fallback(data, tag):
                 logger.warning(f"SteamSpy returned bowling fallback for tag '{tag}' - tag may not exist")
                 return APIError(
@@ -294,60 +290,20 @@ class SteamSpyClient:
                     message=f"Tag '{tag}' not recognized by SteamSpy. The API returned default results instead of matching games. Try a different tag name or check Steam's tag list."
                 )
 
-            # Import GameSummary here to avoid circular import at module level
             from src.schemas import GameSummary
 
             games_list = []
 
-            # Cross-validation for niche tags (<5000 games) to filter false positives
-            if len(data) < TAG_CROSSVAL_THRESHOLD:
-                logger.info(f"Niche tag '{tag}': {len(data)} games - applying cross-validation")
+            # Parse bulk data directly — no per-game cross-validation
+            # SteamSpy bulk endpoint is the source of truth for tag membership
+            for game_data in data.values():
+                parsed = self._parse_game_data(game_data)
+                games_list.append(GameSummary(**parsed))
 
-                # Parse bulk data first (this is the data source for GameSummary)
-                bulk_games = []
-                for game_data in data.values():
-                    parsed = self._parse_game_data(game_data)
-                    bulk_games.append(parsed)
-
-                # Sort by owners before validation (prioritize high-value games)
-                bulk_games.sort(key=lambda g: g["owners_midpoint"], reverse=True)
-
-                # Validate ALL candidates via appdetails (which includes per-game tags)
-                candidate_appids = [g["appid"] for g in bulk_games]
-
-                # Fetch appdetails concurrently for tag validation
-                detail_tasks = [self.get_engagement_data(appid) for appid in candidate_appids]
-                results = await asyncio.gather(*detail_tasks, return_exceptions=True)
-
-                # Filter to games where searched tag is in their tag dict (case-insensitive)
-                # IMPORTANT: Build GameSummary from BULK PARSE DATA, not from appdetails
-                # Fallback: if appdetails fetch fails OR has no tags, INCLUDE the game (can't verify)
-                tag_lower = tag.lower()
-                for bulk_game, result in zip(bulk_games, results):
-                    if isinstance(result, EngagementData):
-                        # Successfully fetched appdetails
-                        if not result.tags:
-                            # No tags in response - can't validate, include the game
-                            games_list.append(GameSummary(**bulk_game))
-                        else:
-                            # Check if searched tag is in the game's tag list
-                            game_tag_names_lower = {t.lower() for t in result.tags.keys()}
-                            if tag_lower in game_tag_names_lower:
-                                # Tag confirmed - use bulk-parsed data for GameSummary (consistent field richness)
-                                games_list.append(GameSummary(**bulk_game))
-                            # else: Tag NOT found - this is a false positive, exclude it
-                    else:
-                        # Failed to fetch appdetails (APIError or Exception) - include game anyway
-                        # Can't verify it's a false positive, so err on the side of inclusion
-                        games_list.append(GameSummary(**bulk_game))
-
-                logger.info(f"Tag validation: {len(games_list)}/{len(bulk_games)} games confirmed with tag '{tag}'")
+            if len(data) < TAG_CROSSVAL_THRESHOLD:  # Used for logging only (cross-validation removed)
+                logger.info(f"Niche tag '{tag}': {len(data)} games from bulk endpoint (no cross-validation)")
             else:
-                # Broad tag: use bulk data as-is (no cross-validation for API efficiency)
-                logger.info(f"Broad tag '{tag}': {len(data)} games from bulk endpoint (>={TAG_CROSSVAL_THRESHOLD}, skipping cross-validation)")
-                for game_data in data.values():
-                    parsed = self._parse_game_data(game_data)
-                    games_list.append(GameSummary(**parsed))
+                logger.info(f"Broad tag '{tag}': {len(data)} games from bulk endpoint")
 
             # Sort by specified field
             sort_key_map = {
@@ -651,53 +607,16 @@ class SteamSpyClient:
                         message=f"Tag '{tag}' not recognized by SteamSpy. The API returned default results instead of matching games. Try a different tag name or check Steam's tag list."
                     )
 
-                if len(data) >= TAG_CROSSVAL_THRESHOLD:
-                    # Broad tag: use bulk data as-is (cross-validation too aggressive for large tags)
-                    for game_data in data.values():
-                        parsed = self._parse_game_data(game_data)
-                        games_list.append(GameEngagementSummary(**parsed))
-                    logger.info(f"Broad tag '{tag}': {len(games_list)} games from bulk endpoint (>={TAG_CROSSVAL_THRESHOLD}, skipping cross-validation)")
+                # Parse bulk data directly — no per-game cross-validation
+                # SteamSpy bulk endpoint is the source of truth for tag membership
+                for game_data in data.values():
+                    parsed = self._parse_game_data(game_data)
+                    games_list.append(GameEngagementSummary(**parsed))
+
+                if len(data) < TAG_CROSSVAL_THRESHOLD:  # Used for logging only (cross-validation removed)
+                    logger.info(f"Niche tag '{tag}': {len(data)} games from bulk endpoint (no cross-validation)")
                 else:
-                    # Niche tag: cross-validate via appdetails to filter irrelevant games
-                    bulk_games = []
-                    for game_data in data.values():
-                        parsed = self._parse_game_data(game_data)
-                        bulk_games.append(parsed)
-                    bulk_games.sort(key=lambda g: g["owners_midpoint"], reverse=True)
-
-                    # Validate all candidates via appdetails (which includes per-game tags)
-                    candidates = bulk_games
-                    candidate_appids = [g["appid"] for g in candidates]
-
-                    # Fetch appdetails concurrently for tag validation
-                    detail_tasks = [self.get_engagement_data(appid) for appid in candidate_appids]
-                    results = await asyncio.gather(*detail_tasks, return_exceptions=True)
-
-                    # Filter to games where searched tag is in their tag dict
-                    tag_lower = tag.lower()
-                    for appid, result in zip(candidate_appids, results):
-                        if isinstance(result, Exception):
-                            failures.append({"appid": appid, "reason": "exception"})
-                        elif isinstance(result, APIError):
-                            failures.append({"appid": appid, "reason": result.error_type})
-                        elif isinstance(result, EngagementData):
-                            game_tag_names_lower = {t.lower() for t in result.tags.keys()}
-                            if tag_lower in game_tag_names_lower:
-                                games_list.append(GameEngagementSummary(
-                                    appid=result.appid,
-                                    name=result.name,
-                                    ccu=result.ccu,
-                                    owners_midpoint=result.owners_midpoint,
-                                    average_forever=result.average_forever,
-                                    average_2weeks=result.average_2weeks,
-                                    positive=result.positive,
-                                    negative=result.negative,
-                                    review_score=result.review_score,
-                                    price=result.price,
-                                    tags=result.tags
-                                ))
-
-                    logger.info(f"Tag validation: {len(games_list)}/{len(candidates)} games confirmed with tag '{tag}'")
+                    logger.info(f"Broad tag '{tag}': {len(data)} games from bulk endpoint")
 
             except httpx.HTTPStatusError as e:
                 status = e.response.status_code

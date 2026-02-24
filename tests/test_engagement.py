@@ -1448,11 +1448,15 @@ class TestBowlingFallbackDetection:
 
 
 class TestTagCrossValidation:
-    """Test tag cross-validation in aggregate_engagement."""
+    """Test that aggregate_engagement uses bulk data directly (no per-game cross-validation)."""
 
     @pytest.mark.asyncio
     async def test_aggregate_filters_games_without_searched_tag(self, mock_http):
-        """Tag validation filters out games where searched tag is not in their tag list."""
+        """Niche tags use bulk data directly without per-game validation.
+
+        After removing cross-validation, ALL bulk games are returned regardless of
+        whether each individual game has the tag in its per-game tag list.
+        """
         # Bulk endpoint returns 5 games
         bulk_response = {
             "1": {"appid": 1, "name": "Game1", "owners": "100000 .. 200000", "ccu": 100, "positive": 500, "negative": 50, "average_forever": 600, "average_2weeks": 60, "median_forever": 300, "median_2weeks": 30, "price": "999"},
@@ -1462,52 +1466,28 @@ class TestTagCrossValidation:
             "5": {"appid": 5, "name": "Game5", "owners": "60000 .. 120000", "ccu": 60, "positive": 300, "negative": 30, "average_forever": 360, "average_2weeks": 36, "median_forever": 180, "median_2weeks": 18, "price": "599"},
         }
 
-        # Mock side_effect: bulk call returns 5 games, then appdetails for each
-        def mock_side_effect(*args, **kwargs):
-            params = kwargs.get("params", {})
-            if params.get("request") == "tag":
-                # Bulk endpoint call
-                return (bulk_response, datetime.now(timezone.utc), 0)
-            elif params.get("request") == "appdetails":
-                # Individual appdetails calls - games 1, 3, 5 have "Indie", 2 and 4 don't
-                appid = int(params.get("appid"))  # appid is passed as string
-                base_data = {
-                    "appid": appid,
-                    "name": f"Game{appid}",
-                    "owners": "100000 .. 200000",
-                    "ccu": 100,
-                    "positive": 500,
-                    "negative": 50,
-                    "average_forever": 600,
-                    "average_2weeks": 60,
-                    "median_forever": 300,
-                    "median_2weeks": 30,
-                    "price": "999"
-                }
-                if appid in [1, 3, 5]:
-                    base_data["tags"] = {"Indie": 100, "Action": 90}
-                else:
-                    base_data["tags"] = {"Action": 100, "Strategy": 90}
-                return (base_data, datetime.now(timezone.utc), 0)
-
-        mock_http.get_with_metadata.side_effect = mock_side_effect
+        # Only the bulk tag call — no appdetails calls needed
+        mock_http.get_with_metadata.return_value = (bulk_response, datetime.now(timezone.utc), 0)
 
         client = SteamSpyClient(mock_http)
         result = await client.aggregate_engagement(tag="Indie")
 
-        # Only 3 games (1, 3, 5) should be in results
+        # All 5 bulk games returned (no filtering)
         assert isinstance(result, AggregateEngagementData)
-        assert result.games_analyzed == 3
-        assert len(result.games) == 3
-        # Verify correct games made it through
+        assert result.games_analyzed == 5
+        assert len(result.games) == 5
+        # Verify all appids are in results
         appids_in_results = {g.appid for g in result.games}
-        assert appids_in_results == {1, 3, 5}
+        assert appids_in_results == {1, 2, 3, 4, 5}
 
     @pytest.mark.asyncio
     async def test_aggregate_tag_validation_bounded(self, mock_http):
-        """Tag validation fetches appdetails for all bulk results."""
+        """Niche tag returns all bulk games without per-game validation calls.
 
-        # Bulk endpoint returns 200 games (more than limit)
+        After removing cross-validation, only a single bulk endpoint call is made
+        (no per-game appdetails calls). All 200 games are returned directly.
+        """
+        # Bulk endpoint returns 200 games (niche tag: < TAG_CROSSVAL_THRESHOLD)
         bulk_response = {
             str(i): {
                 "appid": i,
@@ -1525,81 +1505,41 @@ class TestTagCrossValidation:
             for i in range(1, 201)
         }
 
-        appdetails_call_count = 0
-
-        def mock_side_effect(*args, **kwargs):
-            nonlocal appdetails_call_count
-            params = kwargs.get("params", {})
-            if params.get("request") == "tag":
-                return (bulk_response, datetime.now(timezone.utc), 0)
-            elif params.get("request") == "appdetails":
-                appdetails_call_count += 1
-                appid = int(params.get("appid"))  # appid is passed as string
-                return ({
-                    "appid": appid,
-                    "name": f"Game{appid}",
-                    "owners": "100000 .. 200000",
-                    "ccu": 100,
-                    "positive": 500,
-                    "negative": 50,
-                    "average_forever": 600,
-                    "average_2weeks": 60,
-                    "median_forever": 300,
-                    "median_2weeks": 30,
-                    "price": "999",
-                    "tags": {"Indie": 100}
-                }, datetime.now(timezone.utc), 0)
-
-        mock_http.get_with_metadata.side_effect = mock_side_effect
+        mock_http.get_with_metadata.return_value = (bulk_response, datetime.now(timezone.utc), 0)
 
         client = SteamSpyClient(mock_http)
         result = await client.aggregate_engagement(tag="Indie")
 
-        # Should validate all 200 bulk games (no cap)
-        assert appdetails_call_count == 200
+        # Only 1 HTTP call: the bulk tag call — no per-game appdetails calls
+        assert mock_http.get_with_metadata.call_count == 1
         assert isinstance(result, AggregateEngagementData)
+        # All 200 games returned
+        assert result.games_analyzed == 200
 
     @pytest.mark.asyncio
     async def test_aggregate_includes_tags_in_summary(self, mock_http):
-        """GameEngagementSummary includes tags dict from validated games."""
+        """Bulk endpoint does not provide per-game tags (tags require individual appdetails calls).
+
+        After removing cross-validation, bulk-parsed GameEngagementSummary objects
+        have tags={} since the SteamSpy tag bulk endpoint does not return per-game tag dicts.
+        """
         bulk_response = {
             "1": {"appid": 1, "name": "Game1", "owners": "100000 .. 200000", "ccu": 100, "positive": 500, "negative": 50, "average_forever": 600, "average_2weeks": 60, "median_forever": 300, "median_2weeks": 30, "price": "999"},
             "2": {"appid": 2, "name": "Game2", "owners": "90000 .. 180000", "ccu": 90, "positive": 450, "negative": 45, "average_forever": 540, "average_2weeks": 54, "median_forever": 270, "median_2weeks": 27, "price": "899"},
         }
 
-        def mock_side_effect(*args, **kwargs):
-            params = kwargs.get("params", {})
-            if params.get("request") == "tag":
-                return (bulk_response, datetime.now(timezone.utc), 0)
-            elif params.get("request") == "appdetails":
-                appid = int(params.get("appid"))  # appid is passed as string
-                return ({
-                    "appid": appid,
-                    "name": f"Game{appid}",
-                    "owners": "100000 .. 200000",
-                    "ccu": 100,
-                    "positive": 500,
-                    "negative": 50,
-                    "average_forever": 600,
-                    "average_2weeks": 60,
-                    "median_forever": 300,
-                    "median_2weeks": 30,
-                    "price": "999",
-                    "tags": {"Indie": 100, "Roguelike": 90, "Strategy": 80}
-                }, datetime.now(timezone.utc), 0)
-
-        mock_http.get_with_metadata.side_effect = mock_side_effect
+        # Only the bulk tag call
+        mock_http.get_with_metadata.return_value = (bulk_response, datetime.now(timezone.utc), 0)
 
         client = SteamSpyClient(mock_http)
         result = await client.aggregate_engagement(tag="Indie")
 
         assert isinstance(result, AggregateEngagementData)
         assert len(result.games) == 2
-        # Check that each game has tags
+        # Bulk endpoint does not return per-game tags — tags={} for all games
         for game in result.games:
             assert isinstance(game.tags, dict)
-            assert len(game.tags) > 0
-            assert "Indie" in game.tags or "indie" in {k.lower() for k in game.tags.keys()}
+            assert game.tags == {}
 
 
 # ---------------------------------------------------------------------------
