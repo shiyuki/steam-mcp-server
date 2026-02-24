@@ -40,12 +40,16 @@ from src.analytics import (
 from src.logging_config import get_logger
 from src.schemas import (
     AnalyzeMarketResult,
+    CompareMarketsResult,
     CompetitorComparison,
     ComputeTimingInfo,
     EvaluateGameResult,
     GamePercentiles,
     GameProfile,
+    MarketComparisonEntry,
     MarketHealthScores,
+    MetricDelta,
+    OverlapInfo,
     SkippedMetric,
     TagInsight,
 )
@@ -1511,6 +1515,429 @@ async def evaluate_game_analysis(
         pricing_context=pricing_context,
         historical_performance=historical_performance,
         genre_baseline=genre_baseline,
+        compute_time=compute_time,
+        warnings=warnings,
+        methodology=methodology,
+    )
+
+    return result_obj.model_dump()
+
+
+# ---------------------------------------------------------------------------
+# Compare Markets — Helper Functions
+# ---------------------------------------------------------------------------
+
+# Metric polarity: True = higher is better, False = lower is better
+_METRIC_HIGHER_IS_BETTER: dict[str, bool] = {
+    "total_games": True,
+    "avg_revenue": True,
+    "median_revenue": True,
+    "gini": False,
+    "success_rate_100k": True,
+    "top_10_share": False,
+    "growth_score": True,
+    "competition_score": True,
+    "accessibility_score": True,
+}
+
+
+def _extract_comparison_metrics(label: str, analysis: dict) -> dict[str, float | None]:
+    """Extract key numeric metrics from a market analysis dict for delta comparison.
+
+    Returns a flat dict of metric_name -> value.
+    """
+    values: dict[str, float | None] = {}
+
+    # Basic counts
+    values["total_games"] = analysis.get("total_games")
+
+    # Revenue from descriptive_stats
+    ds = analysis.get("descriptive_stats") or {}
+    rev_stats = ds.get("revenue") or {}
+    values["avg_revenue"] = rev_stats.get("mean")
+    values["median_revenue"] = rev_stats.get("median")
+
+    # Concentration
+    concentration = analysis.get("concentration") or {}
+    values["gini"] = concentration.get("gini")
+    top_shares = concentration.get("top_shares") or {}
+    top_10 = top_shares.get("top_10") or {}
+    values["top_10_share"] = top_10.get("share_pct")
+
+    # Success rates
+    success_rates = analysis.get("success_rates") or {}
+    thresholds = success_rates.get("thresholds") or {}
+    values["success_rate_100k"] = thresholds.get("100k")
+
+    # Health scores
+    health = analysis.get("health_scores") or {}
+    values["growth_score"] = health.get("growth")
+    values["competition_score"] = health.get("competition")
+    values["accessibility_score"] = health.get("accessibility")
+
+    return values
+
+
+def _compute_deltas(market_analyses: list[tuple[str, dict]]) -> list[MetricDelta]:
+    """Compare key numeric metrics across markets.
+
+    Args:
+        market_analyses: list of (label, analysis_dict) tuples
+
+    Returns:
+        list of MetricDelta objects, one per metric.
+    """
+    if len(market_analyses) < 2:
+        return []
+
+    # Extract per-market values
+    per_market: dict[str, dict[str, float | None]] = {}
+    for label, analysis in market_analyses:
+        per_market[label] = _extract_comparison_metrics(label, analysis)
+
+    deltas: list[MetricDelta] = []
+
+    for metric, higher_is_better in _METRIC_HIGHER_IS_BETTER.items():
+        values_dict: dict[str, float | None] = {
+            label: per_market[label].get(metric)
+            for label, _ in market_analyses
+        }
+
+        # Find winner: label with best value (non-None)
+        non_null = [(label, v) for label, v in values_dict.items() if v is not None]
+        if len(non_null) < 2:
+            # Not enough data to compare — still include metric, no winner/delta
+            deltas.append(MetricDelta(
+                metric=metric,
+                values=values_dict,
+                winner="",
+                delta_pct=None,
+            ))
+            continue
+
+        if higher_is_better:
+            winner_label, winner_val = max(non_null, key=lambda x: x[1])
+            loser_label, loser_val = min(non_null, key=lambda x: x[1])
+        else:
+            # Lower is better (gini, top_10_share)
+            winner_label, winner_val = min(non_null, key=lambda x: x[1])
+            loser_label, loser_val = max(non_null, key=lambda x: x[1])
+
+        # Delta pct: how much better is winner vs. worst
+        delta_pct: float | None = None
+        if loser_val is not None and loser_val != 0:
+            delta_pct = round(abs((winner_val - loser_val) / loser_val) * 100, 1)
+        elif loser_val == 0 and winner_val != 0:
+            delta_pct = None  # division by zero case
+
+        deltas.append(MetricDelta(
+            metric=metric,
+            values=values_dict,
+            winner=winner_label,
+            delta_pct=delta_pct,
+        ))
+
+    return deltas
+
+
+def _compute_overlap(
+    market_game_sets: list[tuple[str, list[dict]]],
+) -> tuple[list[OverlapInfo], OverlapInfo | None]:
+    """Compute pairwise and global game overlap between markets.
+
+    Args:
+        market_game_sets: list of (label, game_dicts) tuples
+
+    Returns:
+        (pairwise_overlaps, global_overlap)
+        - pairwise_overlaps: one OverlapInfo per unique pair
+        - global_overlap: games appearing in ALL markets (None if < 3 markets)
+    """
+    # Build appid sets per market
+    market_appids: list[tuple[str, set[int], list[dict]]] = []
+    for label, games in market_game_sets:
+        appid_set = {g.get("appid") for g in games if g.get("appid") is not None}
+        market_appids.append((label, appid_set, games))
+
+    pairwise: list[OverlapInfo] = []
+
+    # Pairwise comparisons
+    for i in range(len(market_appids)):
+        label_a, ids_a, games_a = market_appids[i]
+        for j in range(i + 1, len(market_appids)):
+            label_b, ids_b, games_b = market_appids[j]
+
+            shared_ids = ids_a & ids_b
+            if not shared_ids:
+                pairwise.append(OverlapInfo(
+                    pair=f"{label_a} vs {label_b}",
+                    overlap_count=0,
+                    overlap_games=[],
+                    pct_of_smaller_market=0.0,
+                ))
+                continue
+
+            smaller_market_size = min(len(ids_a), len(ids_b))
+            pct = round(len(shared_ids) / smaller_market_size * 100, 1) if smaller_market_size > 0 else 0.0
+
+            # Build GameProfile list for shared games (use market_a data as source)
+            shared_game_dicts = [g for g in games_a if g.get("appid") in shared_ids]
+            overlap_profiles = [_build_game_profile(g) for g in shared_game_dicts[:10]]
+
+            pairwise.append(OverlapInfo(
+                pair=f"{label_a} vs {label_b}",
+                overlap_count=len(shared_ids),
+                overlap_games=overlap_profiles,
+                pct_of_smaller_market=pct,
+            ))
+
+    # Global overlap (games in ALL markets) — only meaningful for 3+ markets
+    global_overlap: OverlapInfo | None = None
+    if len(market_appids) >= 3:
+        all_ids_sets = [ids for _, ids, _ in market_appids]
+        global_ids = all_ids_sets[0].copy()
+        for s in all_ids_sets[1:]:
+            global_ids &= s
+
+        smallest_market_size = min(len(ids) for _, ids, _ in market_appids)
+        global_pct = round(len(global_ids) / smallest_market_size * 100, 1) if smallest_market_size > 0 else 0.0
+
+        # Build profiles for global overlap games
+        first_label, first_ids, first_games = market_appids[0]
+        global_game_dicts = [g for g in first_games if g.get("appid") in global_ids]
+        global_profiles = [_build_game_profile(g) for g in global_game_dicts[:10]]
+
+        global_overlap = OverlapInfo(
+            pair=" vs ".join(label for label, _, _ in market_appids),
+            overlap_count=len(global_ids),
+            overlap_games=global_profiles,
+            pct_of_smaller_market=global_pct,
+        )
+
+    return pairwise, global_overlap
+
+
+def _compute_confidence_notes(market_analyses: list[tuple[str, dict]]) -> list[str]:
+    """Warn about potentially misleading comparisons.
+
+    Warns when:
+    - Size ratio > 5:1 between any two markets
+    - Any market has < 50 games
+    """
+    notes: list[str] = []
+
+    sizes = [(label, analysis.get("total_games", 0)) for label, analysis in market_analyses]
+
+    # Small market warning
+    for label, size in sizes:
+        if size < 50:
+            notes.append(
+                f"Market '{label}' has only {size} games — analysis may not be statistically reliable."
+            )
+
+    # Size ratio warning (pairwise)
+    for i in range(len(sizes)):
+        label_a, size_a = sizes[i]
+        for j in range(i + 1, len(sizes)):
+            label_b, size_b = sizes[j]
+            if size_a == 0 or size_b == 0:
+                continue
+            ratio = max(size_a, size_b) / min(size_a, size_b)
+            if ratio > 5.0:
+                larger = label_a if size_a > size_b else label_b
+                smaller = label_b if size_a > size_b else label_a
+                notes.append(
+                    f"Market size ratio between '{larger}' ({max(size_a, size_b)} games) "
+                    f"and '{smaller}' ({min(size_a, size_b)} games) is {ratio:.1f}x — "
+                    "comparisons may be skewed by sample size differences."
+                )
+
+    return notes
+
+
+def _rank_markets_by_health(market_analyses: list[tuple[str, dict]]) -> list[dict]:
+    """Rank markets by average health score (growth + competition + accessibility) / 3.
+
+    Returns list of dicts with label, avg_health, growth, competition, accessibility, rank.
+    Sorted by avg_health descending.
+    """
+    ranked: list[dict] = []
+    for label, analysis in market_analyses:
+        health = analysis.get("health_scores") or {}
+        growth = health.get("growth", 50)
+        competition = health.get("competition", 50)
+        accessibility = health.get("accessibility", 50)
+        avg_health = round((growth + competition + accessibility) / 3, 1)
+        ranked.append({
+            "label": label,
+            "avg_health": avg_health,
+            "growth": growth,
+            "competition": competition,
+            "accessibility": accessibility,
+        })
+
+    ranked.sort(key=lambda x: x["avg_health"], reverse=True)
+
+    # Add rank field (1-based)
+    for i, entry in enumerate(ranked):
+        entry["rank"] = i + 1
+
+    return ranked
+
+
+# ---------------------------------------------------------------------------
+# Compare Markets — Main Orchestration
+# ---------------------------------------------------------------------------
+
+async def compare_markets_analysis(
+    market_inputs: list[dict],
+    steamspy,
+    steam_store,
+    gamalytic,
+) -> dict:
+    """Compare 2-4 markets side-by-side with deltas, overlap detection, and ranking.
+
+    Each market_input dict must have:
+      - tags: list[str] — required, market tag query
+      - label: str — optional, human label for the market
+      - metrics: list[str] | None — optional metric filter (default: all)
+      - exclude: list[str] | None — optional metrics to exclude
+      - top_n: int — optional, number of top games (default: 10)
+
+    Returns a flat dict matching CompareMarketsResult schema.
+    """
+    total_start = time.monotonic()
+    warnings: list[str] = []
+
+    # Validate market count
+    if not (2 <= len(market_inputs) <= 4):
+        return {
+            "error": f"compare_markets requires 2-4 markets, got {len(market_inputs)}.",
+            "market_count": len(market_inputs),
+        }
+
+    # Fetch game lists and run analysis for each market
+    market_analyses: list[tuple[str, dict]] = []  # (label, analysis_dict)
+    market_game_sets: list[tuple[str, list[dict]]] = []  # (label, raw_games)
+
+    for idx, market_input in enumerate(market_inputs):
+        tags = market_input.get("tags") or []
+        if not tags:
+            warnings.append(f"Market {idx + 1} has no tags — skipping.")
+            continue
+
+        label = market_input.get("label") or ", ".join(tags)
+        metrics = market_input.get("metrics")
+        exclude = market_input.get("exclude")
+        top_n = market_input.get("top_n", 10)
+
+        # Fetch game list
+        fetch_start = time.monotonic()
+        games, data_source = await _fetch_game_list_steamspy(steamspy, steam_store, tags)
+        fetch_ms = round((time.monotonic() - fetch_start) * 1000)
+
+        if not games:
+            warnings.append(f"Market '{label}': no games found.")
+            analysis = {
+                "market_label": label,
+                "total_games": 0,
+                "error": "No games found for specified tags.",
+            }
+            market_analyses.append((label, analysis))
+            market_game_sets.append((label, []))
+            continue
+
+        # Run pure analysis
+        analysis = _run_market_analysis(
+            games=games,
+            tags=tags,
+            metrics=metrics,
+            exclude=exclude,
+            top_n=top_n,
+            include_raw=False,
+            market_label=label,
+            data_source=data_source,
+        )
+
+        # Attach fetch timing
+        if analysis.get("compute_time"):
+            analysis["compute_time"]["data_fetch_ms"] = fetch_ms
+
+        if "error" in analysis:
+            warnings.append(f"Market '{label}': {analysis['error']}")
+
+        market_analyses.append((label, analysis))
+        market_game_sets.append((label, games))
+
+    if not market_analyses:
+        return {
+            "error": "No markets could be analyzed.",
+            "market_count": 0,
+            "warnings": warnings,
+        }
+
+    # Compute deltas
+    valid_analyses = [(label, a) for label, a in market_analyses if "error" not in a]
+    deltas = _compute_deltas(valid_analyses) if len(valid_analyses) >= 2 else []
+
+    # Compute overlap
+    valid_game_sets = [(label, games) for label, a in market_analyses for gl, games in [(label, next(
+        (g for ml, g in market_game_sets if ml == label), []
+    ))]]
+    pairwise_overlap, global_overlap = _compute_overlap(market_game_sets)
+
+    # Confidence notes
+    confidence_notes = _compute_confidence_notes(market_analyses)
+
+    # Ranking by health score
+    overall_ranking = _rank_markets_by_health(valid_analyses) if valid_analyses else []
+
+    # Build health score comparison dict: {label -> health_dict}
+    health_score_comparison: dict[str, dict] = {}
+    for label, analysis in market_analyses:
+        health = analysis.get("health_scores") or {}
+        health_score_comparison[label] = health
+
+    # Build MarketComparisonEntry list (embed full analysis)
+    rank_lookup = {r["label"]: r["rank"] for r in overall_ranking}
+    market_entries: list[MarketComparisonEntry] = []
+    for label, analysis in market_analyses:
+        market_entries.append(MarketComparisonEntry(
+            market_label=label,
+            analysis=analysis,
+            rank=rank_lookup.get(label, 0),
+        ))
+
+    # Build timing
+    total_ms = round((time.monotonic() - total_start) * 1000)
+    compute_time = ComputeTimingInfo(
+        total_ms=total_ms,
+        per_metric={},
+        data_fetch_ms=0,
+    )
+
+    # Build methodology
+    methodology = {
+        "market_count": len(market_analyses),
+        "markets_analyzed": [label for label, _ in market_analyses],
+        "data_source": "steamspy",
+        "biases": list(STANDARD_BIASES),
+        "notes": [
+            "Each market runs analyze_market independently.",
+            "Overlap detection by Steam AppID (exact match).",
+            "Health scores computed independently per market.",
+        ],
+    }
+
+    result_obj = CompareMarketsResult(
+        market_count=len(market_analyses),
+        markets=market_entries,
+        deltas=deltas,
+        health_score_comparison=health_score_comparison,
+        overall_ranking=overall_ranking,
+        overlap=pairwise_overlap,
+        global_overlap=global_overlap,
+        confidence_notes=confidence_notes,
         compute_time=compute_time,
         warnings=warnings,
         methodology=methodology,
