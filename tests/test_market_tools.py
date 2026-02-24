@@ -1,0 +1,738 @@
+"""Tests for src/market_tools.py — pure sync, no HTTP mocking needed.
+
+Tests schemas, helpers, _run_market_analysis orchestration, and health scores.
+"""
+import time
+import pytest
+
+from src.schemas import (
+    AnalyzeMarketResult,
+    ComputeTimingInfo,
+    EvaluateGameResult,
+    GamePercentiles,
+    GameProfile,
+    MarketHealthScores,
+    SkippedMetric,
+)
+from src.market_tools import (
+    ANALYSIS_CACHE_TTL,
+    GAMALYTIC_QUOTA_HARD_WARN,
+    GAMALYTIC_QUOTA_WARN_THRESHOLD,
+    MIN_GAMES_THRESHOLD,
+    _analysis_cache,
+    _build_game_profile,
+    _cache_get,
+    _cache_set,
+    _compute_descriptive_stats,
+    _compute_health_scores,
+    _compute_tag_frequency,
+    _get_analysis_cache_key,
+    _percentile_rank,
+    _run_market_analysis,
+    _std_deviations_from_mean,
+    clear_analysis_cache,
+    get_gamalytic_call_count,
+    increment_gamalytic_counter,
+    reset_gamalytic_counter,
+)
+
+
+# ---------------------------------------------------------------------------
+# Test factory (module-level, not pytest fixtures)
+# ---------------------------------------------------------------------------
+
+def make_games(n=50, revenue_base=50000, with_tags=True):
+    """Generate n synthetic games with all fields required for market analysis."""
+    games = []
+    for i in range(1, n + 1):
+        tags = {"Action": 100, "Indie": 80, "Roguelike": 60} if with_tags else {}
+        games.append({
+            "appid": i,
+            "name": f"Game {i}",
+            "revenue": i * revenue_base,
+            "price": 4.99 + (i % 6) * 5,
+            "review_score": 50 + (i % 50),
+            "release_date": f"{2015 + (i % 10)}-{1 + (i % 12):02d}-15",
+            "tags": tags,
+            "developer": f"Dev{i}",
+            "publisher": f"Pub{i}" if i % 3 else f"Dev{i}",
+            "owners": i * 1000,
+            "ccu": i * 10,
+            "median_forever": i * 2.5,
+            "followers": i * 500 if i % 2 else None,
+            "copies_sold": i * 3000 if i % 2 else None,
+            "positive": i * 200,
+            "negative": i * 10,
+        })
+    return games
+
+
+# ---------------------------------------------------------------------------
+# TestSchemas — 8 tests
+# ---------------------------------------------------------------------------
+
+class TestSchemas:
+    def test_game_profile_defaults(self):
+        """GameProfile can be instantiated with minimal required fields."""
+        gp = GameProfile(appid=1, name="Test Game")
+        assert gp.appid == 1
+        assert gp.name == "Test Game"
+        assert gp.revenue is None
+        assert gp.review_score is None
+        assert gp.release_date is None
+        assert gp.tags == {}
+        assert gp.developer == ""
+        assert gp.publisher == ""
+
+    def test_game_profile_full(self):
+        """GameProfile stores all optional fields correctly."""
+        gp = GameProfile(
+            appid=123,
+            name="Full Game",
+            revenue=500000.0,
+            review_score=87.5,
+            release_date="2022-05-15",
+            owners=50000.0,
+            ccu=1200,
+            median_playtime=12.5,
+            followers=3000,
+            copies_sold=10000,
+            price=19.99,
+            tags={"Action": 100, "Indie": 80},
+            developer="DevCo",
+            publisher="PubCo",
+        )
+        assert gp.revenue == 500000.0
+        assert gp.price == 19.99
+        assert gp.tags == {"Action": 100, "Indie": 80}
+        assert gp.median_playtime == 12.5
+
+    def test_analyze_market_result_flat_structure(self):
+        """AnalyzeMarketResult instantiates with defaults and all metric fields at top level."""
+        result = AnalyzeMarketResult(market_label="Test", total_games=50)
+        assert result.market_label == "Test"
+        assert result.total_games == 50
+        assert result.concentration is None
+        assert result.temporal_trends is None
+        assert result.price_brackets is None
+        assert result.success_rates is None
+        assert result.tag_multipliers is None
+        assert result.score_revenue is None
+        assert result.publisher_analysis is None
+        assert result.release_timing is None
+        assert result.sub_genres is None
+        assert result.competitive_density is None
+        assert result.health_scores is None
+        assert result.skipped_metrics == []
+
+    def test_skipped_metric(self):
+        """SkippedMetric stores metric name and reason."""
+        sm = SkippedMetric(metric="tag_multipliers", reason="insufficient data")
+        assert sm.metric == "tag_multipliers"
+        assert sm.reason == "insufficient data"
+
+    def test_market_health_scores_defaults(self):
+        """MarketHealthScores defaults all to neutral 50."""
+        scores = MarketHealthScores()
+        assert scores.growth == 50
+        assert scores.competition == 50
+        assert scores.accessibility == 50
+
+    def test_game_percentiles_all_none(self):
+        """GamePercentiles can be instantiated with all None values."""
+        gp = GamePercentiles()
+        assert gp.revenue is None
+        assert gp.review_score is None
+        assert gp.median_playtime is None
+        assert gp.ccu is None
+        assert gp.followers is None
+        assert gp.copies_sold is None
+        assert gp.review_count is None
+
+    def test_evaluate_game_result_defaults(self):
+        """EvaluateGameResult has correct default values."""
+        r = EvaluateGameResult(appid=1, name="Test")
+        assert r.appid == 1
+        assert r.name == "Test"
+        assert r.genre == ""
+        assert r.position_score == 50.0
+        assert r.potential_score == 50.0
+        assert r.opportunity_score == 50.0
+        assert r.strengths == []
+        assert r.weaknesses == []
+        assert r.competitors == []
+        assert r.tag_insights == []
+
+    def test_compute_timing_info(self):
+        """ComputeTimingInfo stores timing data correctly."""
+        t = ComputeTimingInfo(total_ms=250, per_metric={"concentration": 50}, data_fetch_ms=100)
+        assert t.total_ms == 250
+        assert t.per_metric["concentration"] == 50
+        assert t.data_fetch_ms == 100
+
+
+# ---------------------------------------------------------------------------
+# TestPercentileRank — 6 tests
+# ---------------------------------------------------------------------------
+
+class TestPercentileRank:
+    def test_basic_middle(self):
+        """50 in a 10-100 population: 4 values strictly below -> 40.0%."""
+        population = list(range(10, 110, 10))  # [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+        result = _percentile_rank(50, population)
+        assert result == 40.0  # 4 values < 50: [10,20,30,40]
+
+    def test_top_value(self):
+        """Top value (100) in 10..100: 9 values strictly below -> 90.0%."""
+        population = list(range(10, 110, 10))
+        result = _percentile_rank(100, population)
+        assert result == 90.0
+
+    def test_bottom_value(self):
+        """Minimum value (10) in 10..100: 0 values strictly below -> 0.0%."""
+        population = list(range(10, 110, 10))
+        result = _percentile_rank(10, population)
+        assert result == 0.0
+
+    def test_none_value(self):
+        """None value returns None."""
+        result = _percentile_rank(None, [10, 20, 30])
+        assert result is None
+
+    def test_empty_population(self):
+        """Empty population returns None."""
+        result = _percentile_rank(50, [])
+        assert result is None
+
+    def test_single_value_population(self):
+        """Single-element population: value == that element -> 0.0% (none below)."""
+        result = _percentile_rank(42, [42])
+        assert result == 0.0
+
+
+# ---------------------------------------------------------------------------
+# TestStdDeviations — 6 tests
+# ---------------------------------------------------------------------------
+
+class TestStdDeviations:
+    def test_above_mean(self):
+        """Value above mean returns positive deviation."""
+        pop = [10.0, 20.0, 30.0, 40.0, 50.0]
+        # mean=30, stdev ~ 15.81
+        result = _std_deviations_from_mean(50.0, pop)
+        assert result is not None
+        assert result > 0
+
+    def test_below_mean(self):
+        """Value below mean returns negative deviation."""
+        pop = [10.0, 20.0, 30.0, 40.0, 50.0]
+        result = _std_deviations_from_mean(10.0, pop)
+        assert result is not None
+        assert result < 0
+
+    def test_at_mean(self):
+        """Value at mean returns ~0.0."""
+        pop = [10.0, 20.0, 30.0, 40.0, 50.0]
+        result = _std_deviations_from_mean(30.0, pop)
+        assert result is not None
+        assert abs(result) < 0.01
+
+    def test_none_value(self):
+        """None value returns None."""
+        result = _std_deviations_from_mean(None, [1.0, 2.0, 3.0])
+        assert result is None
+
+    def test_insufficient_data(self):
+        """Single-element population returns None (need >= 2)."""
+        result = _std_deviations_from_mean(5.0, [5.0])
+        assert result is None
+
+    def test_zero_stdev(self):
+        """Population with zero stdev (all same values) returns 0.0."""
+        pop = [5.0, 5.0, 5.0, 5.0, 5.0]
+        result = _std_deviations_from_mean(5.0, pop)
+        assert result == 0.0
+
+
+# ---------------------------------------------------------------------------
+# TestDescriptiveStats — 3 tests
+# ---------------------------------------------------------------------------
+
+class TestDescriptiveStats:
+    def test_basic_stats(self):
+        """Computes mean/median/stdev/min/max for all four fields."""
+        games = make_games(20)
+        stats = _compute_descriptive_stats(games)
+        assert "revenue" in stats
+        assert "price" in stats
+        assert "review_score" in stats
+        assert "ccu" in stats
+        # Revenue stats should all be non-None with 20 games
+        rev = stats["revenue"]
+        assert rev["mean"] is not None
+        assert rev["median"] is not None
+        assert rev["stdev"] is not None
+        assert rev["count"] == 20
+        assert rev["coverage_pct"] == 100.0
+
+    def test_partial_coverage(self):
+        """Fields with some None values compute partial coverage_pct."""
+        games = make_games(10)
+        # Set ccu to None for half the games
+        for g in games[:5]:
+            g["ccu"] = None
+        stats = _compute_descriptive_stats(games)
+        ccu_stats = stats["ccu"]
+        assert ccu_stats["count"] == 5
+        assert ccu_stats["coverage_pct"] == 50.0
+
+    def test_empty_field(self):
+        """Field with all None values returns zeros and None stats."""
+        games = make_games(5)
+        for g in games:
+            g["ccu"] = None
+        stats = _compute_descriptive_stats(games)
+        ccu_stats = stats["ccu"]
+        assert ccu_stats["count"] == 0
+        assert ccu_stats["mean"] is None
+        assert ccu_stats["coverage_pct"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# TestTagFrequency — 6 tests
+# ---------------------------------------------------------------------------
+
+class TestTagFrequency:
+    def test_basic_frequency(self):
+        """Tags are counted and returned sorted by count descending."""
+        games = make_games(10)
+        result = _compute_tag_frequency(games)
+        assert len(result) > 0
+        # Should be sorted by count descending
+        counts = [entry["count"] for entry in result]
+        assert counts == sorted(counts, reverse=True)
+
+    def test_excludes_primary_tags(self):
+        """Primary tags are excluded from the result."""
+        games = make_games(10)
+        result = _compute_tag_frequency(games, primary_tags={"Action"})
+        tag_names = [entry["tag"] for entry in result]
+        assert "Action" not in tag_names
+
+    def test_dict_tags(self):
+        """Dict tags (tag->weight) are handled correctly."""
+        games = [
+            {"appid": 1, "tags": {"Action": 100, "Indie": 80}},
+            {"appid": 2, "tags": {"Action": 90, "RPG": 60}},
+        ]
+        result = _compute_tag_frequency(games)
+        action_entry = next((e for e in result if e["tag"] == "Action"), None)
+        assert action_entry is not None
+        assert action_entry["count"] == 2
+
+    def test_list_tags(self):
+        """List tags are handled correctly."""
+        games = [
+            {"appid": 1, "tags": ["Action", "Indie"]},
+            {"appid": 2, "tags": ["Action", "RPG"]},
+        ]
+        result = _compute_tag_frequency(games)
+        action_entry = next((e for e in result if e["tag"] == "Action"), None)
+        assert action_entry is not None
+        assert action_entry["count"] == 2
+
+    def test_empty_games(self):
+        """Empty game list returns empty result."""
+        result = _compute_tag_frequency([])
+        assert result == []
+
+    def test_top_n_limit(self):
+        """top_n parameter limits the result count."""
+        games = make_games(20)
+        result = _compute_tag_frequency(games, top_n=2)
+        assert len(result) <= 2
+
+
+# ---------------------------------------------------------------------------
+# TestAnalysisCache — 5 tests
+# ---------------------------------------------------------------------------
+
+class TestAnalysisCache:
+    def setup_method(self):
+        """Clear cache before each test."""
+        clear_analysis_cache()
+
+    def test_set_and_get(self):
+        """Cache set then get returns the stored value."""
+        key = "test_key_1"
+        data = {"market_label": "Test", "total_games": 50}
+        _cache_set(key, data)
+        result = _cache_get(key)
+        assert result == data
+
+    def test_expired_entry(self, monkeypatch):
+        """Expired cache entry returns None and is removed."""
+        key = "test_key_exp"
+        data = {"market_label": "Expired"}
+        _cache_set(key, data)
+        # Monkey-patch time.monotonic to simulate expiry
+        future_time = time.monotonic() + ANALYSIS_CACHE_TTL + 1
+        monkeypatch.setattr("src.market_tools.time.monotonic", lambda: future_time)
+        result = _cache_get(key)
+        assert result is None
+        # Should have been deleted from cache
+        assert key not in _analysis_cache
+
+    def test_miss(self):
+        """Cache miss returns None."""
+        result = _cache_get("nonexistent_key_xyz")
+        assert result is None
+
+    def test_key_deterministic(self):
+        """Same tag and params always produce the same cache key."""
+        key1 = _get_analysis_cache_key("action", {"metrics": ["concentration"]})
+        key2 = _get_analysis_cache_key("action", {"metrics": ["concentration"]})
+        assert key1 == key2
+
+    def test_clear(self):
+        """clear_analysis_cache removes all entries."""
+        _cache_set("a", {"x": 1})
+        _cache_set("b", {"y": 2})
+        clear_analysis_cache()
+        assert _cache_get("a") is None
+        assert _cache_get("b") is None
+
+
+# ---------------------------------------------------------------------------
+# TestGamalyticQuota — 4 tests
+# ---------------------------------------------------------------------------
+
+class TestGamalyticQuota:
+    def setup_method(self):
+        """Reset counter before each test."""
+        reset_gamalytic_counter()
+
+    def test_below_threshold(self):
+        """Below soft threshold returns None."""
+        result = increment_gamalytic_counter(10)
+        assert result is None
+        assert get_gamalytic_call_count() == 10
+
+    def test_at_soft_threshold(self):
+        """At soft threshold returns soft warning string."""
+        increment_gamalytic_counter(GAMALYTIC_QUOTA_WARN_THRESHOLD - 1)
+        result = increment_gamalytic_counter(1)
+        assert result is not None
+        assert "Approaching" in result
+        assert str(GAMALYTIC_QUOTA_WARN_THRESHOLD) in result
+
+    def test_above_hard_threshold(self):
+        """Above hard threshold returns hard warning string."""
+        increment_gamalytic_counter(GAMALYTIC_QUOTA_HARD_WARN - 1)
+        result = increment_gamalytic_counter(1)
+        assert result is not None
+        assert "WARNING" in result
+
+    def test_reset(self):
+        """reset_gamalytic_counter resets to zero."""
+        increment_gamalytic_counter(300)
+        assert get_gamalytic_call_count() == 300
+        reset_gamalytic_counter()
+        assert get_gamalytic_call_count() == 0
+
+
+# ---------------------------------------------------------------------------
+# TestRunMarketAnalysis — 16 tests
+# ---------------------------------------------------------------------------
+
+class TestRunMarketAnalysis:
+    def test_insufficient_games_returns_error(self):
+        """15 games (below threshold of 20) returns an error dict."""
+        games = make_games(15)
+        result = _run_market_analysis(games, tags=["Action"])
+        assert "error" in result
+        assert "Insufficient" in result["error"]
+        assert result["total_games"] == 15
+
+    def test_minimum_20_games_succeeds(self):
+        """Exactly 20 games returns a valid result (no 'error' key)."""
+        games = make_games(20)
+        result = _run_market_analysis(games, tags=["Action"])
+        assert "error" not in result
+        assert result["total_games"] == 20
+
+    def test_full_50_games_all_metrics(self):
+        """50 games runs all 10 analytics metrics."""
+        games = make_games(50)
+        result = _run_market_analysis(games, tags=["Action"])
+        assert "error" not in result
+        assert result["total_games"] == 50
+        # With 50 games, concentration should be computed
+        assert result["concentration"] is not None
+
+    def test_metrics_filter(self):
+        """Specifying metrics=['concentration'] only computes that metric."""
+        games = make_games(50)
+        result = _run_market_analysis(games, tags=["Action"], metrics=["concentration"])
+        assert result["concentration"] is not None
+        # Other metrics should be skipped
+        # Some will be in skipped_metrics as "not requested"
+        skipped_names = [s["metric"] for s in result["skipped_metrics"]]
+        assert "temporal_trends" in skipped_names
+
+    def test_exclude_filter(self):
+        """Excluding a metric marks it as skipped."""
+        games = make_games(50)
+        result = _run_market_analysis(games, tags=["Action"], exclude=["concentration"])
+        assert result["concentration"] is None
+        skipped_names = [s["metric"] for s in result["skipped_metrics"]]
+        assert "concentration" in skipped_names
+
+    def test_top_games_count(self):
+        """top_n parameter controls number of top games returned."""
+        games = make_games(50)
+        result = _run_market_analysis(games, tags=["Action"], top_n=5)
+        assert len(result["top_games"]) == 5
+
+    def test_top_games_sorted_by_revenue(self):
+        """Top games are sorted by revenue descending."""
+        games = make_games(50)
+        result = _run_market_analysis(games, tags=["Action"], top_n=5)
+        revenues = [g["revenue"] for g in result["top_games"] if g.get("revenue") is not None]
+        assert revenues == sorted(revenues, reverse=True)
+
+    def test_skipped_metrics_present(self):
+        """Skipped metrics list is present in result."""
+        games = make_games(20)  # only 20 games -> many metrics skipped
+        result = _run_market_analysis(games, tags=["Action"])
+        assert "skipped_metrics" in result
+        assert isinstance(result["skipped_metrics"], list)
+        assert len(result["skipped_metrics"]) > 0
+
+    def test_skipped_has_reason(self):
+        """Each skipped metric has a non-empty reason string."""
+        games = make_games(20)
+        result = _run_market_analysis(games, tags=["Action"])
+        for skipped in result["skipped_metrics"]:
+            assert "reason" in skipped
+            assert len(skipped["reason"]) > 0
+
+    def test_coverage_pct(self):
+        """coverage_pct reflects the fraction of games with revenue data."""
+        games = make_games(20)
+        # Remove revenue from half the games
+        for g in games[:10]:
+            g["revenue"] = None
+        result = _run_market_analysis(games, tags=["Action"])
+        assert "error" not in result
+        assert result["games_with_revenue"] == 10
+        assert result["coverage_pct"] == 50.0
+
+    def test_health_scores_present(self):
+        """health_scores dict is always present in result."""
+        games = make_games(20)
+        result = _run_market_analysis(games, tags=["Action"])
+        assert "health_scores" in result
+        assert result["health_scores"] is not None
+        health = result["health_scores"]
+        assert "growth" in health
+        assert "competition" in health
+        assert "accessibility" in health
+
+    def test_include_raw(self):
+        """include_raw=True attaches raw game dicts to result."""
+        games = make_games(20)
+        result = _run_market_analysis(games, tags=["Action"], include_raw=True)
+        assert result["raw_data"] is not None
+        assert len(result["raw_data"]) == 20
+
+    def test_custom_label(self):
+        """market_label parameter sets the label in result."""
+        games = make_games(20)
+        result = _run_market_analysis(games, tags=["Action"], market_label="My Market")
+        assert result["market_label"] == "My Market"
+
+    def test_auto_label_from_tags(self):
+        """Without market_label, label is derived from tags."""
+        games = make_games(20)
+        result = _run_market_analysis(games, tags=["Action", "Roguelike"])
+        assert "Action" in result["market_label"]
+        assert "Roguelike" in result["market_label"]
+
+    def test_timing_present(self):
+        """compute_time is included in the result."""
+        games = make_games(20)
+        result = _run_market_analysis(games, tags=["Action"])
+        assert "compute_time" in result
+        ct = result["compute_time"]
+        assert ct is not None
+        assert "total_ms" in ct
+        assert ct["total_ms"] >= 0
+
+    def test_methodology_present(self):
+        """methodology dict is present and has key fields."""
+        games = make_games(20)
+        result = _run_market_analysis(games, tags=["Action"])
+        assert "methodology" in result
+        m = result["methodology"]
+        assert "data_source" in m
+        assert "total_games_analyzed" in m
+        assert m["total_games_analyzed"] == 20
+
+
+# ---------------------------------------------------------------------------
+# TestHealthScores — 7 tests
+# ---------------------------------------------------------------------------
+
+class TestHealthScores:
+    def _make_analysis(self, concentration=None, temporal=None, price_brackets=None, success_rates=None):
+        """Helper: build minimal analysis dict for _compute_health_scores."""
+        return {
+            "concentration": concentration,
+            "temporal_trends": temporal,
+            "price_brackets": price_brackets,
+            "success_rates": success_rates,
+        }
+
+    def test_monopoly_low_competition(self):
+        """High Gini (monopoly) produces low competition score."""
+        analysis = self._make_analysis(
+            concentration={"gini": 0.9, "top_shares": {}}
+        )
+        scores = _compute_health_scores(analysis)
+        assert scores.competition <= 15  # (1 - 0.9) * 100 = 10
+
+    def test_distributed_high_competition(self):
+        """Low Gini (distributed) produces high competition score."""
+        analysis = self._make_analysis(
+            concentration={"gini": 0.1, "top_shares": {}}
+        )
+        scores = _compute_health_scores(analysis)
+        assert scores.competition >= 85  # (1 - 0.1) * 100 = 90
+
+    def test_growing_market_high_growth(self):
+        """Recent years with higher avg_revenue produce growth > 50."""
+        yearly = [
+            {"year": 2018, "avg_revenue": 10000, "game_count": 10, "partial": False},
+            {"year": 2019, "avg_revenue": 12000, "game_count": 11, "partial": False},
+            {"year": 2022, "avg_revenue": 50000, "game_count": 20, "partial": False},
+            {"year": 2023, "avg_revenue": 60000, "game_count": 25, "partial": False},
+        ]
+        analysis = self._make_analysis(
+            temporal={"yearly": yearly}
+        )
+        scores = _compute_health_scores(analysis)
+        assert scores.growth > 50
+
+    def test_declining_market_low_growth(self):
+        """Recent years with lower avg_revenue produce growth < 50."""
+        yearly = [
+            {"year": 2018, "avg_revenue": 80000, "game_count": 30, "partial": False},
+            {"year": 2019, "avg_revenue": 70000, "game_count": 28, "partial": False},
+            {"year": 2022, "avg_revenue": 20000, "game_count": 10, "partial": False},
+            {"year": 2023, "avg_revenue": 15000, "game_count": 8, "partial": False},
+        ]
+        analysis = self._make_analysis(
+            temporal={"yearly": yearly}
+        )
+        scores = _compute_health_scores(analysis)
+        assert scores.growth < 50
+
+    def test_accessible_market(self):
+        """High affordable % + good success rate produces accessibility > 50."""
+        analysis = self._make_analysis(
+            price_brackets={
+                "brackets": [
+                    {"label": "f2p", "count": 20},
+                    {"label": "0.01_4.99", "count": 20},
+                    {"label": "5_9.99", "count": 10},
+                    {"label": "25_29.99", "count": 5},
+                ]
+            },
+            success_rates={
+                "thresholds": {"100k": 40.0}  # 40% success rate
+            }
+        )
+        scores = _compute_health_scores(analysis)
+        assert scores.accessibility > 50
+
+    def test_no_data_neutral(self):
+        """No analysis data produces all neutral scores (50)."""
+        analysis = self._make_analysis()
+        scores = _compute_health_scores(analysis)
+        assert scores.growth == 50
+        assert scores.competition == 50
+        assert scores.accessibility == 50
+
+    def test_clamped_0_100(self):
+        """Extreme values are clamped to 0-100 range."""
+        # Extremely high success rate
+        analysis = self._make_analysis(
+            price_brackets={
+                "brackets": [
+                    {"label": "f2p", "count": 1000},
+                ]
+            },
+            success_rates={"thresholds": {"100k": 100.0}},
+            concentration={"gini": 0.0},
+        )
+        scores = _compute_health_scores(analysis)
+        assert 0 <= scores.growth <= 100
+        assert 0 <= scores.competition <= 100
+        assert 0 <= scores.accessibility <= 100
+
+
+# ---------------------------------------------------------------------------
+# TestBuildGameProfile — 3 tests
+# ---------------------------------------------------------------------------
+
+class TestBuildGameProfile:
+    def test_full_dict(self):
+        """All game dict fields are mapped to GameProfile correctly."""
+        game = {
+            "appid": 42,
+            "name": "Test Game",
+            "revenue": 123456.0,
+            "review_score": 85.0,
+            "release_date": "2021-03-15",
+            "owners": 20000.0,
+            "ccu": 500,
+            "median_forever": 10.5,
+            "followers": 1500,
+            "copies_sold": 5000,
+            "price": 14.99,
+            "tags": {"Action": 100, "Indie": 80},
+            "developer": "DevCo",
+            "publisher": "PubCo",
+        }
+        profile = _build_game_profile(game)
+        assert profile.appid == 42
+        assert profile.name == "Test Game"
+        assert profile.revenue == 123456.0
+        assert profile.review_score == 85.0
+        assert profile.release_date == "2021-03-15"
+        assert profile.owners == 20000.0
+        assert profile.ccu == 500
+        assert profile.median_playtime == 10.5  # median_forever -> median_playtime
+        assert profile.followers == 1500
+        assert profile.copies_sold == 5000
+        assert profile.price == 14.99
+        assert profile.tags == {"Action": 100, "Indie": 80}
+        assert profile.developer == "DevCo"
+        assert profile.publisher == "PubCo"
+
+    def test_minimal_dict(self):
+        """Minimal dict (only appid) maps safely with None/defaults."""
+        game = {"appid": 99}
+        profile = _build_game_profile(game)
+        assert profile.appid == 99
+        assert profile.name == ""
+        assert profile.revenue is None
+        assert profile.tags == {}
+
+    def test_median_forever_mapping(self):
+        """median_forever in game dict maps to median_playtime in GameProfile."""
+        game = {"appid": 1, "median_forever": 42.5}
+        profile = _build_game_profile(game)
+        # The field mapping: game["median_forever"] -> profile.median_playtime
+        assert profile.median_playtime == 42.5
