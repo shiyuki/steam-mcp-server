@@ -11,6 +11,14 @@ from src.rate_limiter import HostRateLimiter
 from src.steam_api import SteamSpyClient, SteamStoreClient, GamalyticClient, SteamReviewClient
 from src.schemas import APIError, SearchResult, GameSummary, EngagementData
 from src.logging_config import get_logger
+from src.market_tools import (
+    analyze_market_phase1,
+    analyze_market_phase2,
+    evaluate_game_analysis,
+    compare_markets_analysis,
+    _fetch_game_list_steamspy,
+    increment_gamalytic_counter,
+)
 
 logger = get_logger(__name__)
 
@@ -698,3 +706,349 @@ def register_tools(mcp: FastMCP):
             )
 
         return json.dumps(result.model_dump(), default=str)
+
+    # --- Phase 9: Market Analysis Tools ---
+
+    async def _fetch_game_list_for_analysis(tags):
+        """Fetch flat game dict list from SteamSpy/Steam Store for the given tags."""
+        games, data_source = await _fetch_game_list_steamspy(_steamspy, _steam_store, tags)
+        return games
+
+    @mcp.tool()
+    async def analyze_market(
+        genre: str = "",
+        appids: str = "",
+        metrics: str = "",
+        exclude: str = "",
+        top_n: int = 10,
+        include_raw: bool = False,
+        market_label: str = "",
+        continuation_token: str = "",
+    ) -> str:
+        """Compute full market analytics for a Steam genre or custom game list.
+
+        Returns concentration, temporal trends, price brackets, tag multipliers,
+        score-revenue correlation, publisher analysis, release timing, sub-genres,
+        competitive density, health scores, and top games in a single response.
+
+        Two-phase response pattern:
+        - Phase 1 (default): Returns SteamSpy-based analytics + continuation_token
+        - Phase 2 (with token): Adds Gamalytic cross-validation data
+        Claude should auto-continue Phase 2 after presenting Phase 1 results.
+
+        Args:
+            genre: Steam tag (e.g., "Roguelike") or comma-separated tags for intersection
+                   (e.g., "Roguelike, Deckbuilder"). Mutually exclusive with appids.
+            appids: Comma-separated Steam AppIDs for custom game list. Mutually exclusive with genre.
+            metrics: Comma-separated metric names to compute (allowlist).
+                     Valid: concentration, temporal_trends, price_brackets, success_rates,
+                     tag_multipliers, score_revenue, publisher_analysis, release_timing,
+                     sub_genres, competitive_density. Empty = compute all available.
+            exclude: Comma-separated metric names to skip (blocklist). Applied after metrics.
+            top_n: Number of top games to include (default 10). Set higher for full leaderboard.
+            include_raw: If true, embed full game-level data array in response.
+            market_label: Custom label for this market (auto-generated if empty).
+            continuation_token: Pass token from Phase 1 response to get Phase 2 (Gamalytic enrichment).
+
+        Returns:
+            JSON with flat analytics structure: total_games, coverage, each metric result at
+            top level, health_scores, top_games, skipped_metrics, methodology, compute_time.
+        """
+        # Phase 2: continuation
+        if continuation_token.strip():
+            try:
+                result = await analyze_market_phase2(_gamalytic, continuation_token.strip())
+                return json.dumps(result, default=str)
+            except Exception as e:
+                logger.error("analyze_market phase 2 failed: %s", e)
+                return json.dumps({"error": str(e), "error_type": "phase2_error"})
+
+        # Input validation
+        genre = genre.strip()
+        appids_str = appids.strip()
+
+        if not genre and not appids_str:
+            return json.dumps({"error": "Either genre or appids must be provided", "error_type": "validation"})
+
+        if genre and appids_str:
+            return json.dumps({"error": "Provide either genre or appids, not both", "error_type": "validation"})
+
+        # Parse metrics/exclude
+        metrics_list = [m.strip() for m in metrics.split(",") if m.strip()] if metrics.strip() else None
+        exclude_list = [m.strip() for m in exclude.split(",") if m.strip()] if exclude.strip() else None
+
+        # Parse tags
+        tags = [t.strip() for t in genre.split(",") if t.strip()] if genre else []
+
+        # Parse appid list
+        appid_list = None
+        if appids_str:
+            try:
+                appid_list = [int(a.strip()) for a in appids_str.split(",") if a.strip()]
+                if not appid_list:
+                    return json.dumps({"error": "appids list is empty", "error_type": "validation"})
+                if any(a <= 0 for a in appid_list):
+                    return json.dumps({"error": "All appids must be positive", "error_type": "validation"})
+            except ValueError:
+                return json.dumps({"error": "appids must be comma-separated integers", "error_type": "validation"})
+
+        logger.info(
+            "analyze_market: genre=%s, appids=%d, top_n=%d",
+            genre or "N/A",
+            len(appid_list or []),
+            top_n,
+        )
+
+        try:
+            result = await analyze_market_phase1(
+                steamspy=_steamspy,
+                steam_store=_steam_store,
+                gamalytic=_gamalytic,
+                tags=tags,
+                appids=appid_list,
+                metrics=metrics_list,
+                exclude=exclude_list,
+                top_n=top_n,
+                include_raw=include_raw,
+                market_label=market_label,
+            )
+            return json.dumps(result, default=str)
+        except Exception as e:
+            logger.error("analyze_market failed: %s", e)
+            return json.dumps({"error": str(e), "error_type": "analysis_error"})
+
+    @mcp.tool()
+    async def evaluate_game(
+        appid: int = 0,
+        genre: str = "",
+        price_tier: str = "",
+    ) -> str:
+        """Evaluate a Steam game against genre benchmarks with percentile rankings.
+
+        Returns percentile rankings for revenue, review score, playtime, CCU,
+        followers, copies sold, and review count. Identifies strengths and weaknesses
+        (metrics >1 standard deviation from genre mean). Computes opportunity score
+        (position + potential) calibrated to tiers: 90-100 exceptional, 75-89 strong,
+        60-74 moderate, 40-59 neutral, 20-39 competitive risk, 0-19 significant disadvantage.
+
+        Also provides: competitor identification (3-5 similar games), tag insights
+        (revenue multiplier per tag), genre fit analysis, pricing context (where game
+        sits on genre's price-revenue curve), review sentiment summary, and historical
+        performance trends.
+
+        Args:
+            appid: Steam AppID of the game to evaluate (required, must be positive).
+            genre: Genre to evaluate against (required). Single tag or comma-separated
+                   for intersection (e.g., "Roguelike, Deckbuilder").
+            price_tier: Optional price tier filter for percentile comparison.
+                        Values: "f2p", "0.01_4.99", "5_9.99", "10_14.99", "15_19.99",
+                        "20_29.99", "30_plus". Empty = full genre (default).
+
+        Returns:
+            JSON with percentiles, strengths, weaknesses, opportunity_score (with position
+            and potential breakdown), competitors, tag_insights, genre_fit, pricing_context,
+            review_sentiment, historical_performance, genre_baseline.
+        """
+        if appid <= 0:
+            return json.dumps({"error": "appid must be positive", "error_type": "validation"})
+
+        if not genre.strip():
+            return json.dumps({"error": "genre is required", "error_type": "validation"})
+
+        genre_tags = [t.strip() for t in genre.split(",") if t.strip()]
+
+        logger.info("evaluate_game: appid=%d, genre=%s, price_tier=%s", appid, genre, price_tier or "all")
+
+        try:
+            # Step 1: Get genre baseline via analyze_market_phase1
+            genre_result = await analyze_market_phase1(
+                steamspy=_steamspy,
+                steam_store=_steam_store,
+                gamalytic=_gamalytic,
+                tags=genre_tags,
+                appids=None,
+                metrics=None,
+                exclude=None,
+                top_n=10,
+                include_raw=False,
+                market_label="",
+            )
+
+            if "error" in genre_result:
+                return json.dumps(
+                    {"error": f"Genre analysis failed: {genre_result['error']}", "error_type": "genre_error"}
+                )
+
+            # Step 2: Get game data from all sources
+            game_commercial = await _gamalytic.get_commercial_data(appid, detail_level="full")
+            game_engagement = await _steamspy.get_engagement_data(appid)
+            game_metadata = await _steam_store.get_app_details(appid)
+
+            # Build unified game dict
+            game_data: dict = {"appid": appid}
+            if not isinstance(game_engagement, APIError):
+                game_data.update({
+                    "name": game_engagement.name,
+                    "review_score": game_engagement.review_score,
+                    "owners": game_engagement.owners_midpoint,
+                    "ccu": game_engagement.ccu,
+                    "median_forever": game_engagement.median_forever,
+                    "price": game_engagement.price,
+                    "developer": game_engagement.developer,
+                    "publisher": game_engagement.publisher,
+                    "positive": game_engagement.positive,
+                    "negative": game_engagement.negative,
+                    "tags": game_engagement.tags,
+                })
+            if not isinstance(game_commercial, APIError):
+                game_data.update({
+                    "revenue": (
+                        game_commercial.gamalytic_revenue
+                        or (
+                            (game_commercial.revenue_min + game_commercial.revenue_max) / 2
+                            if (game_commercial.revenue_min is not None and game_commercial.revenue_max is not None)
+                            else None
+                        )
+                    ),
+                    "followers": game_commercial.followers,
+                    "copies_sold": game_commercial.copies_sold,
+                })
+                if not game_data.get("name"):
+                    game_data["name"] = game_commercial.name
+            if not isinstance(game_metadata, APIError):
+                game_data.setdefault("name", game_metadata.name)
+                game_data.setdefault("price", game_metadata.price)
+                game_data["release_date"] = game_metadata.release_date
+
+            if not game_data.get("name"):
+                return json.dumps(
+                    {"error": f"Game AppID {appid} not found or has no data", "error_type": "not_found"}
+                )
+
+            # Step 3: Get genre game list
+            genre_games = await _fetch_game_list_for_analysis(genre_tags)
+            if isinstance(genre_games, dict) and "error" in genre_games:
+                return json.dumps(genre_games)
+
+            # Step 4: Optionally get review data (compact, non-blocking)
+            reviews_data = None
+            try:
+                async with _review_semaphore:
+                    reviews_result = await _review_client.fetch_reviews(
+                        appid=appid,
+                        limit=50,
+                        language="english",
+                        detail_level="compact",
+                        filter_offtopic=True,
+                    )
+                reviews_data = reviews_result.model_dump()
+            except Exception as e:
+                logger.warning("Failed to fetch reviews for evaluate_game: %s", e)
+
+            # Step 5: Run evaluation
+            result = await evaluate_game_analysis(
+                appid=appid,
+                genre_tags=genre_tags,
+                genre_games=genre_games,
+                genre_analysis=genre_result,
+                game_data=game_data,
+                commercial_data=game_commercial if not isinstance(game_commercial, APIError) else None,
+                reviews_data=reviews_data,
+                price_tier=price_tier.strip() if price_tier.strip() else None,
+            )
+            return json.dumps(result, default=str)
+        except Exception as e:
+            logger.error("evaluate_game failed: %s", e)
+            return json.dumps({"error": str(e), "error_type": "evaluation_error"})
+
+    @mcp.tool()
+    async def compare_markets(
+        markets: str = "",
+    ) -> str:
+        """Compare 2-4 Steam game markets side-by-side with deltas and rankings.
+
+        Each market entry is a JSON object with: tag (string), appids (comma-separated), and optional label.
+        Runs analyze_market internally for each market, then computes side-by-side
+        deltas, overlap detection, health score comparison, and overall ranking.
+
+        Always compares all metrics (no selection parameter). Each market embeds its
+        complete analyze_market output. Warns when comparing very different-sized markets.
+
+        Args:
+            markets: JSON array of market definitions. Each object has:
+                     - "tag": Steam tag string (e.g., "Roguelike") — supports comma-separated for intersection
+                     - "appids": comma-separated AppIDs (alternative to tag)
+                     - "label": optional custom label
+                     Example: '[{"tag": "Roguelike"}, {"tag": "Deckbuilder"}]'
+                     Example: '[{"tag": "Roguelike, Deckbuilder", "label": "Hybrid"}, {"appids": "646570,247080"}]'
+
+        Returns:
+            JSON with markets (each embedding full analyze_market output), deltas
+            (side-by-side metric comparisons), overlap (shared games), health_score_comparison,
+            overall_ranking (by avg health score), confidence_notes.
+        """
+        if not markets.strip():
+            return json.dumps({"error": "markets parameter is required (JSON array)", "error_type": "validation"})
+
+        try:
+            market_defs = json.loads(markets)
+        except json.JSONDecodeError as e:
+            return json.dumps({"error": f"Invalid JSON in markets parameter: {e}", "error_type": "validation"})
+
+        if not isinstance(market_defs, list):
+            return json.dumps({"error": "markets must be a JSON array", "error_type": "validation"})
+
+        if len(market_defs) < 2 or len(market_defs) > 4:
+            return json.dumps(
+                {"error": f"2-4 markets required, got {len(market_defs)}", "error_type": "validation"}
+            )
+
+        # Parse and validate each market definition
+        market_inputs = []
+        for i, m in enumerate(market_defs):
+            if not isinstance(m, dict):
+                return json.dumps(
+                    {"error": f"Market {i + 1} must be a JSON object", "error_type": "validation"}
+                )
+
+            tag = m.get("tag", "").strip()
+            appids_str = m.get("appids", "").strip()
+            label = m.get("label", "").strip()
+
+            if not tag and not appids_str:
+                return json.dumps(
+                    {"error": f"Market {i + 1}: either 'tag' or 'appids' required", "error_type": "validation"}
+                )
+
+            tags = [t.strip() for t in tag.split(",") if t.strip()] if tag else []
+            appid_list = None
+            if appids_str:
+                try:
+                    appid_list = [int(a.strip()) for a in appids_str.split(",") if a.strip()]
+                except ValueError:
+                    return json.dumps(
+                        {
+                            "error": f"Market {i + 1}: appids must be comma-separated integers",
+                            "error_type": "validation",
+                        }
+                    )
+
+            market_inputs.append({
+                "label": label or tag or f"Custom ({len(appid_list or [])} games)",
+                "tags": tags,
+                "appids": appid_list or [],
+            })
+
+        logger.info("compare_markets: %d markets", len(market_inputs))
+
+        try:
+            result = await compare_markets_analysis(
+                market_inputs=market_inputs,
+                steamspy=_steamspy,
+                steam_store=_steam_store,
+                gamalytic=_gamalytic,
+            )
+            return json.dumps(result, default=str)
+        except Exception as e:
+            logger.error("compare_markets failed: %s", e)
+            return json.dumps({"error": str(e), "error_type": "comparison_error"})
