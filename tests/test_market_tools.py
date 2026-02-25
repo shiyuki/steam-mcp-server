@@ -1107,7 +1107,7 @@ class TestGenreMembershipValidation:
         games = [
             {
                 "appid": 1, "name": "RogueHit", "revenue": 50_000_000,
-                "tags": {"Roguelike": 1000, "Action": 800, "Indie": 600},
+                "tags": {"Rogue-like": 1000, "Action": 800, "Indie": 600},
             },
             {
                 "appid": 2, "name": "NotRogue", "revenue": 30_000_000,
@@ -1119,7 +1119,7 @@ class TestGenreMembershipValidation:
             },
         ]
 
-        flags = _validate_genre_membership(games, "Roguelike")
+        flags = _validate_genre_membership(games, "Rogue-like")
 
         # Total revenue ~80M + 100. Threshold = 80000100 * 0.001 = ~80000
         # Game 1 (50M) and Game 2 (30M) exceed threshold; Game 3 (100) does not
@@ -1127,7 +1127,7 @@ class TestGenreMembershipValidation:
 
         rogue_flag = next(f for f in flags if f["appid"] == 1)
         assert rogue_flag["genre_valid"] is True
-        assert rogue_flag["tag_rank"] == 1  # "Roguelike" is highest-weighted tag
+        assert rogue_flag["tag_rank"] == 1  # "Rogue-like" is highest-weighted tag
 
         not_rogue_flag = next(f for f in flags if f["appid"] == 2)
         assert not_rogue_flag["genre_valid"] is False
@@ -1140,10 +1140,10 @@ class TestGenreMembershipValidation:
         games = [
             {"appid": 1, "name": "NoTags", "revenue": 50_000_000, "tags": {}},
             {"appid": 2, "name": "NullTags", "revenue": 30_000_000, "tags": None},
-            {"appid": 3, "name": "HasTags", "revenue": 20_000_000, "tags": {"Roguelike": 500}},
+            {"appid": 3, "name": "HasTags", "revenue": 20_000_000, "tags": {"Rogue-like": 500}},
         ]
 
-        flags = _validate_genre_membership(games, "Roguelike")
+        flags = _validate_genre_membership(games, "Rogue-like")
 
         # Only game 3 has tag data and exceeds threshold
         assert len(flags) == 1
@@ -1156,10 +1156,10 @@ class TestGenreMembershipValidation:
 
         games = [
             {"appid": 1, "name": "Game1", "revenue": 1_000_000,
-             "tags": {"roguelike": 1000, "action": 800}},
+             "tags": {"rogue-like": 1000, "action": 800}},
         ]
 
-        flags = _validate_genre_membership(games, "Roguelike")
+        flags = _validate_genre_membership(games, "Rogue-like")
         assert len(flags) == 1
         assert flags[0]["genre_valid"] is True
 
@@ -1168,10 +1168,10 @@ class TestGenreMembershipValidation:
         from src.market_tools import _validate_genre_membership
 
         games = [
-            {"appid": 1, "name": "Free", "revenue": 0, "tags": {"Roguelike": 500}},
+            {"appid": 1, "name": "Free", "revenue": 0, "tags": {"Rogue-like": 500}},
         ]
 
-        flags = _validate_genre_membership(games, "Roguelike")
+        flags = _validate_genre_membership(games, "Rogue-like")
         assert flags == []
 
     def test_top_tags_shows_context(self):
@@ -1181,15 +1181,34 @@ class TestGenreMembershipValidation:
         games = [
             {"appid": 1, "name": "Game1", "revenue": 1_000_000,
              "tags": {"Action": 1000, "Adventure": 900, "RPG": 800, "Indie": 700,
-                      "Open World": 600, "Roguelike": 500}},
+                      "Open World": 600, "Rogue-like": 500}},
         ]
 
-        flags = _validate_genre_membership(games, "Roguelike")
+        flags = _validate_genre_membership(games, "Rogue-like")
         assert len(flags) == 1
         assert flags[0]["genre_valid"] is True
         assert flags[0]["tag_rank"] == 6  # 6th tag
         assert len(flags[0]["top_tags"]) == 5
         assert flags[0]["top_tags"][0] == "Action"
+
+    def test_normalize_tag_matches_steamspy_format(self):
+        """User input 'Roguelike' matches SteamSpy's 'Rogue-like' after normalize_tag."""
+        from src.market_tools import _validate_genre_membership
+        from src.steam_api import normalize_tag
+
+        games = [
+            {"appid": 1, "name": "Game1", "revenue": 1_000_000,
+             "tags": {"Rogue-like": 1000, "Action": 800}},
+        ]
+
+        # Simulates the caller path: normalize_tag("Roguelike") -> "Rogue-like"
+        normalized = normalize_tag("Roguelike")
+        assert normalized == "Rogue-like"
+
+        flags = _validate_genre_membership(games, normalized)
+        assert len(flags) == 1
+        assert flags[0]["genre_valid"] is True
+        assert flags[0]["tag_rank"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1324,7 +1343,7 @@ class TestValidationFlagsInResult:
             appid=1, name="BigGame", ccu=5000, owners_midpoint=5000000.0,
             average_forever=50.0, average_2weeks=10.0,
             positive=50000, negative=2000, total_reviews=52000, price=29.99,
-            review_score=96.2, tags={"Roguelike": 1000, "Action": 800, "Indie": 600},
+            review_score=96.2, tags={"Rogue-like": 1000, "Action": 800, "Indie": 600},
             owners_min=4000000, owners_max=6000000,
             median_forever=40.0, median_2weeks=8.0,
             developer="Dev", publisher="Pub",
@@ -1342,7 +1361,7 @@ class TestValidationFlagsInResult:
         flag = result["validation_flags"][0]
         assert flag["appid"] == 1
         assert flag["genre_valid"] is True
-        assert flag["tag_rank"] == 1  # "Roguelike" is top tag
+        assert flag["tag_rank"] == 1  # "Rogue-like" is top tag
 
 
 # ---------------------------------------------------------------------------

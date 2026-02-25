@@ -46,7 +46,7 @@ from src.analytics import (
     get_computable_metrics,
 )
 from src.logging_config import get_logger
-from src.steam_api import _ms_to_iso
+from src.steam_api import _ms_to_iso, normalize_tag
 from src.schemas import (
     APIError,
     AnalyzeMarketResult,
@@ -1427,7 +1427,8 @@ def _validate_genre_membership(
 
     Args:
         games: List of enriched game dicts (with "tags" and "revenue" fields)
-        genre_tag: The genre tag to validate membership for (e.g., "Roguelike")
+        genre_tag: The genre tag to validate membership for (should be normalized
+            via normalize_tag() to match SteamSpy's format, e.g., "Rogue-like")
         revenue_threshold_pct: Revenue threshold percentage (default: 0.1%)
 
     Returns:
@@ -1649,7 +1650,7 @@ async def _analyze_market_single_impl(
     # Uses SteamSpy tag weights populated by Tier 2 enrichment or independent tag fetch
     validation_flags = []
     if tags and len(tags) == 1:
-        validation_flags = _validate_genre_membership(enriched_games, tags[0])
+        validation_flags = _validate_genre_membership(enriched_games, normalize_tag(tags[0]))
         if validation_flags:
             flagged = [f for f in validation_flags if not f["genre_valid"]]
             valid = [f for f in validation_flags if f["genre_valid"]]

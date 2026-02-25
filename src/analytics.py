@@ -628,7 +628,8 @@ def compute_tag_multipliers(
     if not genre_avg:
         return None
 
-    min_games = max(5, len(revenue_games) // 20)
+    games_with_tags = sum(1 for g, _ in revenue_games if g.get("tags"))
+    min_games = max(5, games_with_tags // 20)
 
     # Accumulate per-tag revenues
     tag_revenues: dict[str, list[float]] = defaultdict(list)
@@ -666,7 +667,8 @@ def compute_tag_multipliers(
         sample_size=len(revenue_games),
         methodology=(
             f"Tag revenue multipliers vs genre baseline. "
-            f"Min {min_games} games per tag required. Primary tags excluded from comparison."
+            f"Min {min_games} games per tag required (5% of {games_with_tags} games with tag data). "
+            f"Primary tags excluded from comparison."
         ),
     )
     return TagMultiplierResult(

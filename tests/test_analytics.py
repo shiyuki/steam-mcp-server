@@ -664,10 +664,35 @@ class TestComputeTagMultipliers:
         games = make_games(100)
         result = compute_tag_multipliers(games)
         assert result is not None
-        # min_games = max(5, len(games_with_revenue) // 20)
-        n_with_rev = sum(1 for g in games if g.get("revenue") is not None)
-        expected_min = max(5, n_with_rev // 20)
+        # min_games = max(5, games_with_tags // 20) — all make_games() have tags
+        n_with_tags = sum(1 for g in games if g.get("tags") and g.get("revenue") is not None)
+        expected_min = max(5, n_with_tags // 20)
         assert result.min_games_threshold == expected_min
+
+    def test_min_games_based_on_tagged_games_not_total(self):
+        """Threshold uses count of games-with-tag-data, not all revenue games."""
+        # 20 games with tags, 80 without — threshold should be max(5, 20//20) = 5, not max(5, 100//20) = 5
+        # Use larger numbers to make the difference visible:
+        # 40 tagged + 460 untagged = 500 total revenue games
+        # Old: max(5, 500//20) = 25
+        # New: max(5, 40//20) = 5
+        tagged_games = [
+            {"appid": i, "revenue": 100_000.0, "tags": {"Action": 100, "Indie": 50}}
+            for i in range(40)
+        ]
+        untagged_games = [
+            {"appid": i + 40, "revenue": 50_000.0, "tags": {}}
+            for i in range(460)
+        ]
+        result = compute_tag_multipliers(tagged_games + untagged_games)
+        assert result is not None
+        # Threshold based on 40 tagged games: max(5, 40//20) = 5
+        assert result.min_games_threshold == max(5, 40 // 20)
+        # "Action" appears in all 40 tagged games, should pass threshold
+        booster_tags = {e.tag for e in result.boosters}
+        penalty_tags = {e.tag for e in result.penalties}
+        all_tags = booster_tags | penalty_tags
+        assert "Action" in all_tags
 
     def test_empty_returns_none(self):
         assert compute_tag_multipliers([]) is None
