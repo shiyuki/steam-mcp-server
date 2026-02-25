@@ -1248,6 +1248,9 @@ async def analyze_market_single(
     Args:
         skip_min_check: If True, bypass MIN_GAMES_THRESHOLD in _run_market_analysis.
             Used by evaluate_game with custom genre_appids baselines.
+        return_games: If True, return (result_dict, enriched_games_list) tuple instead of
+            just result_dict. Allows callers to reuse enriched games without re-fetching.
+            Default False preserves backward compatibility.
     """
     fetch_start = time.monotonic()
     games, data_source = await _fetch_game_list_steamspy(steamspy, steam_store, tags, appids=appids)
@@ -1258,11 +1261,14 @@ async def analyze_market_single(
         if data_source.startswith("steam_store:tag_error:"):
             bad_tags = data_source.split(":", 2)[2]
             error_msg = f"Tag(s) not recognized: {bad_tags}. Check tag names against Steam's tag list (e.g., 'Roguelike Deckbuilder' not 'Deckbuilder')."
-        return {
+        error_result = {
             "error": error_msg,
             "total_games": 0,
             "market_label": market_label or ", ".join(tags) or f"Custom ({len(appids or [])} games)",
         }
+        if return_games:
+            return error_result, []
+        return error_result
 
     # Two-tier Gamalytic enrichment: bulk for tag-based, per-game for appid-based
     enrich_start = time.monotonic()
@@ -1344,6 +1350,8 @@ async def analyze_market_single(
     )
 
     if "error" in result:
+        if return_games:
+            return result, enriched_games
         return result
 
     # Add validation flags to result (games flagged but NOT removed)
@@ -1373,6 +1381,8 @@ async def analyze_market_single(
         existing_warnings = result.get("warnings", [])
         result["warnings"] = existing_warnings + enrich_warnings
 
+    if return_games:
+        return result, enriched_games
     return result
 
 
