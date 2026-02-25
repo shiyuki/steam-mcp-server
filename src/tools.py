@@ -623,7 +623,7 @@ def register_tools(mcp: FastMCP):
     @mcp.tool()
     async def fetch_reviews(
         appid: int,
-        limit: int = 200,
+        limit: int = 1000,
         language: str = "english",
         review_type: str = "all",
         purchase_type: str = "all",
@@ -639,7 +639,7 @@ def register_tools(mcp: FastMCP):
 
         Returns individual reviews with sentiment, playtime, helpfulness scores, plus
         aggregate stats, playtime histogram, and sentiment timeline. Two detail levels:
-        full (200 reviews + all stats) or compact (3 snippets + stats only).
+        full (1000 reviews + all stats) or compact (3 snippets + stats only).
 
         Reviews are sorted by helpfulness (most helpful first) by default.
         Stats (histogram, sentiment) are computed from a separate recent-sort scan
@@ -647,7 +647,7 @@ def register_tools(mcp: FastMCP):
 
         Args:
             appid: Steam AppID (e.g., 646570 for Slay the Spire)
-            limit: Number of reviews to fetch (default 200, max 10000). Only affects review text, not stats.
+            limit: Number of reviews to fetch (default 1000, max 10000). Only affects review text, not stats.
             language: Language filter (default "english"). Use "all" for all languages.
                       Codes: english, schinese, tchinese, japanese, koreana, russian, german, french, spanish, etc.
             review_type: Filter by sentiment: "all" (default), "positive", "negative"

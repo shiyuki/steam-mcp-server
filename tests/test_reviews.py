@@ -1224,7 +1224,7 @@ def _make_fetch_reviews_tool(review_client_mock):
 
     async def fetch_reviews(
         appid: int,
-        limit: int = 200,
+        limit: int = 1000,
         language: str = "english",
         review_type: str = "all",
         purchase_type: str = "all",
