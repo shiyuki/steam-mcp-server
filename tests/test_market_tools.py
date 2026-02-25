@@ -1749,3 +1749,607 @@ class TestReturnGames:
         assert "error" in error_dict
         assert isinstance(games_list, list)
         assert games_list == [], f"Expected empty list on error path, got {games_list}"
+
+
+# ---------------------------------------------------------------------------
+# TestFetchGameListFallbacks — 6 tests
+# ---------------------------------------------------------------------------
+
+class TestFetchGameListFallbacks:
+    """Tests for Steam Store and Gamalytic fallback paths in _fetch_game_list_steamspy."""
+
+    @pytest.mark.asyncio
+    async def test_single_tag_steam_store_fallback_on_api_error(self):
+        """_fetch_game_list_steamspy falls back to Steam Store when SteamSpy tag search returns APIError."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.schemas import APIError as APIErrorSchema, EngagementData
+        from src.market_tools import _fetch_game_list_steamspy
+        from datetime import datetime, timezone
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+
+        # SteamSpy bulk tag fails
+        mock_steamspy.search_by_tag = AsyncMock(return_value=APIErrorSchema(
+            error_code=500, error_type="api_error", message="SteamSpy unavailable"
+        ))
+
+        # Steam Store returns 3 appids
+        mock_steam_store.get_tag_map = AsyncMock(return_value={"roguelike": 1234})
+        mock_steam_store.search_by_tag_ids = AsyncMock(return_value=(3, [101, 102, 103]))
+
+        # SteamSpy per-game enrichment succeeds
+        mock_steamspy.get_engagement_data = AsyncMock(return_value=EngagementData(
+            appid=101, name="FallbackGame", ccu=100, owners_min=1000, owners_max=5000,
+            owners_midpoint=3000.0, average_forever=10.0, average_2weeks=1.0,
+            median_forever=8.0, median_2weeks=0.5, positive=200, negative=10, price=9.99,
+            review_score=80.0, tags={"Roguelike": 100},
+            developer="Dev", publisher="Pub",
+            fetched_at=datetime.now(timezone.utc), total_reviews=210,
+        ))
+
+        games, data_source = await _fetch_game_list_steamspy(
+            mock_steamspy, mock_steam_store, mock_gamalytic, ["Roguelike"]
+        )
+
+        assert len(games) == 3
+        assert data_source == "steam_store_fallback"
+        mock_steam_store.get_tag_map.assert_called_once()
+        mock_steam_store.search_by_tag_ids.assert_called_once_with([1234], count=500)
+
+    @pytest.mark.asyncio
+    async def test_single_tag_steam_store_fallback_on_empty_result(self):
+        """_fetch_game_list_steamspy falls back to Steam Store when SteamSpy returns empty SearchResult."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.schemas import SearchResult, EngagementData
+        from src.market_tools import _fetch_game_list_steamspy
+        from datetime import datetime, timezone
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+
+        # SteamSpy returns empty result (bowling fallback or genuinely empty)
+        empty_result = SearchResult(
+            tag="ObscureTag", appids=[], total_found=0, games=[],
+            data_source="steamspy", fetched_at="2026-01-01T00:00:00Z", cache_age_seconds=0,
+        )
+        mock_steamspy.search_by_tag = AsyncMock(return_value=empty_result)
+
+        # Steam Store resolves tag and returns appids
+        mock_steam_store.get_tag_map = AsyncMock(return_value={"obscuretag": 9999})
+        mock_steam_store.search_by_tag_ids = AsyncMock(return_value=(2, [201, 202]))
+
+        mock_steamspy.get_engagement_data = AsyncMock(return_value=EngagementData(
+            appid=201, name="Game201", ccu=50, owners_min=500, owners_max=2000,
+            owners_midpoint=1250.0, average_forever=5.0, average_2weeks=0.5,
+            median_forever=4.0, median_2weeks=0.2, positive=100, negative=5, price=4.99,
+            review_score=95.0, tags={},
+            developer="Dev", publisher="Pub",
+            fetched_at=datetime.now(timezone.utc), total_reviews=105,
+        ))
+
+        games, data_source = await _fetch_game_list_steamspy(
+            mock_steamspy, mock_steam_store, mock_gamalytic, ["ObscureTag"]
+        )
+
+        assert len(games) == 2
+        assert data_source == "steam_store_fallback"
+        mock_steam_store.get_tag_map.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_single_tag_fallback_tag_not_in_map_returns_empty(self):
+        """When tag cannot be resolved in Steam tag map, fallback returns empty gracefully."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.schemas import APIError as APIErrorSchema
+        from src.market_tools import _fetch_game_list_steamspy
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+
+        mock_steamspy.search_by_tag = AsyncMock(return_value=APIErrorSchema(
+            error_code=404, error_type="tag_not_found", message="tag unknown"
+        ))
+        # Tag map doesn't contain this tag
+        mock_steam_store.get_tag_map = AsyncMock(return_value={"roguelike": 1234})
+
+        games, data_source = await _fetch_game_list_steamspy(
+            mock_steamspy, mock_steam_store, mock_gamalytic, ["CompletelyUnknownTag"]
+        )
+
+        assert games == []
+        assert data_source == "steam_store_fallback"
+        mock_steam_store.search_by_tag_ids.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_appids_gamalytic_fallback_recovers_failed(self):
+        """Appids that fail SteamSpy per-game are recovered via Gamalytic commercial data."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.schemas import APIError as APIErrorSchema, EngagementData, CommercialData
+        from src.market_tools import _fetch_game_list_steamspy
+        from datetime import datetime, timezone
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+
+        # Appids 1 and 2 succeed via SteamSpy, appid 3 fails
+        def steamspy_side_effect(appid):
+            if appid == 3:
+                return APIErrorSchema(error_code=502, error_type="api_error", message="502 Bad Gateway")
+            return EngagementData(
+                appid=appid, name=f"Game{appid}", ccu=100, owners_min=1000, owners_max=5000,
+                owners_midpoint=3000.0, average_forever=10.0, average_2weeks=1.0,
+                median_forever=8.0, median_2weeks=0.5, positive=200, negative=10, price=9.99,
+                review_score=80.0, tags={"Action": 100},
+                developer="Dev", publisher="Pub",
+                fetched_at=datetime.now(timezone.utc), total_reviews=210,
+            )
+        mock_steamspy.get_engagement_data = AsyncMock(side_effect=steamspy_side_effect)
+
+        # Gamalytic recovers appid 3
+        mock_gamalytic.get_commercial_data = AsyncMock(return_value=CommercialData(
+            appid=3, name="RecoveredGame", price=14.99,
+            revenue_min=100_000, revenue_max=200_000,
+            confidence="low", source="gamalytic",
+            fetched_at=datetime.now(timezone.utc),
+            followers=500, copies_sold=8000,
+            review_score=72.0, release_date="2022-03-15",
+            gamalytic_owners=12000,
+        ))
+
+        games, data_source = await _fetch_game_list_steamspy(
+            mock_steamspy, mock_steam_store, mock_gamalytic,
+            [],  # no tags
+            appids=[1, 2, 3],
+        )
+
+        assert len(games) == 3
+        appids_found = {g["appid"] for g in games}
+        assert appids_found == {1, 2, 3}
+
+        # Verify recovered game has correct Gamalytic fields
+        recovered = next(g for g in games if g["appid"] == 3)
+        assert recovered["name"] == "RecoveredGame"
+        assert recovered["price"] == 14.99
+        assert recovered["revenue"] == 150_000.0  # midpoint of 100k/200k
+        assert recovered["followers"] == 500
+        assert recovered["copies_sold"] == 8000
+        assert recovered["release_date"] == "2022-03-15"
+        assert recovered["owners"] == 12000
+        # Gamalytic has no ccu/playtime/tags
+        assert recovered["ccu"] is None
+        assert recovered["median_forever"] is None
+        assert recovered["tags"] == {}
+
+        assert data_source == "steamspy_appids"
+
+    @pytest.mark.asyncio
+    async def test_appids_double_failure_drops_gracefully(self):
+        """When both SteamSpy and Gamalytic fail for an appid, it is silently dropped."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.schemas import APIError as APIErrorSchema
+        from src.market_tools import _fetch_game_list_steamspy
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+
+        # All appids fail SteamSpy
+        mock_steamspy.get_engagement_data = AsyncMock(return_value=APIErrorSchema(
+            error_code=500, error_type="api_error", message="steamspy down"
+        ))
+        # Gamalytic also fails
+        mock_gamalytic.get_commercial_data = AsyncMock(return_value=APIErrorSchema(
+            error_code=500, error_type="api_error", message="gamalytic down"
+        ))
+
+        games, data_source = await _fetch_game_list_steamspy(
+            mock_steamspy, mock_steam_store, mock_gamalytic,
+            [],
+            appids=[10, 20],
+        )
+
+        assert games == []
+        assert data_source == "steamspy_appids"
+
+    @pytest.mark.asyncio
+    async def test_gamalytic_fallback_empty_appids(self):
+        """_gamalytic_fallback with empty appids returns empty list without calling API."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import _gamalytic_fallback
+
+        mock_gamalytic = MagicMock()
+        mock_gamalytic.get_commercial_data = AsyncMock()
+
+        result = await _gamalytic_fallback(mock_gamalytic, [])
+
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# TestTier15Enrichment — 7 tests for Tier 1.5 per-game enrichment
+# ---------------------------------------------------------------------------
+
+class TestTier15Enrichment:
+    """Tests for Tier 1.5 per-game enrichment in _enrich_with_gamalytic_bulk.
+
+    Tier 1.5 fills the gap between Tier 1 (bulk merge) and Tier 2 (deep enrichment):
+    games not found in Gamalytic's tag taxonomy get per-game CommercialData + SteamSpy tags.
+    """
+
+    def _make_bulk_setup(self, gamalytic_appids, steamspy_appids):
+        """Return (mock_gamalytic, steamspy_games) for a bulk-merge scenario.
+
+        gamalytic_appids: appids included in Gamalytic bulk response (revenue=1_000_000 each)
+        steamspy_appids: all appids in SteamSpy response (each missing revenue initially)
+        """
+        from unittest.mock import AsyncMock, MagicMock
+        mock_gamalytic = MagicMock()
+        gamalytic_games = [
+            {"steamId": i, "name": f"Game{i}", "revenue": 1_000_000, "copiesSold": 5000}
+            for i in gamalytic_appids
+        ]
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=gamalytic_games)
+        steamspy_games = [
+            {"appid": i, "name": f"Game{i}", "owners": 50_000, "revenue": None, "tags": {}}
+            for i in steamspy_appids
+        ]
+        return mock_gamalytic, steamspy_games
+
+    @pytest.mark.asyncio
+    async def test_tier1_5_enriches_unenriched_games(self):
+        """Games not in Gamalytic bulk get revenue + tags via Tier 1.5 per-game fetch."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import _enrich_with_gamalytic_bulk
+        from src.schemas import CommercialData, EngagementData
+        from datetime import datetime, timezone
+
+        # Gamalytic bulk: appids 1-8 (appids 9 and 10 are NOT in bulk)
+        mock_gamalytic, steamspy_games = self._make_bulk_setup(
+            gamalytic_appids=list(range(1, 9)),
+            steamspy_appids=list(range(1, 11)),
+        )
+        # Tier 1.5: get_commercial_batch returns CommercialData for appids 9 and 10
+        now = datetime.now(timezone.utc)
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[
+            CommercialData(
+                appid=9, name="HiddenGame9", price=14.99,
+                revenue_min=900_000, revenue_max=1_100_000,
+                confidence="medium", source="gamalytic", fetched_at=now,
+            ),
+            CommercialData(
+                appid=10, name="HiddenGame10", price=24.99,
+                revenue_min=1_800_000, revenue_max=2_200_000,
+                confidence="high", source="gamalytic", fetched_at=now,
+            ),
+        ])
+
+        # SteamSpy tags for Tier 1.5 games
+        mock_steamspy = MagicMock()
+        mock_steamspy.get_engagement_data = AsyncMock(return_value=EngagementData(
+            appid=9, name="HiddenGame9", ccu=500, owners_midpoint=50_000.0,
+            owners_min=40_000, owners_max=60_000,
+            average_forever=20.0, average_2weeks=5.0,
+            median_forever=15.0, median_2weeks=3.0,
+            positive=5000, negative=100, price=14.99,
+            review_score=90.0, tags={"Roguelike": 500, "Indie": 300},
+            developer="DevA", publisher="PubA",
+            fetched_at=now, total_reviews=5100,
+        ))
+
+        enriched, warnings, meta = await _enrich_with_gamalytic_bulk(
+            steamspy_games, mock_gamalytic,
+            steamspy=mock_steamspy, primary_tag="Roguelike",
+        )
+
+        # Both Tier 1.5 games should have revenue populated
+        game9 = next(g for g in enriched if g["appid"] == 9)
+        game10 = next(g for g in enriched if g["appid"] == 10)
+        assert game9["revenue"] is not None, "Game 9 should have revenue from Tier 1.5"
+        assert game10["revenue"] is not None, "Game 10 should have revenue from Tier 1.5"
+
+        # Tier 1.5 meta fields populated
+        assert meta["tier1_5_count"] == 2   # 2 unenriched appids
+        assert meta["tier1_5_commercial_found"] == 2
+        assert meta["tier1_5_total"] >= 2   # at least both games were updated
+
+        # SteamSpy tags should be populated (get_engagement_data was called)
+        assert mock_steamspy.get_engagement_data.call_count >= 2
+
+    @pytest.mark.asyncio
+    async def test_tier1_5_skips_when_all_enriched(self):
+        """Tier 1.5 fires no per-game calls when Tier 1 enriches 100% of games."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import _enrich_with_gamalytic_bulk
+        from src.schemas import EngagementData
+        from datetime import datetime, timezone
+
+        # Gamalytic bulk: ALL appids 1-10 are in Gamalytic
+        mock_gamalytic, steamspy_games = self._make_bulk_setup(
+            gamalytic_appids=list(range(1, 11)),
+            steamspy_appids=list(range(1, 11)),
+        )
+        # Tier 2 get_commercial_batch returns empty (skip Tier 2 enrichment)
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
+
+        now = datetime.now(timezone.utc)
+        mock_steamspy = MagicMock()
+        mock_steamspy.get_engagement_data = AsyncMock(return_value=EngagementData(
+            appid=1, name="Game1", ccu=100, owners_midpoint=50_000.0,
+            owners_min=40_000, owners_max=60_000,
+            average_forever=10.0, average_2weeks=2.0,
+            median_forever=8.0, median_2weeks=1.0,
+            positive=200, negative=10, price=9.99,
+            review_score=90.0, tags={"Roguelike": 500},
+            developer="Dev", publisher="Pub",
+            fetched_at=now, total_reviews=210,
+        ))
+
+        enriched, warnings, meta = await _enrich_with_gamalytic_bulk(
+            steamspy_games, mock_gamalytic,
+            steamspy=mock_steamspy, primary_tag="Roguelike",
+        )
+
+        # All games enriched in Tier 1 → Tier 1.5 meta fields absent (block not entered)
+        assert "tier1_5_count" not in meta, "tier1_5_count should not exist when all enriched"
+
+    @pytest.mark.asyncio
+    async def test_tier1_5_warns_for_large_batch(self):
+        """Warning is logged (not info) when 1000+ games need Tier 1.5 enrichment."""
+        import logging
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import _enrich_with_gamalytic_bulk
+
+        # Setup: 3000 SteamSpy games, Gamalytic covers 2000 (66.7% overlap -> passes cross-val)
+        # 1000 games remain unenriched -> triggers >= 1000 warning path
+        total_games = 3000
+        gamalytic_covered = 2000
+        mock_gamalytic, steamspy_games = self._make_bulk_setup(
+            gamalytic_appids=list(range(1, gamalytic_covered + 1)),
+            steamspy_appids=list(range(1, total_games + 1)),
+        )
+        # get_commercial_batch returns empty (don't care about enrichment results here)
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
+
+        mock_steamspy = MagicMock()
+        mock_steamspy.get_engagement_data = AsyncMock(return_value=None)
+
+        import src.market_tools as mt
+
+        warning_messages = []
+        original_warning = mt.logger.warning
+
+        def capture_warning(msg, *args, **kwargs):
+            warning_messages.append(msg)
+            original_warning(msg, *args, **kwargs)
+
+        mt.logger.warning = capture_warning
+        try:
+            enriched, warnings_list, meta = await _enrich_with_gamalytic_bulk(
+                steamspy_games, mock_gamalytic,
+                steamspy=mock_steamspy, primary_tag="Roguelike",
+            )
+        finally:
+            mt.logger.warning = original_warning
+
+        # Should have logged a warning about Tier 1.5 bottleneck
+        tier15_warnings = [m for m in warning_messages if "Tier 1.5" in str(m)]
+        assert len(tier15_warnings) >= 1, (
+            f"Expected warning about large Tier 1.5 batch, got: {warning_messages}"
+        )
+        assert any("ETA" in str(m) or "bottleneck" in str(m) for m in tier15_warnings), (
+            f"Warning should mention ETA/bottleneck: {tier15_warnings}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_tier1_5_recalculates_tier2_threshold(self):
+        """Tier 2 threshold is based on total_revenue AFTER Tier 1.5 enrichment.
+
+        Setup: 8 games enriched by Tier 1 at $1M each. 2 games unenriched.
+        Tier 1.5 adds $10M to game 9 and $10M to game 10.
+        Without Tier 1.5: total_revenue = 8M, threshold = 8000 (0.1% of 8M).
+        With Tier 1.5: total_revenue = 28M, threshold = 28000 (0.1% of 28M).
+        Tier 2 should be triggered for more games when threshold is higher/different.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import _enrich_with_gamalytic_bulk, GAMALYTIC_REVENUE_THRESHOLD_PCT
+        from src.schemas import CommercialData, EngagementData
+        from datetime import datetime, timezone
+
+        mock_gamalytic, steamspy_games = self._make_bulk_setup(
+            gamalytic_appids=list(range(1, 9)),
+            steamspy_appids=list(range(1, 11)),
+        )
+
+        now = datetime.now(timezone.utc)
+        # Tier 1.5: appids 9 and 10 each get $10M
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[
+            CommercialData(
+                appid=9, name="BigHidden9", price=19.99,
+                revenue_min=9_000_000, revenue_max=11_000_000,
+                confidence="high", source="gamalytic", fetched_at=now,
+            ),
+            CommercialData(
+                appid=10, name="BigHidden10", price=19.99,
+                revenue_min=9_000_000, revenue_max=11_000_000,
+                confidence="high", source="gamalytic", fetched_at=now,
+            ),
+        ])
+
+        mock_steamspy = MagicMock()
+        mock_steamspy.get_engagement_data = AsyncMock(return_value=EngagementData(
+            appid=9, name="BigHidden9", ccu=100, owners_midpoint=5000.0,
+            owners_min=4000, owners_max=6000,
+            average_forever=10.0, average_2weeks=2.0,
+            median_forever=8.0, median_2weeks=1.0,
+            positive=200, negative=10, price=19.99,
+            review_score=90.0, tags={"Roguelike": 500},
+            developer="Dev", publisher="Pub",
+            fetched_at=now, total_reviews=210,
+        ))
+
+        enriched, warnings, meta = await _enrich_with_gamalytic_bulk(
+            steamspy_games, mock_gamalytic,
+            steamspy=mock_steamspy, primary_tag="Roguelike",
+        )
+
+        # Tier 1.5 meta: 2 unenriched games
+        assert meta["tier1_5_count"] == 2
+        assert meta["tier1_5_commercial_found"] == 2
+
+        # total_revenue should include Tier 1.5 revenue
+        # Tier 1: 8 games * $1M = $8M; Tier 1.5: 2 games * ~$10M midpoint = ~$20M
+        # Total should be ~$28M
+        assert meta["total_revenue"] > 8_000_000, (
+            f"total_revenue {meta['total_revenue']} should include Tier 1.5 revenue"
+        )
+
+    @pytest.mark.asyncio
+    async def test_tier1_5_api_error_handling(self):
+        """Games where Tier 1.5 fetch fails retain revenue=None without crashing."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import _enrich_with_gamalytic_bulk
+        from src.schemas import APIError as APIErrorSchema
+
+        # 2 unenriched games (appids 9 and 10)
+        mock_gamalytic, steamspy_games = self._make_bulk_setup(
+            gamalytic_appids=list(range(1, 9)),
+            steamspy_appids=list(range(1, 11)),
+        )
+        # Tier 1.5 Gamalytic fetch returns all APIErrors
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[
+            APIErrorSchema(error_code=429, error_type="rate_limit", message="rate limited"),
+            APIErrorSchema(error_code=500, error_type="api_error", message="server error"),
+        ])
+
+        mock_steamspy = MagicMock()
+        mock_steamspy.get_engagement_data = AsyncMock(
+            side_effect=Exception("SteamSpy unavailable")
+        )
+
+        # Should not raise; unenriched games keep revenue=None
+        enriched, warnings, meta = await _enrich_with_gamalytic_bulk(
+            steamspy_games, mock_gamalytic,
+            steamspy=mock_steamspy, primary_tag="Roguelike",
+        )
+
+        # Games 9 and 10 should still have revenue=None (APIError not merged)
+        game9 = next(g for g in enriched if g["appid"] == 9)
+        game10 = next(g for g in enriched if g["appid"] == 10)
+        assert game9.get("revenue") is None, "APIError game should retain revenue=None"
+        assert game10.get("revenue") is None, "APIError game should retain revenue=None"
+
+        # Meta still recorded the attempt
+        assert meta["tier1_5_count"] == 2
+        assert meta["tier1_5_commercial_found"] == 0  # all failed
+        assert meta["tier1_5_total"] == 0  # nothing merged
+
+    @pytest.mark.asyncio
+    async def test_tier1_5_partial_success(self):
+        """3 of 5 unenriched games succeed; 2 fail — partial enrichment works."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import _enrich_with_gamalytic_bulk
+        from src.schemas import CommercialData, APIError as APIErrorSchema
+        from datetime import datetime, timezone
+
+        # 8 enriched by Tier 1, appids 9-13 unenriched (5 games)
+        mock_gamalytic, steamspy_games = self._make_bulk_setup(
+            gamalytic_appids=list(range(1, 9)),
+            steamspy_appids=list(range(1, 14)),
+        )
+
+        now = datetime.now(timezone.utc)
+        # Tier 1.5: 3 succeed, 2 fail
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[
+            CommercialData(
+                appid=9, name="Game9", price=9.99,
+                revenue_min=400_000, revenue_max=600_000,
+                confidence="medium", source="gamalytic", fetched_at=now,
+            ),
+            CommercialData(
+                appid=10, name="Game10", price=9.99,
+                revenue_min=400_000, revenue_max=600_000,
+                confidence="medium", source="gamalytic", fetched_at=now,
+            ),
+            CommercialData(
+                appid=11, name="Game11", price=9.99,
+                revenue_min=400_000, revenue_max=600_000,
+                confidence="medium", source="gamalytic", fetched_at=now,
+            ),
+            APIErrorSchema(error_code=404, error_type="not_found", message="not found"),
+            APIErrorSchema(error_code=404, error_type="not_found", message="not found"),
+        ])
+
+        mock_steamspy = MagicMock()
+        mock_steamspy.get_engagement_data = AsyncMock(return_value=None)
+
+        enriched, warnings, meta = await _enrich_with_gamalytic_bulk(
+            steamspy_games, mock_gamalytic,
+            steamspy=mock_steamspy, primary_tag="Roguelike",
+        )
+
+        # Exactly 3 succeeded
+        assert meta["tier1_5_commercial_found"] == 3, (
+            f"Expected 3 successful Gamalytic results, got {meta['tier1_5_commercial_found']}"
+        )
+        assert meta["tier1_5_count"] == 5  # 5 unenriched
+
+        # Games 9-11 have revenue; games 12-13 keep None
+        for appid in [9, 10, 11]:
+            game = next(g for g in enriched if g["appid"] == appid)
+            assert game["revenue"] is not None, f"Game {appid} should have revenue"
+        for appid in [12, 13]:
+            game = next(g for g in enriched if g["appid"] == appid)
+            assert game["revenue"] is None, f"Game {appid} should keep revenue=None (failed)"
+
+    @pytest.mark.asyncio
+    async def test_tier1_5_steamspy_none_still_merges_revenue(self):
+        """When steamspy=None, Tier 1.5 still merges revenue from Gamalytic; tags stay empty."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import _enrich_with_gamalytic_bulk
+        from src.schemas import CommercialData
+        from datetime import datetime, timezone
+
+        # 2 unenriched games (appids 9, 10)
+        mock_gamalytic, steamspy_games = self._make_bulk_setup(
+            gamalytic_appids=list(range(1, 9)),
+            steamspy_appids=list(range(1, 11)),
+        )
+
+        now = datetime.now(timezone.utc)
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[
+            CommercialData(
+                appid=9, name="Game9", price=9.99,
+                revenue_min=450_000, revenue_max=550_000,
+                confidence="medium", source="gamalytic", fetched_at=now,
+            ),
+            CommercialData(
+                appid=10, name="Game10", price=14.99,
+                revenue_min=900_000, revenue_max=1_100_000,
+                confidence="high", source="gamalytic", fetched_at=now,
+            ),
+        ])
+
+        # steamspy=None — no SteamSpy client
+        enriched, warnings, meta = await _enrich_with_gamalytic_bulk(
+            steamspy_games, mock_gamalytic,
+            steamspy=None, primary_tag="Roguelike",
+        )
+
+        # Revenue should be populated from Gamalytic even without SteamSpy
+        game9 = next(g for g in enriched if g["appid"] == 9)
+        game10 = next(g for g in enriched if g["appid"] == 10)
+        assert game9["revenue"] is not None, "Game9 should have revenue from Gamalytic"
+        assert game10["revenue"] is not None, "Game10 should have revenue from Gamalytic"
+
+        # Tags should remain empty (no SteamSpy to populate them)
+        assert game9.get("tags") == {}, f"Game9 tags should be empty dict, got {game9.get('tags')}"
+        assert game10.get("tags") == {}, f"Game10 tags should be empty dict, got {game10.get('tags')}"
+
+        # Meta: tags_found = 0 (no SteamSpy)
+        assert meta["tier1_5_tags_found"] == 0
+        assert meta["tier1_5_commercial_found"] == 2
+        mock_gamalytic.get_commercial_data.assert_not_called()
