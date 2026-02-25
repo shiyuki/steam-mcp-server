@@ -7,7 +7,8 @@ _compute_deltas, _compute_overlap, _compute_confidence_notes, and MCP tool valid
 """
 import json
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.market_tools import (
     _compute_percentiles,
@@ -29,6 +30,8 @@ from src.schemas import (
     MarketHealthScores,
     GameProfile,
     EngagementData,
+    CommercialData,
+    GameMetadata,
     APIError,
 )
 
@@ -1154,6 +1157,7 @@ class TestAppidsInput:
         """Appids-only path returns game dicts with correct field mapping."""
         mock_steamspy = MagicMock()
         mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
 
         async def mock_get_engagement(appid):
             return _make_engagement_data(appid)
@@ -1161,7 +1165,7 @@ class TestAppidsInput:
         mock_steamspy.get_engagement_data = mock_get_engagement
 
         games, data_source = await _fetch_game_list_steamspy(
-            mock_steamspy, mock_steam_store, tags=[], appids=[100, 200, 300]
+            mock_steamspy, mock_steam_store, mock_gamalytic, tags=[], appids=[100, 200, 300]
         )
 
         assert len(games) == 3
@@ -1184,9 +1188,10 @@ class TestAppidsInput:
 
     @pytest.mark.asyncio
     async def test_fetch_game_list_steamspy_appids_with_failures(self):
-        """Partial failures are skipped; successful results still returned."""
+        """Partial failures are skipped when Gamalytic fallback also fails."""
         mock_steamspy = MagicMock()
         mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
 
         async def mock_get_engagement(appid):
             if appid == 200:
@@ -1196,9 +1201,13 @@ class TestAppidsInput:
             return _make_engagement_data(appid)
 
         mock_steamspy.get_engagement_data = mock_get_engagement
+        # Gamalytic fallback also fails for both failed appids
+        mock_gamalytic.get_commercial_data = AsyncMock(
+            return_value=APIError(error_code=500, error_type="api_error", message="gamalytic unavailable")
+        )
 
         games, data_source = await _fetch_game_list_steamspy(
-            mock_steamspy, mock_steam_store, tags=[], appids=[100, 200, 300]
+            mock_steamspy, mock_steam_store, mock_gamalytic, tags=[], appids=[100, 200, 300]
         )
 
         assert len(games) == 1
@@ -1207,17 +1216,22 @@ class TestAppidsInput:
 
     @pytest.mark.asyncio
     async def test_fetch_game_list_steamspy_appids_empty_results(self):
-        """When all appids fail, returns empty list with steamspy_appids source."""
+        """When all appids fail (SteamSpy + Gamalytic), returns empty list."""
         mock_steamspy = MagicMock()
         mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
 
         async def mock_get_engagement(appid):
             raise RuntimeError("All fail")
 
         mock_steamspy.get_engagement_data = mock_get_engagement
+        # Gamalytic fallback also fails
+        mock_gamalytic.get_commercial_data = AsyncMock(
+            return_value=APIError(error_code=500, error_type="api_error", message="gamalytic down")
+        )
 
         games, data_source = await _fetch_game_list_steamspy(
-            mock_steamspy, mock_steam_store, tags=[], appids=[100, 200]
+            mock_steamspy, mock_steam_store, mock_gamalytic, tags=[], appids=[100, 200]
         )
 
         assert games == []
@@ -1228,6 +1242,7 @@ class TestAppidsInput:
         """When both tags and appids provided, tags take priority (existing path used)."""
         mock_steamspy = MagicMock()
         mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
 
         # Mock tag search to return a SearchResult
         from src.schemas import GameSummary, SearchResult
@@ -1260,7 +1275,7 @@ class TestAppidsInput:
         mock_steamspy.search_by_tag = AsyncMock(return_value=search_result)
 
         games, data_source = await _fetch_game_list_steamspy(
-            mock_steamspy, mock_steam_store, tags=["Action"], appids=[100, 200]
+            mock_steamspy, mock_steam_store, mock_gamalytic, tags=["Action"], appids=[100, 200]
         )
 
         # Tag path used — data_source is not "steamspy_appids"
@@ -1374,6 +1389,7 @@ class TestSupplementAndMultiTag:
 
         mock_steamspy = MagicMock()
         mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
 
         # SteamSpy returns 1950 games (above threshold)
         n_steamspy = STEAMSPY_SUPPLEMENT_THRESHOLD + 50  # 1950
@@ -1387,7 +1403,7 @@ class TestSupplementAndMultiTag:
         mock_steamspy.get_engagement_data = AsyncMock(side_effect=lambda appid: _make_engagement_data(appid))
 
         games, data_source = await _fetch_game_list_steamspy(
-            mock_steamspy, mock_steam_store, tags=["Roguelike"], appids=None
+            mock_steamspy, mock_steam_store, mock_gamalytic, tags=["Roguelike"], appids=None
         )
 
         # 1950 original + 2 new (appid 1 was filtered as duplicate)
@@ -1410,6 +1426,7 @@ class TestSupplementAndMultiTag:
 
         mock_steamspy = MagicMock()
         mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
 
         n_steamspy = STEAMSPY_SUPPLEMENT_THRESHOLD + 50
         search_result = self._make_search_result_with_n_games(n_steamspy, "Roguelike")
@@ -1422,7 +1439,7 @@ class TestSupplementAndMultiTag:
         mock_steam_store.search_by_tag_ids = AsyncMock()
 
         games, data_source = await _fetch_game_list_steamspy(
-            mock_steamspy, mock_steam_store, tags=["Roguelike"], appids=None
+            mock_steamspy, mock_steam_store, mock_gamalytic, tags=["Roguelike"], appids=None
         )
 
         # Original SteamSpy games returned unchanged
@@ -1439,6 +1456,7 @@ class TestSupplementAndMultiTag:
 
         mock_steamspy = MagicMock()
         mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
 
         n_steamspy = STEAMSPY_SUPPLEMENT_THRESHOLD + 50
         search_result = self._make_search_result_with_n_games(n_steamspy, "Roguelike")
@@ -1449,7 +1467,7 @@ class TestSupplementAndMultiTag:
         mock_steam_store.search_by_tag_ids = AsyncMock()
 
         games, data_source = await _fetch_game_list_steamspy(
-            mock_steamspy, mock_steam_store, tags=["Roguelike"], appids=None
+            mock_steamspy, mock_steam_store, mock_gamalytic, tags=["Roguelike"], appids=None
         )
 
         assert len(games) == n_steamspy
@@ -1462,6 +1480,7 @@ class TestSupplementAndMultiTag:
         resulting appids enriched via SteamSpy engagement data."""
         mock_steamspy = MagicMock()
         mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
 
         mock_steam_store.get_tag_map = AsyncMock(return_value={
             "roguelike": 12345,
@@ -1472,7 +1491,7 @@ class TestSupplementAndMultiTag:
         mock_steamspy.get_engagement_data = AsyncMock(side_effect=lambda appid: _make_engagement_data(appid))
 
         games, data_source = await _fetch_game_list_steamspy(
-            mock_steamspy, mock_steam_store, tags=["Roguelike", "Deckbuilder"], appids=None
+            mock_steamspy, mock_steam_store, mock_gamalytic, tags=["Roguelike", "Deckbuilder"], appids=None
         )
 
         assert len(games) == 3
@@ -1488,13 +1507,14 @@ class TestSupplementAndMultiTag:
         """Multi-tag path: any tag missing from tag_map returns empty list gracefully."""
         mock_steamspy = MagicMock()
         mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
 
         # "deckbuilder" is not in tag map
         mock_steam_store.get_tag_map = AsyncMock(return_value={"roguelike": 12345})
         mock_steam_store.search_by_tag_ids = AsyncMock()
 
         games, data_source = await _fetch_game_list_steamspy(
-            mock_steamspy, mock_steam_store, tags=["Roguelike", "Deckbuilder"], appids=None
+            mock_steamspy, mock_steam_store, mock_gamalytic, tags=["Roguelike", "Deckbuilder"], appids=None
         )
 
         assert games == []
@@ -1508,6 +1528,7 @@ class TestSupplementAndMultiTag:
         """Multi-tag path: search_by_tag_ids returning APIError returns empty list gracefully."""
         mock_steamspy = MagicMock()
         mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
 
         mock_steam_store.get_tag_map = AsyncMock(return_value={
             "roguelike": 12345,
@@ -1518,8 +1539,153 @@ class TestSupplementAndMultiTag:
         )
 
         games, data_source = await _fetch_game_list_steamspy(
-            mock_steamspy, mock_steam_store, tags=["Roguelike", "Deckbuilder"], appids=None
+            mock_steamspy, mock_steam_store, mock_gamalytic, tags=["Roguelike", "Deckbuilder"], appids=None
         )
 
         assert games == []
         assert data_source == "steam_store"
+
+
+# ---------------------------------------------------------------------------
+# TestEvaluateGameGamalyticFallback
+# ---------------------------------------------------------------------------
+
+class TestEvaluateGameGamalyticFallback:
+    """Regression tests for Gamalytic fallback in evaluate_game.
+
+    When SteamSpy returns APIError(502) for per-game engagement, evaluate_game
+    should populate review_score and owners from Gamalytic CommercialData.
+    When SteamSpy works, its values take priority over Gamalytic.
+    """
+
+    def _make_commercial_data(self, review_score=98.0, gamalytic_owners=13100000):
+        return CommercialData(
+            fetched_at=datetime(2026, 2, 25, tzinfo=timezone.utc),
+            appid=646570,
+            name="Slay the Spire",
+            revenue_min=50_000_000.0,
+            revenue_max=60_000_000.0,
+            confidence="high",
+            source="gamalytic",
+            gamalytic_revenue=55_000_000.0,
+            review_score=review_score,
+            gamalytic_owners=gamalytic_owners,
+        )
+
+    def _make_game_metadata(self, appid=646570):
+        return GameMetadata(
+            fetched_at=datetime(2026, 2, 25, tzinfo=timezone.utc),
+            appid=appid,
+            name="Slay the Spire",
+            release_date="2019-01-23",
+        )
+
+    def _make_steamspy_engagement(self, appid=646570, review_score=92.0, owners_midpoint=5_000_000.0):
+        return EngagementData(
+            fetched_at=datetime(2026, 2, 25, tzinfo=timezone.utc),
+            appid=appid,
+            name="Slay the Spire",
+            ccu=5000,
+            owners_min=2_000_000,
+            owners_max=5_000_000,
+            owners_midpoint=owners_midpoint,
+            average_forever=100.0,
+            average_2weeks=10.0,
+            median_forever=80.0,
+            median_2weeks=8.0,
+            positive=100000,
+            negative=5000,
+            total_reviews=105000,
+            price=24.99,
+            review_score=review_score,
+        )
+
+    @pytest.mark.asyncio
+    async def test_evaluate_game_gamalytic_fallback_review_owners(self):
+        """When SteamSpy returns APIError(502), review_score and owners fall back to Gamalytic."""
+        from src.tools import register_tools
+        from mcp.server.fastmcp import FastMCP
+        import src.tools as tools_module
+
+        mcp = FastMCP("test")
+        register_tools(mcp)
+
+        steamspy_error = APIError(error_code=502, error_type="api_error", message="SteamSpy unavailable")
+        commercial = self._make_commercial_data(review_score=98.0, gamalytic_owners=13_100_000)
+        metadata = self._make_game_metadata()
+
+        # genre analysis stub: valid result with no games (short-circuits percentile computation)
+        genre_result_stub = {"game_count": 0, "methodology": {"data_source": "steamspy"}}
+        genre_games_stub = []
+
+        captured_game_data = {}
+
+        async def fake_evaluate_game_analysis(**kwargs):
+            captured_game_data.update(kwargs.get("game_data", {}))
+            return {"appid": kwargs.get("appid"), "review_score_fallback_test": True}
+
+        with patch("src.tools.analyze_market_single", new=AsyncMock(return_value=(genre_result_stub, genre_games_stub))), \
+             patch.object(tools_module._gamalytic, "get_commercial_data", new=AsyncMock(return_value=commercial)), \
+             patch.object(tools_module._steamspy, "get_engagement_data", new=AsyncMock(return_value=steamspy_error)), \
+             patch.object(tools_module._steam_store, "get_app_details", new=AsyncMock(return_value=metadata)), \
+             patch.object(tools_module._review_client, "fetch_reviews", side_effect=Exception("skip reviews")), \
+             patch("src.tools.evaluate_game_analysis", new=AsyncMock(side_effect=fake_evaluate_game_analysis)):
+            tools = {t.name: t for t in mcp._tool_manager.list_tools()}
+            result_json = await tools["evaluate_game"].fn(appid=646570, genre="Roguelike")
+            result = json.loads(result_json)
+
+        # Result should reflect fake_evaluate_game_analysis output (not an error)
+        assert "error" not in result, f"Unexpected error: {result}"
+
+        # game_data should contain Gamalytic fallback values
+        assert captured_game_data.get("review_score") == 98.0, (
+            f"Expected review_score=98.0 from Gamalytic fallback, got {captured_game_data.get('review_score')}"
+        )
+        assert captured_game_data.get("owners") == 13_100_000, (
+            f"Expected owners=13100000 from Gamalytic fallback, got {captured_game_data.get('owners')}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_evaluate_game_steamspy_values_take_priority(self):
+        """When SteamSpy works, its review_score and owners take priority over Gamalytic."""
+        from src.tools import register_tools
+        from mcp.server.fastmcp import FastMCP
+        import src.tools as tools_module
+
+        mcp = FastMCP("test")
+        register_tools(mcp)
+
+        # SteamSpy returns valid engagement with review_score=92 and owners_midpoint=5M
+        engagement = self._make_steamspy_engagement(review_score=92.0, owners_midpoint=5_000_000.0)
+        # Gamalytic has different values — should NOT override SteamSpy
+        commercial = self._make_commercial_data(review_score=98.0, gamalytic_owners=13_100_000)
+        metadata = self._make_game_metadata()
+
+        genre_result_stub = {"game_count": 0, "methodology": {"data_source": "steamspy"}}
+        genre_games_stub = []
+
+        captured_game_data = {}
+
+        async def fake_evaluate_game_analysis(**kwargs):
+            captured_game_data.update(kwargs.get("game_data", {}))
+            return {"appid": kwargs.get("appid"), "priority_test": True}
+
+        with patch("src.tools.analyze_market_single", new=AsyncMock(return_value=(genre_result_stub, genre_games_stub))), \
+             patch.object(tools_module._gamalytic, "get_commercial_data", new=AsyncMock(return_value=commercial)), \
+             patch.object(tools_module._steamspy, "get_engagement_data", new=AsyncMock(return_value=engagement)), \
+             patch.object(tools_module._steam_store, "get_app_details", new=AsyncMock(return_value=metadata)), \
+             patch.object(tools_module._review_client, "fetch_reviews", side_effect=Exception("skip reviews")), \
+             patch("src.tools.evaluate_game_analysis", new=AsyncMock(side_effect=fake_evaluate_game_analysis)):
+            tools = {t.name: t for t in mcp._tool_manager.list_tools()}
+            result_json = await tools["evaluate_game"].fn(appid=646570, genre="Roguelike")
+            result = json.loads(result_json)
+
+        assert "error" not in result, f"Unexpected error: {result}"
+
+        # SteamSpy values should be present, not Gamalytic's
+        assert captured_game_data.get("review_score") == 92.0, (
+            f"Expected review_score=92.0 from SteamSpy, got {captured_game_data.get('review_score')}"
+        )
+        assert captured_game_data.get("owners") == 5_000_000.0, (
+            f"Expected owners=5000000.0 from SteamSpy, got {captured_game_data.get('owners')}"
+        )
