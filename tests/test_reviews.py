@@ -1334,6 +1334,13 @@ class TestFetchReviewsTool:
         assert result.get("error_type") == "validation"
         assert "limit" in result.get("error", "")
 
+    def test_default_limit_is_1000(self):
+        """Verify fetch_reviews default limit is 1000 (not 200)."""
+        import inspect
+        fn = _make_fetch_reviews_tool(AsyncMock())
+        sig = inspect.signature(fn)
+        assert sig.parameters["limit"].default == 1000
+
 
 # ---------------------------------------------------------------------------
 # TestEAPeriodScan
