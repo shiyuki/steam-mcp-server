@@ -923,6 +923,10 @@ def register_tools(mcp: FastMCP):
                 })
                 if not game_data.get("name"):
                     game_data["name"] = game_commercial.name
+                if not game_data.get("review_score") and game_commercial.review_score is not None:
+                    game_data["review_score"] = game_commercial.review_score
+                if not game_data.get("owners") and game_commercial.gamalytic_owners is not None:
+                    game_data["owners"] = game_commercial.gamalytic_owners
             if not isinstance(game_metadata, APIError):
                 game_data.setdefault("name", game_metadata.name)
                 game_data.setdefault("price", game_metadata.price)
