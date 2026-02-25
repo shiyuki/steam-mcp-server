@@ -1232,7 +1232,8 @@ async def analyze_market_single(
     include_raw: bool = False,
     market_label: str = "",
     skip_min_check: bool = False,
-) -> dict:
+    return_games: bool = False,
+) -> dict | tuple[dict, list]:
     """Single-phase market analysis: fetch games, enrich with two-tier Gamalytic, compute analytics.
 
     Enrichment strategy (two-tier):
@@ -2347,9 +2348,29 @@ async def compare_markets_analysis(
             market_game_sets.append((label, []))
             continue
 
-        # Run pure analysis
+        # Enrich with Gamalytic (consistent with analyze_market_single pipeline)
+        enrich_start = time.monotonic()
+        primary_tag = tags[0] if tags and len(tags) == 1 else None
+        enriched_games, enrich_warnings, enrichment_meta = await _enrich_with_gamalytic_bulk(
+            games, gamalytic, steamspy=steamspy, primary_tag=primary_tag
+        )
+        enrich_ms = round((time.monotonic() - enrich_start) * 1000)
+
+        # Update data_source to reflect enrichment
+        matched = enrichment_meta.get("matched", 0)
+        method = enrichment_meta.get("method", "none")
+        tier2 = enrichment_meta.get("tier2_count", 0)
+        if matched > 0:
+            data_source = f"{data_source}+gamalytic_{method}({matched}/{len(enriched_games)})"
+            if tier2 > 0:
+                data_source += f"+tier2({tier2})"
+
+        if enrich_warnings:
+            warnings.extend(enrich_warnings)
+
+        # Run pure analysis on enriched games
         analysis = _run_market_analysis(
-            games=games,
+            games=enriched_games,
             tags=tags,
             metrics=metrics,
             exclude=exclude,
@@ -2359,15 +2380,27 @@ async def compare_markets_analysis(
             data_source=data_source,
         )
 
-        # Attach fetch timing
+        # Attach fetch and enrichment timing
         if analysis.get("compute_time"):
             analysis["compute_time"]["data_fetch_ms"] = fetch_ms
+            analysis["compute_time"]["gamalytic_enrich_ms"] = enrich_ms
+
+        # Add enrichment metadata to market analysis
+        analysis["enrichment"] = {
+            "method": method,
+            "gamalytic_matched": matched,
+            "gamalytic_total": enrichment_meta.get("total_gamalytic", 0),
+            "match_rate": enrichment_meta.get("match_rate", 0.0),
+            "tag_used": enrichment_meta.get("tag_used"),
+            "total_games": len(enriched_games),
+            "tier2_count": tier2,
+        }
 
         if "error" in analysis:
             warnings.append(f"Market '{label}': {analysis['error']}")
 
         market_analyses.append((label, analysis))
-        market_game_sets.append((label, games))
+        market_game_sets.append((label, enriched_games))
 
     if not market_analyses:
         return {
@@ -2420,11 +2453,12 @@ async def compare_markets_analysis(
     methodology = {
         "market_count": len(market_analyses),
         "markets_analyzed": [label for label, _ in market_analyses],
-        "data_source": "steamspy",
+        "data_source": "steamspy+gamalytic_bulk",
         "biases": list(STANDARD_BIASES),
         "notes": [
             "Each market runs analyze_market independently.",
-            "Overlap detection by Steam AppID (exact match).",
+            "Each market enriched with Gamalytic bulk revenue data before analysis.",
+            "Overlap detection by Steam AppID (exact match) using enriched game lists.",
             "Health scores computed independently per market.",
         ],
     }
