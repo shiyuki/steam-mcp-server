@@ -1451,3 +1451,172 @@ class TestEnrichmentPipelineFixes:
         assert game.get("release_date") == "2020-06-15", (
             f"Expected '2020-06-15' from CommercialData fallback, got {game.get('release_date')!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestCompareMarketsEnrichment — 3 tests
+# ---------------------------------------------------------------------------
+
+class TestCompareMarketsEnrichment:
+    """Tests that compare_markets_analysis enriches each market with Gamalytic data."""
+
+    def _make_search_result(self, tag: str, n: int = 30, revenue_base: int = 50000):
+        """Return a mock SearchResult with n GameSummary objects."""
+        from src.schemas import GameSummary, SearchResult
+        games = [
+            GameSummary(
+                appid=i, name=f"Game {i}", developer="Dev", publisher="Pub",
+                ccu=100, owners_min=1000 * (n + 1 - i), owners_max=5000 * (n + 1 - i),
+                owners_midpoint=float(3000 * (n + 1 - i)),
+                average_forever=10.0, average_2weeks=1.0,
+                median_forever=8.0, median_2weeks=0.5,
+                positive=200, negative=10, price=9.99,
+            )
+            for i in range(1, n + 1)
+        ]
+        return SearchResult(
+            tag=tag, appids=[g.appid for g in games], total_found=n,
+            games=games, data_source="steamspy",
+            fetched_at="2026-01-01T00:00:00Z", cache_age_seconds=0,
+        )
+
+    def _make_gamalytic_games(self, n: int = 30, revenue: int = 500_000):
+        """Return list of Gamalytic game dicts with revenue data."""
+        return [
+            {"steamId": i, "name": f"Game {i}", "revenue": revenue * (n + 1 - i), "copiesSold": 10000}
+            for i in range(1, n + 1)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_compare_markets_calls_enrichment(self):
+        """Each market in compare_markets_analysis has an 'enrichment' key in its analysis."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import compare_markets_analysis
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+
+        # Must be AsyncMock: enrichment pipeline calls asyncio.gather with get_engagement_data
+        mock_steamspy.get_engagement_data = AsyncMock(return_value=None)
+
+        # Two markets: "Roguelike" and "Strategy"
+        mock_steamspy.search_by_tag = AsyncMock(side_effect=[
+            self._make_search_result("Roguelike", n=30),
+            self._make_search_result("Strategy", n=30),
+        ])
+
+        # Gamalytic returns matching game dicts for both markets
+        mock_gamalytic.list_games_by_tag = AsyncMock(side_effect=[
+            self._make_gamalytic_games(n=30),
+            self._make_gamalytic_games(n=30),
+        ])
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
+
+        result = await compare_markets_analysis(
+            market_inputs=[
+                {"tags": ["Roguelike"], "label": "Roguelike"},
+                {"tags": ["Strategy"], "label": "Strategy"},
+            ],
+            steamspy=mock_steamspy,
+            steam_store=mock_steam_store,
+            gamalytic=mock_gamalytic,
+        )
+
+        assert "error" not in result, f"Unexpected error: {result.get('error')}"
+        assert "markets" in result
+        for market_entry in result["markets"]:
+            analysis = market_entry["analysis"]
+            assert "enrichment" in analysis, (
+                f"Market '{market_entry['market_label']}' missing 'enrichment' key"
+            )
+            enrichment = analysis["enrichment"]
+            assert "method" in enrichment, "enrichment dict missing 'method' key"
+            assert enrichment["method"] is not None
+
+    @pytest.mark.asyncio
+    async def test_compare_markets_enriched_data_populates_metrics(self):
+        """With Gamalytic revenue data, revenue-dependent metrics become non-None."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import compare_markets_analysis
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+        mock_steamspy.get_engagement_data = AsyncMock(return_value=None)
+
+        # Markets with high overlap (all 30 games match Gamalytic)
+        mock_steamspy.search_by_tag = AsyncMock(side_effect=[
+            self._make_search_result("Action", n=30, revenue_base=0),
+            self._make_search_result("Indie", n=30, revenue_base=0),
+        ])
+        # Gamalytic provides revenue for all games
+        mock_gamalytic.list_games_by_tag = AsyncMock(side_effect=[
+            self._make_gamalytic_games(n=30, revenue=200_000),
+            self._make_gamalytic_games(n=30, revenue=100_000),
+        ])
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
+
+        result = await compare_markets_analysis(
+            market_inputs=[
+                {"tags": ["Action"], "label": "Action"},
+                {"tags": ["Indie"], "label": "Indie"},
+            ],
+            steamspy=mock_steamspy,
+            steam_store=mock_steam_store,
+            gamalytic=mock_gamalytic,
+        )
+
+        assert "error" not in result
+        for market_entry in result["markets"]:
+            analysis = market_entry["analysis"]
+            label = market_entry["market_label"]
+            # concentration should be populated (non-None) when games have revenue
+            concentration = analysis.get("concentration")
+            assert concentration is not None, (
+                f"Market '{label}': concentration is None despite Gamalytic revenue data"
+            )
+            # data_source in each market's methodology should include "gamalytic"
+            market_methodology = analysis.get("methodology") or {}
+            ds = market_methodology.get("data_source", "")
+            assert "gamalytic" in ds, (
+                f"Market '{label}': data_source '{ds}' does not include 'gamalytic'"
+            )
+
+    @pytest.mark.asyncio
+    async def test_compare_markets_methodology_reflects_enrichment(self):
+        """Top-level methodology data_source is 'steamspy+gamalytic_bulk'."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import compare_markets_analysis
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+        mock_steamspy.get_engagement_data = AsyncMock(return_value=None)
+
+        mock_steamspy.search_by_tag = AsyncMock(side_effect=[
+            self._make_search_result("Platformer", n=30),
+            self._make_search_result("Puzzle", n=30),
+        ])
+        mock_gamalytic.list_games_by_tag = AsyncMock(side_effect=[
+            self._make_gamalytic_games(n=30),
+            self._make_gamalytic_games(n=30),
+        ])
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
+
+        result = await compare_markets_analysis(
+            market_inputs=[
+                {"tags": ["Platformer"], "label": "Platformer"},
+                {"tags": ["Puzzle"], "label": "Puzzle"},
+            ],
+            steamspy=mock_steamspy,
+            steam_store=mock_steam_store,
+            gamalytic=mock_gamalytic,
+        )
+
+        assert "error" not in result
+        methodology = result.get("methodology") or {}
+        data_source = methodology.get("data_source", "")
+        assert data_source == "steamspy+gamalytic_bulk", (
+            f"Expected methodology data_source 'steamspy+gamalytic_bulk', got '{data_source}'"
+        )
