@@ -1620,3 +1620,132 @@ class TestCompareMarketsEnrichment:
         assert data_source == "steamspy+gamalytic_bulk", (
             f"Expected methodology data_source 'steamspy+gamalytic_bulk', got '{data_source}'"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestReturnGames — 3 tests
+# ---------------------------------------------------------------------------
+
+class TestReturnGames:
+    """Tests for return_games parameter on analyze_market_single."""
+
+    def _make_search_result(self, tag: str = "Roguelike", n: int = 30):
+        from src.schemas import GameSummary, SearchResult
+        games = [
+            GameSummary(
+                appid=i, name=f"Game {i}", developer="Dev", publisher="Pub",
+                ccu=100, owners_min=1000 * (n + 1 - i), owners_max=5000 * (n + 1 - i),
+                owners_midpoint=float(3000 * (n + 1 - i)),
+                average_forever=10.0, average_2weeks=1.0,
+                median_forever=8.0, median_2weeks=0.5,
+                positive=200, negative=10, price=9.99,
+            )
+            for i in range(1, n + 1)
+        ]
+        return SearchResult(
+            tag=tag, appids=[g.appid for g in games], total_found=n,
+            games=games, data_source="steamspy",
+            fetched_at="2026-01-01T00:00:00Z", cache_age_seconds=0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_analyze_market_single_return_games_false_default(self):
+        """analyze_market_single default (return_games not specified) returns a plain dict."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import analyze_market_single
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+        mock_steamspy.get_engagement_data = AsyncMock(return_value=None)
+        mock_steamspy.search_by_tag = AsyncMock(return_value=self._make_search_result())
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=[
+            {"steamId": i, "name": f"Game {i}", "revenue": 500_000 * (31 - i), "copiesSold": 10000}
+            for i in range(1, 31)
+        ])
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
+
+        result = await analyze_market_single(
+            steamspy=mock_steamspy, steam_store=mock_steam_store,
+            gamalytic=mock_gamalytic, tags=["Roguelike"],
+        )
+
+        # Without return_games, result is a plain dict (not a tuple)
+        assert isinstance(result, dict), f"Expected dict, got {type(result)}"
+        assert not isinstance(result, tuple)
+        assert "error" not in result
+
+    @pytest.mark.asyncio
+    async def test_analyze_market_single_return_games_true(self):
+        """analyze_market_single with return_games=True returns (dict, list) tuple with enriched games."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import analyze_market_single
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+        mock_steamspy.get_engagement_data = AsyncMock(return_value=None)
+        mock_steamspy.search_by_tag = AsyncMock(return_value=self._make_search_result())
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=[
+            {"steamId": i, "name": f"Game {i}", "revenue": 500_000 * (31 - i), "copiesSold": 10000}
+            for i in range(1, 31)
+        ])
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
+
+        result = await analyze_market_single(
+            steamspy=mock_steamspy, steam_store=mock_steam_store,
+            gamalytic=mock_gamalytic, tags=["Roguelike"],
+            return_games=True,
+        )
+
+        # With return_games=True, result is a (dict, list) tuple
+        assert isinstance(result, tuple), f"Expected tuple, got {type(result)}"
+        assert len(result) == 2
+        result_dict, games_list = result
+
+        assert isinstance(result_dict, dict)
+        assert "error" not in result_dict
+
+        assert isinstance(games_list, list)
+        assert len(games_list) == 30
+
+        # Gamalytic enrichment should have provided revenue for games
+        games_with_revenue = [g for g in games_list if g.get("revenue") is not None]
+        assert len(games_with_revenue) > 0, (
+            "Expected some games to have non-None revenue from Gamalytic enrichment"
+        )
+
+    @pytest.mark.asyncio
+    async def test_analyze_market_single_return_games_error_path(self):
+        """analyze_market_single with return_games=True returns (error_dict, []) on no-games error."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.schemas import SearchResult
+        from src.market_tools import analyze_market_single
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+
+        # SteamSpy returns zero games
+        empty_result = SearchResult(
+            tag="NonExistentTag99999", appids=[], total_found=0,
+            games=[], data_source="steamspy",
+            fetched_at="2026-01-01T00:00:00Z", cache_age_seconds=0,
+        )
+        mock_steamspy.search_by_tag = AsyncMock(return_value=empty_result)
+
+        result = await analyze_market_single(
+            steamspy=mock_steamspy, steam_store=mock_steam_store,
+            gamalytic=mock_gamalytic, tags=["NonExistentTag99999"],
+            return_games=True,
+        )
+
+        # Error path returns (error_dict, [])
+        assert isinstance(result, tuple), f"Expected tuple on error path, got {type(result)}"
+        assert len(result) == 2
+        error_dict, games_list = result
+
+        assert isinstance(error_dict, dict)
+        assert "error" in error_dict
+        assert isinstance(games_list, list)
+        assert games_list == [], f"Expected empty list on error path, got {games_list}"
