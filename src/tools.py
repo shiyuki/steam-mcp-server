@@ -708,11 +708,6 @@ def register_tools(mcp: FastMCP):
 
     # --- Phase 9: Market Analysis Tools ---
 
-    async def _fetch_game_list_for_analysis(tags, appids=None):
-        """Fetch flat game dict list from SteamSpy/Steam Store for the given tags or appids."""
-        games, data_source = await _fetch_game_list_steamspy(_steamspy, _steam_store, tags, appids=appids)
-        return games
-
     @mcp.tool()
     async def analyze_market(
         genre: str = "",
@@ -871,8 +866,8 @@ def register_tools(mcp: FastMCP):
                     appid, genre or "N/A", len(genre_appid_list or []), price_tier or "all")
 
         try:
-            # Step 1: Get genre baseline via analyze_market_single
-            genre_result = await analyze_market_single(
+            # Step 1: Get genre baseline via analyze_market_single, capturing enriched games list
+            genre_result, genre_games = await analyze_market_single(
                 steamspy=_steamspy,
                 steam_store=_steam_store,
                 gamalytic=_gamalytic,
@@ -884,6 +879,7 @@ def register_tools(mcp: FastMCP):
                 include_raw=False,
                 market_label="",
                 skip_min_check=bool(genre_appid_list),
+                return_games=True,
             )
 
             if "error" in genre_result:
@@ -937,13 +933,9 @@ def register_tools(mcp: FastMCP):
                     {"error": f"Game AppID {appid} not found or has no data", "error_type": "not_found"}
                 )
 
-            # Step 3: Get genre game list (tag-based or appids-based)
-            if genre_appid_list:
-                genre_games = await _fetch_game_list_for_analysis([], appids=genre_appid_list)
-            else:
-                genre_games = await _fetch_game_list_for_analysis(genre_tags)
-            if isinstance(genre_games, dict) and "error" in genre_games:
-                return json.dumps(genre_games)
+            # genre_games is populated from Step 1's enriched game list (Gamalytic-enriched)
+            if not genre_games:
+                genre_games = []
 
             # Step 4: Optionally get review data (compact, non-blocking)
             reviews_data = None
