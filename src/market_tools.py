@@ -16,6 +16,14 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from src.steam_api import GamalyticClient, SteamSpyClient, SteamStoreClient
 
+from src.timeout_utils import (
+    gather_with_timeout,
+    compute_gather_timeout,
+    STEAMSPY_RATE,
+    GAMALYTIC_RATE,
+    OVERALL_TIMEOUT,
+)
+
 from src.analytics import (
     PRICE_BRACKETS,
     STANDARD_BIASES,
@@ -684,8 +692,12 @@ async def _gamalytic_fallback(
         return []
 
     tasks = [_fetch_one_gamalytic(appid) for appid in appids]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    recovered = [r for r in results if isinstance(r, dict)]
+    gather_result = await gather_with_timeout(
+        tasks,
+        timeout=compute_gather_timeout(len(appids), GAMALYTIC_RATE),
+        label=f"gamalytic_fallback({len(appids)})",
+    )
+    recovered = [r for r in gather_result.results if isinstance(r, dict)]
     if recovered:
         logger.info(
             f"Gamalytic fallback: recovered {len(recovered)}/{len(appids)} appids "
@@ -747,7 +759,12 @@ async def _fetch_game_list_steamspy(
     if appids and not tags:
         logger.info(f"Appids-only fetch: fetching engagement data for {len(appids)} appids")
         tasks = [_fetch_one(appid) for appid in appids]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        gather_result = await gather_with_timeout(
+            tasks,
+            timeout=compute_gather_timeout(len(appids), STEAMSPY_RATE),
+            label=f"appids_only({len(appids)})",
+        )
+        results = gather_result.results
         games = [r for r in results if isinstance(r, dict)]
         failed_appids = [appids[i] for i, r in enumerate(results) if not isinstance(r, dict)]
         if failed_appids and gamalytic is not None:
@@ -799,8 +816,12 @@ async def _fetch_game_list_steamspy(
                                 if new_appids:
                                     # Enrich new appids with SteamSpy engagement data concurrently
                                     enrich_tasks = [_fetch_one(appid) for appid in new_appids]
-                                    enrich_results = await asyncio.gather(*enrich_tasks, return_exceptions=True)
-                                    new_games = [r for r in enrich_results if isinstance(r, dict)]
+                                    enrich_gr = await gather_with_timeout(
+                                        enrich_tasks,
+                                        timeout=compute_gather_timeout(len(new_appids), STEAMSPY_RATE),
+                                        label=f"supplement_enrich({len(new_appids)})",
+                                    )
+                                    new_games = [r for r in enrich_gr.results if isinstance(r, dict)]
                                     games.extend(new_games)
                                     data_source = "steamspy+steam_store"
                                     logger.info(f"Supplement added {len(new_games)} additional games (of {len(new_appids)} new appids)")
@@ -837,8 +858,12 @@ async def _fetch_game_list_steamspy(
 
             logger.info(f"Steam Store fallback: enriching {len(store_appids)} appids for tag '{tag}'")
             enrich_tasks = [_fetch_one(appid) for appid in store_appids]
-            enrich_results = await asyncio.gather(*enrich_tasks, return_exceptions=True)
-            games = [r for r in enrich_results if isinstance(r, dict)]
+            enrich_gr = await gather_with_timeout(
+                enrich_tasks,
+                timeout=compute_gather_timeout(len(store_appids), STEAMSPY_RATE),
+                label=f"store_fallback_enrich({len(store_appids)})",
+            )
+            games = [r for r in enrich_gr.results if isinstance(r, dict)]
             return games, "steam_store_fallback"
 
         except Exception as exc:
@@ -880,8 +905,12 @@ async def _fetch_game_list_steamspy(
 
         # Enrich appids with SteamSpy engagement data concurrently
         enrich_tasks = [_fetch_one(appid) for appid in store_appids]
-        enrich_results = await asyncio.gather(*enrich_tasks, return_exceptions=True)
-        games = [r for r in enrich_results if isinstance(r, dict)]
+        enrich_gr = await gather_with_timeout(
+            enrich_tasks,
+            timeout=compute_gather_timeout(len(store_appids), STEAMSPY_RATE),
+            label=f"multi_tag_enrich({len(store_appids)})",
+        )
+        games = [r for r in enrich_gr.results if isinstance(r, dict)]
         return games, "steam_store"
 
 
@@ -926,7 +955,16 @@ async def _enrich_with_gamalytic(
             return game
 
     tasks = [_enrich_one(g) for g in games]
-    enriched_games = await asyncio.gather(*tasks)
+    gather_result = await gather_with_timeout(
+        tasks,
+        timeout=compute_gather_timeout(len(games), GAMALYTIC_RATE),
+        label=f"enrich_gamalytic({len(games)})",
+        return_exceptions=True,
+    )
+    # _enrich_one always returns a dict (falls back to original game on error),
+    # but with return_exceptions=True, timeouts appear as exceptions
+    enriched_games = [r if isinstance(r, dict) else games[i]
+                      for i, r in enumerate(gather_result.results)]
 
     # Quota tracking
     quota_warning = increment_gamalytic_counter(len(games))
@@ -999,32 +1037,52 @@ async def _enrich_with_gamalytic_bulk(
     # --- Path 2: Tag provided -> try bulk endpoint ---
     tag_to_try = primary_tag
     gamalytic_games = None
+    pagination_meta = None  # Track pagination health for warnings
 
     # Try exact tag name first
     result = await gamalytic.list_games_by_tag(tag_to_try)
     if isinstance(result, APIErrorSchema):
         logger.warning(f"Gamalytic bulk list failed for tag '{tag_to_try}': {result.message}")
-    elif len(result) == 0:
-        # Tag returned 0 games — try normalized form
-        normalized = GAMALYTIC_TAG_NORMALIZATIONS.get(tag_to_try.lower())
-        if normalized and normalized.lower() != tag_to_try.lower():
-            logger.info(f"Gamalytic 0 results for '{tag_to_try}', trying normalized '{normalized}'")
-            result2 = await gamalytic.list_games_by_tag(normalized)
-            if not isinstance(result2, APIErrorSchema) and len(result2) > 0:
-                gamalytic_games = result2
-                tag_to_try = normalized
-                logger.info(f"Normalized tag '{normalized}' returned {len(gamalytic_games)} games")
-        if gamalytic_games is None:
-            # Also try stripping hyphens as a generic fallback
-            stripped = tag_to_try.replace("-", "").replace("_", " ")
-            if stripped.lower() != tag_to_try.lower():
-                logger.info(f"Gamalytic 0 results, trying stripped '{stripped}'")
-                result3 = await gamalytic.list_games_by_tag(stripped)
-                if not isinstance(result3, APIErrorSchema) and len(result3) > 0:
-                    gamalytic_games = result3
-                    tag_to_try = stripped
     else:
-        gamalytic_games = result
+        games_list, pagination_meta = result
+        if len(games_list) == 0:
+            # Tag returned 0 games — try normalized form
+            normalized = GAMALYTIC_TAG_NORMALIZATIONS.get(tag_to_try.lower())
+            if normalized and normalized.lower() != tag_to_try.lower():
+                logger.info(f"Gamalytic 0 results for '{tag_to_try}', trying normalized '{normalized}'")
+                result2 = await gamalytic.list_games_by_tag(normalized)
+                if not isinstance(result2, APIErrorSchema):
+                    games_list2, pagination_meta2 = result2
+                    if len(games_list2) > 0:
+                        gamalytic_games = games_list2
+                        pagination_meta = pagination_meta2
+                        tag_to_try = normalized
+                        logger.info(f"Normalized tag '{normalized}' returned {len(gamalytic_games)} games")
+            if gamalytic_games is None:
+                # Also try stripping hyphens as a generic fallback
+                stripped = tag_to_try.replace("-", "").replace("_", " ")
+                if stripped.lower() != tag_to_try.lower():
+                    logger.info(f"Gamalytic 0 results, trying stripped '{stripped}'")
+                    result3 = await gamalytic.list_games_by_tag(stripped)
+                    if not isinstance(result3, APIErrorSchema):
+                        games_list3, pagination_meta3 = result3
+                        if len(games_list3) > 0:
+                            gamalytic_games = games_list3
+                            pagination_meta = pagination_meta3
+                            tag_to_try = stripped
+        else:
+            gamalytic_games = games_list
+
+    # Surface pagination warnings if Gamalytic returned partial data
+    if pagination_meta and pagination_meta.get("is_partial"):
+        pg_warn = (
+            f"Gamalytic pagination: partial data — fetched {pagination_meta['pages_fetched']}/"
+            f"{pagination_meta.get('total_pages', '?')} pages "
+            f"({len(gamalytic_games or [])} of {pagination_meta.get('total_expected', '?')} expected games). "
+            f"Error: {pagination_meta.get('error', 'unknown')}"
+        )
+        warnings.append(pg_warn)
+        logger.warning(pg_warn)
 
     # If bulk fetch failed entirely, fall back to per-game
     if gamalytic_games is None or len(gamalytic_games) == 0:
@@ -1145,13 +1203,26 @@ async def _enrich_with_gamalytic_bulk(
         )
 
         tier1_5_tag_results = []
+        tier1_5_steamspy_timed_out = 0
+        tier1_5_steamspy_completed = 0
         if steamspy is not None:
             chunk_size = 50
             for chunk_start in range(0, len(tier1_5_appids), chunk_size):
                 chunk = tier1_5_appids[chunk_start:chunk_start + chunk_size]
                 chunk_tasks = [steamspy.get_engagement_data(appid) for appid in chunk]
-                chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
-                tier1_5_tag_results.extend(chunk_results)
+                chunk_gr = await gather_with_timeout(
+                    chunk_tasks,
+                    timeout=compute_gather_timeout(len(chunk), STEAMSPY_RATE),
+                    label=f"tier1_5_steamspy_chunk_{chunk_start}",
+                )
+                tier1_5_tag_results.extend(chunk_gr.results)
+                tier1_5_steamspy_completed += chunk_gr.completed
+                tier1_5_steamspy_timed_out += chunk_gr.timed_out
+                if chunk_gr.hit_timeout:
+                    warnings.append(
+                        f"Tier 1.5 SteamSpy chunk {chunk_start}: {chunk_gr.timed_out}/{len(chunk)} "
+                        f"requests timed out after {chunk_gr.timeout_seconds:.0f}s"
+                    )
                 if chunk_start + chunk_size < len(tier1_5_appids):
                     logger.info(
                         f"Tier 1.5 SteamSpy progress: {chunk_start + len(chunk)}/{len(tier1_5_appids)} games fetched"
@@ -1197,6 +1268,9 @@ async def _enrich_with_gamalytic_bulk(
         enrichment_meta["tier1_5_commercial_found"] = len(tier1_5_commercial)
         enrichment_meta["tier1_5_tags_found"] = len(tier1_5_tags)
         enrichment_meta["tier1_5_total"] = tier1_5_count
+        if tier1_5_steamspy_timed_out > 0:
+            enrichment_meta["tier1_5_steamspy_timed_out"] = tier1_5_steamspy_timed_out
+            enrichment_meta["tier1_5_steamspy_completed"] = tier1_5_steamspy_completed
         tier1_5_quota = increment_gamalytic_counter(len(tier1_5_appids))
         if tier1_5_quota:
             warnings.append(tier1_5_quota)
@@ -1231,7 +1305,17 @@ async def _enrich_with_gamalytic_bulk(
             tag_results = []
             if steamspy is not None:
                 tag_tasks = [steamspy.get_engagement_data(appid) for appid in tier2_appids]
-                tag_results = await asyncio.gather(*tag_tasks, return_exceptions=True)
+                tier2_gr = await gather_with_timeout(
+                    tag_tasks,
+                    timeout=compute_gather_timeout(len(tier2_appids), STEAMSPY_RATE),
+                    label=f"tier2_steamspy({len(tier2_appids)})",
+                )
+                tag_results = tier2_gr.results
+                if tier2_gr.hit_timeout:
+                    warnings.append(
+                        f"Tier 2 SteamSpy: {tier2_gr.timed_out}/{len(tier2_appids)} "
+                        f"requests timed out after {tier2_gr.timeout_seconds:.0f}s"
+                    )
             else:
                 tag_results = [None] * len(tier2_appids)
 
@@ -1322,6 +1406,8 @@ async def _enrich_with_gamalytic_bulk(
             )
 
     enrichment_meta["method"] = "bulk"
+    if pagination_meta:
+        enrichment_meta["gamalytic_pagination"] = pagination_meta
     return enriched_games, warnings, enrichment_meta
 
 
@@ -1438,7 +1524,52 @@ async def analyze_market_single(
         return_games: If True, return (result_dict, enriched_games_list) tuple instead of
             just result_dict. Allows callers to reuse enriched games without re-fetching.
             Default False preserves backward compatibility.
+
+    Overall timeout: OVERALL_TIMEOUT (3600s / 1 hour). If exceeded, returns an error
+    with elapsed time so the caller knows the operation timed out.
     """
+    overall_start = time.monotonic()
+    try:
+        return await asyncio.wait_for(
+            _analyze_market_single_impl(
+                steamspy, steam_store, gamalytic, tags, appids=appids,
+                metrics=metrics, exclude=exclude, top_n=top_n,
+                include_raw=include_raw, market_label=market_label,
+                skip_min_check=skip_min_check, return_games=return_games,
+            ),
+            timeout=OVERALL_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        elapsed = round(time.monotonic() - overall_start)
+        label = market_label or ", ".join(tags) or f"Custom ({len(appids or [])} games)"
+        logger.error(f"analyze_market_single OVERALL TIMEOUT ({OVERALL_TIMEOUT}s) for '{label}' after {elapsed}s")
+        error_result = {
+            "error": f"Analysis timed out after {elapsed}s (limit: {OVERALL_TIMEOUT}s). "
+                     "This may indicate API connectivity issues with SteamSpy or Gamalytic.",
+            "total_games": 0,
+            "market_label": label,
+            "warnings": [f"Overall timeout: {elapsed}s elapsed, {OVERALL_TIMEOUT}s limit"],
+        }
+        if return_games:
+            return error_result, []
+        return error_result
+
+
+async def _analyze_market_single_impl(
+    steamspy: "SteamSpyClient",
+    steam_store: "SteamStoreClient",
+    gamalytic: "GamalyticClient",
+    tags: list[str],
+    appids: list[int] | None = None,
+    metrics: list[str] | None = None,
+    exclude: list[str] | None = None,
+    top_n: int = 10,
+    include_raw: bool = False,
+    market_label: str = "",
+    skip_min_check: bool = False,
+    return_games: bool = False,
+) -> dict | tuple[dict, list]:
+    """Inner implementation of analyze_market_single, wrapped with overall timeout."""
     fetch_start = time.monotonic()
     games, data_source = await _fetch_game_list_steamspy(steamspy, steam_store, gamalytic, tags, appids=appids)
     fetch_ms = round((time.monotonic() - fetch_start) * 1000)
@@ -1487,7 +1618,17 @@ async def analyze_market_single(
         tag_fetch_targets = games_needing_tags[:TAG_FETCH_LIMIT]
         if tag_fetch_targets:
             tag_tasks = [steamspy.get_engagement_data(g["appid"]) for g in tag_fetch_targets]
-            tag_results = await asyncio.gather(*tag_tasks, return_exceptions=True)
+            indep_gr = await gather_with_timeout(
+                tag_tasks,
+                timeout=compute_gather_timeout(len(tag_fetch_targets), STEAMSPY_RATE),
+                label=f"independent_tags({len(tag_fetch_targets)})",
+            )
+            tag_results = indep_gr.results
+            if indep_gr.hit_timeout:
+                enrich_warnings.append(
+                    f"Independent tag fetch: {indep_gr.timed_out}/{len(tag_fetch_targets)} "
+                    f"requests timed out after {indep_gr.timeout_seconds:.0f}s"
+                )
             tag_lookup = {}
             for g, result in zip(tag_fetch_targets, tag_results):
                 if (result is not None
@@ -1551,7 +1692,7 @@ async def analyze_market_single(
         result["compute_time"]["gamalytic_enrich_ms"] = enrich_ms
 
     # Add enrichment metadata
-    result["enrichment"] = {
+    enrichment_dict = {
         "method": method,
         "gamalytic_matched": matched,
         "gamalytic_total": enrichment_meta.get("total_gamalytic", 0),
@@ -1562,6 +1703,23 @@ async def analyze_market_single(
         "tier2_threshold": enrichment_meta.get("tier2_threshold", GAMALYTIC_REVENUE_THRESHOLD_PCT),
         "total_revenue": enrichment_meta.get("total_revenue", 0.0),
     }
+    # Add timeout stats if any timeouts occurred
+    timeout_stats = {}
+    if enrichment_meta.get("tier1_5_steamspy_timed_out"):
+        timeout_stats["tier1_5_steamspy"] = {
+            "completed": enrichment_meta["tier1_5_steamspy_completed"],
+            "timed_out": enrichment_meta["tier1_5_steamspy_timed_out"],
+        }
+    if enrichment_meta.get("gamalytic_pagination", {}).get("is_partial"):
+        pg = enrichment_meta["gamalytic_pagination"]
+        timeout_stats["gamalytic_pagination"] = {
+            "pages_fetched": pg["pages_fetched"],
+            "total_pages": pg.get("total_pages"),
+            "is_partial": True,
+        }
+    if timeout_stats:
+        enrichment_dict["timeout_stats"] = timeout_stats
+    result["enrichment"] = enrichment_dict
 
     # Surface enrichment warnings
     if enrich_warnings:

@@ -15,6 +15,7 @@ from tenacity import (
 
 from src.cache import TTLCache, make_cache_key
 from src.rate_limiter import HostRateLimiter
+from src.timeout_utils import PER_REQUEST_TIMEOUT
 
 
 class CachedAPIClient:
@@ -73,6 +74,20 @@ class CachedAPIClient:
         response.raise_for_status()
         return response.json()
 
+    async def _fetch_with_timeout(self, url: str, params: dict = None, headers: dict = None) -> dict:
+        """Wrap _fetch() (including all retries) in a per-request timeout.
+
+        Prevents a single request from blocking indefinitely when retries
+        combine with rate limiter contention.
+
+        Raises:
+            asyncio.TimeoutError: If the entire retry cycle exceeds PER_REQUEST_TIMEOUT.
+        """
+        return await asyncio.wait_for(
+            self._fetch(url, params, headers),
+            timeout=PER_REQUEST_TIMEOUT,
+        )
+
     async def get(self, url: str, params: dict = None, cache_ttl: float = None, headers: dict = None) -> dict:
         """Make a cached, rate-limited GET request.
 
@@ -87,7 +102,7 @@ class CachedAPIClient:
         """
         if cache_ttl == 0:
             # Bypass cache, just fetch with rate limiting
-            return await self._fetch(url, params, headers)
+            return await self._fetch_with_timeout(url, params, headers)
 
         host = self._extract_host(url)
         endpoint = url.split(host)[-1] if host else url
@@ -95,7 +110,7 @@ class CachedAPIClient:
 
         entry = await self.cache.get_or_fetch(
             key=cache_key,
-            fetch_func=lambda: self._fetch(url, params, headers),
+            fetch_func=lambda: self._fetch_with_timeout(url, params, headers),
             ttl=cache_ttl,
         )
         return entry.value
@@ -115,7 +130,7 @@ class CachedAPIClient:
             Tuple of (data dict, fetched_at datetime, cache_age_seconds int)
         """
         if cache_ttl == 0:
-            data = await self._fetch(url, params, headers)
+            data = await self._fetch_with_timeout(url, params, headers)
             return data, datetime.now(timezone.utc), 0
 
         host = self._extract_host(url)
@@ -124,7 +139,7 @@ class CachedAPIClient:
 
         entry = await self.cache.get_or_fetch(
             key=cache_key,
-            fetch_func=lambda: self._fetch(url, params, headers),
+            fetch_func=lambda: self._fetch_with_timeout(url, params, headers),
             ttl=cache_ttl,
         )
         cache_age = int(time.monotonic() - entry.created_at)

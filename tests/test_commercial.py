@@ -1590,9 +1590,12 @@ class TestListGamesByTag:
         result = await client.list_games_by_tag("Roguelike Deckbuilder")
 
         assert not isinstance(result, APIError)
-        assert len(result) == 3
-        assert result[0]["steamId"] == 588650
-        assert result[0]["revenue"] == 85945035
+        games, meta = result
+        assert len(games) == 3
+        assert games[0]["steamId"] == 588650
+        assert games[0]["revenue"] == 85945035
+        assert meta["is_partial"] is False
+        assert meta["pages_fetched"] == 1
         mock_http.get_with_metadata.assert_called_once()
         assert "tags" in str(mock_http.get_with_metadata.call_args)
 
@@ -1623,8 +1626,11 @@ class TestListGamesByTag:
         client = GamalyticClient(mock_http)
         result = await client.list_games_by_tag("Roguelike", limit_per_page=2)
 
-        assert len(result) == 3
-        assert [g["steamId"] for g in result] == [1, 2, 3]
+        games, meta = result
+        assert len(games) == 3
+        assert [g["steamId"] for g in games] == [1, 2, 3]
+        assert meta["is_partial"] is False
+        assert meta["pages_fetched"] == 2
         assert mock_http.get_with_metadata.call_count == 2
 
     @pytest.mark.asyncio
@@ -1641,7 +1647,9 @@ class TestListGamesByTag:
         result = await client.list_games_by_tag("Rogue-like")
 
         assert not isinstance(result, APIError)
-        assert result == []
+        games, meta = result
+        assert games == []
+        assert meta["is_partial"] is False
 
     @pytest.mark.asyncio
     async def test_max_pages_cap(self):
@@ -1660,7 +1668,9 @@ class TestListGamesByTag:
         client = GamalyticClient(mock_http)
         result = await client.list_games_by_tag("Action", max_pages=1)
 
-        assert len(result) == 200
+        games, meta = result
+        assert len(games) == 200
+        assert meta["is_partial"] is False
         assert mock_http.get_with_metadata.call_count == 1
 
     @pytest.mark.asyncio
@@ -1693,4 +1703,5 @@ class TestListGamesByTag:
         client = GamalyticClient(mock_http)
         result = await client.list_games_by_tag("Roguelike")
 
-        assert result[0]["steamId"] == 588650  # int, not string
+        games, meta = result
+        assert games[0]["steamId"] == 588650  # int, not string

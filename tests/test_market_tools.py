@@ -38,6 +38,26 @@ from src.market_tools import (
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _pagination_meta(games_list, pages=1, is_partial=False, error=None):
+    """Build a pagination_meta dict matching list_games_by_tag's tuple return."""
+    return {
+        "is_partial": is_partial,
+        "pages_fetched": pages,
+        "total_pages": pages,
+        "total_expected": len(games_list),
+        "error": error,
+    }
+
+
+def _with_meta(games_list, **kwargs):
+    """Wrap a games list in the (games, pagination_meta) tuple for list_games_by_tag mocks."""
+    return (games_list, _pagination_meta(games_list, **kwargs))
+
+
+# ---------------------------------------------------------------------------
 # Test factory (module-level, not pytest fixtures)
 # ---------------------------------------------------------------------------
 
@@ -758,7 +778,7 @@ class TestBulkEnrichmentCrossValidation:
             {"steamId": i, "name": f"Game{i}", "revenue": 1000000 * i, "copiesSold": 50000 * i}
             for i in range(1, 301)
         ]
-        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=gamalytic_games)
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=_with_meta(gamalytic_games))
         # Tier 2 mocks (get_commercial_batch returns empty for simplicity)
         mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
 
@@ -796,7 +816,7 @@ class TestBulkEnrichmentCrossValidation:
             {"steamId": i, "name": f"SmallGame{i}", "revenue": 1_000_000, "copiesSold": 50000}
             for i in range(2, 11)
         ]
-        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=gamalytic_games)
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=_with_meta(gamalytic_games))
 
         # Tier 2: get_commercial_batch returns full data for qualifying games
         mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[
@@ -857,7 +877,7 @@ class TestBulkEnrichmentCrossValidation:
             {"steamId": 9000 + i, "name": f"OtherGame{i}", "revenue": 500000}
             for i in range(100)
         ]
-        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=gamalytic_games)
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=_with_meta(gamalytic_games))
         # Per-game fallback mock
         mock_gamalytic.get_commercial_data = AsyncMock(return_value=CommercialData(
             appid=1, name="Test", price=9.99,
@@ -951,7 +971,7 @@ class TestAnalyzeMarketSingle:
             {"steamId": i, "name": f"Game {i}", "revenue": 1000000 * (31 - i), "copiesSold": 50000}
             for i in range(1, 31)
         ]
-        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=gamalytic_games)
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=_with_meta(gamalytic_games))
         mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
 
         result = await analyze_market_single(
@@ -993,9 +1013,10 @@ class TestAnalyzeMarketSingle:
             games=games, data_source="steamspy",
             fetched_at="2026-01-01T00:00:00Z", cache_age_seconds=0,
         ))
-        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=[
+        _inline_games = [
             {"steamId": i, "name": f"Game {i}", "revenue": 100000} for i in range(1, 31)
-        ])
+        ]
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=_with_meta(_inline_games))
         mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
 
         result = await analyze_market_single(
@@ -1285,7 +1306,7 @@ class TestValidationFlagsInResult:
             {"steamId": i, "name": f"SmallGame{i}", "revenue": 100_000, "copiesSold": 5000}
             for i in range(2, 26)
         ]
-        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=gamalytic_games)
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=_with_meta(gamalytic_games))
 
         # Tier 2: full CommercialData for BigGame
         mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[
@@ -1350,7 +1371,7 @@ class TestEnrichmentPipelineFixes:
             {"steamId": i, "name": f"Game{i}", "revenue": 500_000, "copiesSold": 10000}
             for i in range(1, 71)
         ]
-        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=gamalytic_games)
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=_with_meta(gamalytic_games))
         mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
 
         # 100 SteamSpy games: owners ascending by appid (appid 100 has most owners)
@@ -1391,7 +1412,7 @@ class TestEnrichmentPipelineFixes:
             }
             for i in range(1, 71)
         ]
-        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=gamalytic_games)
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=_with_meta(gamalytic_games))
         mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
 
         steamspy_games = [
@@ -1427,7 +1448,7 @@ class TestEnrichmentPipelineFixes:
 
         mock_gamalytic = MagicMock()
         # Bulk fetch returns nothing (empty) -> cross-validation fails -> per-game fallback
-        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=[])
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=_with_meta([]))
 
         # Per-game fallback: CommercialData with release_date set
         mock_gamalytic.get_commercial_data = AsyncMock(return_value=CommercialData(
@@ -1507,9 +1528,11 @@ class TestCompareMarketsEnrichment:
         ])
 
         # Gamalytic returns matching game dicts for both markets
+        _gam1 = self._make_gamalytic_games(n=30)
+        _gam2 = self._make_gamalytic_games(n=30)
         mock_gamalytic.list_games_by_tag = AsyncMock(side_effect=[
-            self._make_gamalytic_games(n=30),
-            self._make_gamalytic_games(n=30),
+            _with_meta(_gam1),
+            _with_meta(_gam2),
         ])
         mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
 
@@ -1551,9 +1574,11 @@ class TestCompareMarketsEnrichment:
             self._make_search_result("Indie", n=30, revenue_base=0),
         ])
         # Gamalytic provides revenue for all games
+        _gam_action = self._make_gamalytic_games(n=30, revenue=200_000)
+        _gam_indie = self._make_gamalytic_games(n=30, revenue=100_000)
         mock_gamalytic.list_games_by_tag = AsyncMock(side_effect=[
-            self._make_gamalytic_games(n=30, revenue=200_000),
-            self._make_gamalytic_games(n=30, revenue=100_000),
+            _with_meta(_gam_action),
+            _with_meta(_gam_indie),
         ])
         mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
 
@@ -1598,9 +1623,11 @@ class TestCompareMarketsEnrichment:
             self._make_search_result("Platformer", n=30),
             self._make_search_result("Puzzle", n=30),
         ])
+        _gam_plat = self._make_gamalytic_games(n=30)
+        _gam_puzz = self._make_gamalytic_games(n=30)
         mock_gamalytic.list_games_by_tag = AsyncMock(side_effect=[
-            self._make_gamalytic_games(n=30),
-            self._make_gamalytic_games(n=30),
+            _with_meta(_gam_plat),
+            _with_meta(_gam_puzz),
         ])
         mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
 
@@ -1659,10 +1686,11 @@ class TestReturnGames:
         mock_gamalytic = MagicMock()
         mock_steamspy.get_engagement_data = AsyncMock(return_value=None)
         mock_steamspy.search_by_tag = AsyncMock(return_value=self._make_search_result())
-        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=[
+        _inline_games2 = [
             {"steamId": i, "name": f"Game {i}", "revenue": 500_000 * (31 - i), "copiesSold": 10000}
             for i in range(1, 31)
-        ])
+        ]
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=_with_meta(_inline_games2))
         mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
 
         result = await analyze_market_single(
@@ -1686,10 +1714,11 @@ class TestReturnGames:
         mock_gamalytic = MagicMock()
         mock_steamspy.get_engagement_data = AsyncMock(return_value=None)
         mock_steamspy.search_by_tag = AsyncMock(return_value=self._make_search_result())
-        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=[
+        _inline_games3 = [
             {"steamId": i, "name": f"Game {i}", "revenue": 500_000 * (31 - i), "copiesSold": 10000}
             for i in range(1, 31)
-        ])
+        ]
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=_with_meta(_inline_games3))
         mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
 
         result = await analyze_market_single(
@@ -1992,7 +2021,7 @@ class TestTier15Enrichment:
             {"steamId": i, "name": f"Game{i}", "revenue": 1_000_000, "copiesSold": 5000}
             for i in gamalytic_appids
         ]
-        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=gamalytic_games)
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=_with_meta(gamalytic_games))
         steamspy_games = [
             {"appid": i, "name": f"Game{i}", "owners": 50_000, "revenue": None, "tags": {}}
             for i in steamspy_appids

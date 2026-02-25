@@ -16,6 +16,7 @@ from src.schemas import (
     GamalyticHistoryEntry, CountryDataEntry, CompetitorEntry, EstimateModelEntry, DLCEntry,
 )
 from src.logging_config import get_logger
+from src.timeout_utils import gather_with_timeout, compute_gather_timeout, GAMALYTIC_RATE
 
 logger = get_logger(__name__)
 
@@ -637,7 +638,13 @@ class SteamSpyClient:
         # Branch 2: AppID-list (concurrent individual calls)
         elif appids:
             tasks = [self.get_engagement_data(appid) for appid in appids]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            from src.timeout_utils import STEAMSPY_RATE as _SS_RATE
+            gr = await gather_with_timeout(
+                tasks,
+                timeout=compute_gather_timeout(len(appids), _SS_RATE),
+                label=f"aggregate_engagement({len(appids)})",
+            )
+            results = gr.results
 
             for appid, result in zip(appids, results):
                 if isinstance(result, Exception):
@@ -1666,6 +1673,7 @@ class GamalyticClient:
         """Fetch commercial data for multiple AppIDs concurrently.
 
         Rate limiting handled by HostRateLimiter (5 req/s for gamalytic.com).
+        Gather is wrapped in a scaled timeout to prevent indefinite hangs.
 
         Args:
             appids: List of Steam AppIDs
@@ -1675,11 +1683,16 @@ class GamalyticClient:
             List of CommercialData or APIError for each AppID (same order as input)
         """
         tasks = [self.get_commercial_data(appid, detail_level=detail_level) for appid in appids]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        gather_result = await gather_with_timeout(
+            tasks,
+            timeout=compute_gather_timeout(len(appids), GAMALYTIC_RATE),
+            label=f"commercial_batch({len(appids)})",
+            return_exceptions=True,
+        )
         return [
             r if isinstance(r, (CommercialData, APIError))
             else APIError(error_code=502, error_type="api_error", message=str(r))
-            for r in results
+            for r in gather_result.results
         ]
 
     async def list_games_by_tag(
@@ -1688,7 +1701,7 @@ class GamalyticClient:
         fields: str = "steamId,name,revenue,copiesSold,reviewScore,price,releaseDate,genres",
         limit_per_page: int = 200,
         max_pages: int | None = None,
-    ) -> list[dict] | APIError:
+    ) -> tuple[list[dict], dict] | APIError:
         """Fetch games by tag from Gamalytic bulk list endpoint with pagination.
 
         Uses GET /steam-games/list?tags={tag}&limit={limit}&page={N}&fields={fields}&sort=revenue&sort_mode=desc
@@ -1702,11 +1715,28 @@ class GamalyticClient:
             max_pages: Optional cap on pages fetched. None = fetch all pages.
 
         Returns:
-            List of game dicts with requested fields (steamId as int), or APIError on failure.
-            Each dict has keys matching the fields parameter (steamId, name, revenue, etc.)
+            Tuple of (games_list, pagination_meta) or APIError on total failure.
+            games_list: List of game dicts with requested fields (steamId as int).
+            pagination_meta: Dict with keys:
+                - is_partial (bool): True if pagination was interrupted by error.
+                - pages_fetched (int): Number of pages successfully fetched.
+                - total_pages (int | None): Total pages reported by API.
+                - total_expected (int | None): Total games reported by API.
+                - error (str | None): Error message if partial, else None.
         """
         all_games: list[dict] = []
         page = 1
+        total_pages_reported: int | None = None
+        total_games_reported: int | None = None
+
+        def _make_meta(*, is_partial: bool = False, error: str | None = None) -> dict:
+            return {
+                "is_partial": is_partial,
+                "pages_fetched": page - 1 if is_partial else page,
+                "total_pages": total_pages_reported,
+                "total_expected": total_games_reported,
+                "error": error,
+            }
 
         try:
             while True:
@@ -1725,13 +1755,13 @@ class GamalyticClient:
 
                 # Parse response: {"pages": N, "total": M, "result": [...], "next": {...}}
                 results = data.get("result", [])
-                total_pages = data.get("pages", 0)
-                total_games = data.get("total", 0)
+                total_pages_reported = data.get("pages", 0)
+                total_games_reported = data.get("total", 0)
 
                 if page == 1:
                     logger.info(
-                        f"Gamalytic list_games_by_tag '{tag}': {total_games} total games, "
-                        f"{total_pages} pages at {limit_per_page}/page"
+                        f"Gamalytic list_games_by_tag '{tag}': {total_games_reported} total games, "
+                        f"{total_pages_reported} pages at {limit_per_page}/page"
                     )
 
                 if not results:
@@ -1745,7 +1775,7 @@ class GamalyticClient:
                     all_games.append(game)
 
                 # Check pagination bounds
-                if page >= total_pages:
+                if page >= total_pages_reported:
                     break
                 if max_pages is not None and page >= max_pages:
                     logger.info(f"Gamalytic list: reached max_pages={max_pages}, stopping at {len(all_games)} games")
@@ -1755,28 +1785,36 @@ class GamalyticClient:
 
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
-            logger.warning(f"Gamalytic list API error {status} for tag '{tag}'")
+            error_msg = f"Gamalytic list API error {status} for tag '{tag}' on page {page}"
+            logger.warning(error_msg)
             if all_games:
-                # Partial results: return what we have with a warning logged
-                logger.warning(f"Returning {len(all_games)} partial results from {page - 1} pages")
-                return all_games
+                logger.warning(
+                    f"Returning {len(all_games)} PARTIAL results from {page - 1} pages "
+                    f"(expected {total_games_reported} from {total_pages_reported} pages)"
+                )
+                return all_games, _make_meta(is_partial=True, error=error_msg)
             return APIError(
                 error_code=status,
                 error_type="rate_limit" if status == 429 else "api_error",
-                message=f"Gamalytic list API error: {status} for tag '{tag}'"
+                message=error_msg,
             )
         except Exception as e:
-            logger.error(f"Gamalytic list_games_by_tag error for tag '{tag}': {e}")
+            error_msg = f"Gamalytic list_games_by_tag error for tag '{tag}' on page {page}: {e}"
+            logger.error(error_msg)
             if all_games:
-                return all_games
+                logger.warning(
+                    f"Returning {len(all_games)} PARTIAL results from {page - 1} pages "
+                    f"(expected {total_games_reported} from {total_pages_reported} pages)"
+                )
+                return all_games, _make_meta(is_partial=True, error=error_msg)
             return APIError(
                 error_code=502,
                 error_type="api_error",
-                message=f"Gamalytic list endpoint failed for tag '{tag}': {e}"
+                message=f"Gamalytic list endpoint failed for tag '{tag}': {e}",
             )
 
         logger.info(f"Gamalytic list_games_by_tag '{tag}': fetched {len(all_games)} games across {page} pages")
-        return all_games
+        return all_games, _make_meta()
 
 
 class SteamReviewClient:
