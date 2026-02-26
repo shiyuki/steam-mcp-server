@@ -864,6 +864,193 @@ class TestBulkEnrichmentCrossValidation:
         assert big_game.get("tags") == {"Roguelike": 1000, "Action": 800}  # from SteamSpy
 
     @pytest.mark.asyncio
+    async def test_tier2_revenue_downgrade_blocked(self):
+        """Tier 2 never overwrites a higher Tier 1 bulk revenue with a lower fallback estimate."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import _enrich_with_gamalytic_bulk
+        from src.schemas import CommercialData, EngagementData
+        from datetime import datetime, timezone
+
+        mock_gamalytic = MagicMock()
+        now = datetime.now(timezone.utc)
+
+        # Gamalytic bulk: game 1 reported at 90M (Tier 1 bulk revenue)
+        gamalytic_games = [
+            {"steamId": 1, "name": "MegaGame", "revenue": 90_000_000, "copiesSold": 5_000_000},
+        ] + [
+            {"steamId": i, "name": f"SmallGame{i}", "revenue": 1_000_000, "copiesSold": 50_000}
+            for i in range(2, 11)
+        ]
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=_with_meta(gamalytic_games))
+
+        # Tier 2: get_commercial_batch returns a LOW per-game estimate (review-based fallback)
+        # midpoint = (4M + 6M) / 2 = 5M — far below the 90M bulk figure
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[
+            CommercialData(
+                appid=1, name="MegaGame", price=29.99,
+                revenue_min=4_000_000, revenue_max=6_000_000,
+                confidence="low", source="gamalytic",
+                fetched_at=now,
+                followers=500_000,
+            )
+        ])
+
+        # SteamSpy mock for Tier 2 tag weights
+        mock_steamspy = MagicMock()
+        mock_steamspy.get_engagement_data = AsyncMock(return_value=EngagementData(
+            appid=1, name="MegaGame", ccu=5000, owners_midpoint=5_000_000.0,
+            owners_min=4_000_000, owners_max=6_000_000,
+            average_forever=50.0, average_2weeks=10.0,
+            median_forever=40.0, median_2weeks=8.0,
+            positive=50_000, negative=2_000, price=29.99,
+            review_score=96.2, tags={"Action": 1000, "Roguelike": 800},
+            developer="Dev", publisher="Pub",
+            fetched_at=now, total_reviews=52_000,
+        ))
+
+        steamspy_games = [
+            {"appid": 1, "name": "MegaGame", "owners": 5_000_000, "revenue": None, "tags": {}},
+        ] + [
+            {"appid": i, "name": f"SmallGame{i}", "owners": 50_000, "revenue": None, "tags": {}}
+            for i in range(2, 11)
+        ]
+
+        enriched, warnings, meta = await _enrich_with_gamalytic_bulk(
+            steamspy_games, mock_gamalytic, steamspy=mock_steamspy, primary_tag="Action"
+        )
+
+        big_game = next(g for g in enriched if g["appid"] == 1)
+        # Guard: Tier 2 must NOT downgrade from 90M to 5M
+        assert big_game["revenue"] == 90_000_000, (
+            f"Tier 2 should not downgrade revenue from 90M to 5M; got {big_game['revenue']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_tier2_revenue_upgrade_allowed(self):
+        """Tier 2 upgrades revenue when per-game data is genuinely higher than Tier 1 bulk."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import _enrich_with_gamalytic_bulk
+        from src.schemas import CommercialData, EngagementData
+        from datetime import datetime, timezone
+
+        mock_gamalytic = MagicMock()
+        now = datetime.now(timezone.utc)
+
+        # Gamalytic bulk: game 1 reported at only 5M (undercount in bulk endpoint)
+        gamalytic_games = [
+            {"steamId": 1, "name": "MegaGame", "revenue": 5_000_000, "copiesSold": 5_000_000},
+        ] + [
+            {"steamId": i, "name": f"SmallGame{i}", "revenue": 1_000_000, "copiesSold": 50_000}
+            for i in range(2, 11)
+        ]
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=_with_meta(gamalytic_games))
+
+        # Tier 2: get_commercial_batch returns a genuinely HIGHER per-game value
+        # midpoint = (72M + 108M) / 2 = 90M — correct per-game data
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[
+            CommercialData(
+                appid=1, name="MegaGame", price=29.99,
+                revenue_min=72_000_000, revenue_max=108_000_000,
+                confidence="high", source="gamalytic",
+                fetched_at=now,
+                followers=500_000,
+            )
+        ])
+
+        # SteamSpy mock for Tier 2 tag weights
+        mock_steamspy = MagicMock()
+        mock_steamspy.get_engagement_data = AsyncMock(return_value=EngagementData(
+            appid=1, name="MegaGame", ccu=5000, owners_midpoint=5_000_000.0,
+            owners_min=4_000_000, owners_max=6_000_000,
+            average_forever=50.0, average_2weeks=10.0,
+            median_forever=40.0, median_2weeks=8.0,
+            positive=50_000, negative=2_000, price=29.99,
+            review_score=96.2, tags={"Action": 1000, "Roguelike": 800},
+            developer="Dev", publisher="Pub",
+            fetched_at=now, total_reviews=52_000,
+        ))
+
+        steamspy_games = [
+            {"appid": 1, "name": "MegaGame", "owners": 5_000_000, "revenue": None, "tags": {}},
+        ] + [
+            {"appid": i, "name": f"SmallGame{i}", "owners": 50_000, "revenue": None, "tags": {}}
+            for i in range(2, 11)
+        ]
+
+        enriched, warnings, meta = await _enrich_with_gamalytic_bulk(
+            steamspy_games, mock_gamalytic, steamspy=mock_steamspy, primary_tag="Action"
+        )
+
+        big_game = next(g for g in enriched if g["appid"] == 1)
+        # Guard: Tier 2 SHOULD upgrade from 5M to 90M when per-game data is higher
+        assert big_game["revenue"] == 90_000_000, (
+            f"Tier 2 should upgrade revenue from 5M to 90M; got {big_game['revenue']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_tier1_5_revenue_downgrade_blocked(self):
+        """Tier 1.5 never overwrites a higher Tier 1 bulk revenue with a lower fallback estimate."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import _enrich_with_gamalytic_bulk
+        from src.schemas import CommercialData, EngagementData
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+
+        # Gamalytic bulk: appids 1-8 present (game 9 is NOT in bulk — Tier 1.5 will fire for it)
+        # But game 9 already has revenue=50M set (simulating it was populated by prior data)
+        mock_gamalytic = MagicMock()
+        gamalytic_games = [
+            {"steamId": i, "name": f"Game{i}", "revenue": 1_000_000, "copiesSold": 5000}
+            for i in range(1, 9)
+        ]
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=_with_meta(gamalytic_games))
+        mock_gamalytic.get_commercial_batch = AsyncMock(side_effect=[
+            # First call: Tier 2 (empty — no Tier 2 games qualify after setting revenue=50M on game9 only)
+            [],
+            # Second call: Tier 1.5 — returns a LOW estimate for game 9
+            [
+                CommercialData(
+                    appid=9, name="MegaGame9", price=19.99,
+                    revenue_min=1_500_000, revenue_max=2_500_000,
+                    confidence="low", source="gamalytic",
+                    fetched_at=now,
+                )
+            ],
+        ])
+
+        # SteamSpy mock (needed for Tier 1.5 tag fetch)
+        mock_steamspy = MagicMock()
+        mock_steamspy.get_engagement_data = AsyncMock(return_value=EngagementData(
+            appid=9, name="MegaGame9", ccu=1000, owners_midpoint=500_000.0,
+            owners_min=400_000, owners_max=600_000,
+            average_forever=30.0, average_2weeks=5.0,
+            median_forever=20.0, median_2weeks=3.0,
+            positive=10_000, negative=500, price=19.99,
+            review_score=95.0, tags={"Action": 500, "RPG": 300},
+            developer="Dev9", publisher="Pub9",
+            fetched_at=now, total_reviews=10_500,
+        ))
+
+        # Game 9 already has revenue=50_000_000 from Tier 1 bulk (e.g., from a prior merge step)
+        steamspy_games = [
+            {"appid": i, "name": f"Game{i}", "owners": 50_000, "revenue": None, "tags": {}}
+            for i in range(1, 9)
+        ] + [
+            {"appid": 9, "name": "MegaGame9", "owners": 5_000_000, "revenue": 50_000_000, "tags": {}},
+        ]
+
+        enriched, warnings, meta = await _enrich_with_gamalytic_bulk(
+            steamspy_games, mock_gamalytic, steamspy=mock_steamspy, primary_tag="Action"
+        )
+
+        game9 = next(g for g in enriched if g["appid"] == 9)
+        # Guard: Tier 1.5 must NOT downgrade from 50M to 2M
+        assert game9["revenue"] == 50_000_000, (
+            f"Tier 1.5 should not downgrade revenue from 50M to 2M; got {game9['revenue']}"
+        )
+
+    @pytest.mark.asyncio
     async def test_bulk_enrichment_low_overlap_falls_back(self):
         """When <60% overlap, falls back to per-game enrichment."""
         from unittest.mock import AsyncMock, MagicMock
@@ -927,6 +1114,169 @@ class TestBulkEnrichmentCrossValidation:
         assert meta["method"] == "per_game"
         # get_commercial_data should have been called (per-game path)
         assert mock_gamalytic.get_commercial_data.call_count == 5
+
+
+# ---------------------------------------------------------------------------
+# TestUnionBulkEnrichment — tests for multi-tag union-bulk path
+# ---------------------------------------------------------------------------
+
+class TestUnionBulkEnrichment:
+    """Test _enrich_with_gamalytic_bulk union-bulk path for multi-tag queries."""
+
+    @pytest.mark.asyncio
+    async def test_union_bulk_merges_multiple_tags(self):
+        """Union-bulk fetches each tag and merges lookups."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import _enrich_with_gamalytic_bulk
+
+        mock_gamalytic = MagicMock()
+
+        # Tag A: appids 1-100 with revenue
+        tag_a_games = [
+            {"steamId": i, "name": f"GameA{i}", "revenue": 100000 * i, "copiesSold": 5000 * i}
+            for i in range(1, 101)
+        ]
+        # Tag B: appids 50-150 with revenue (overlap: 50-100)
+        tag_b_games = [
+            {"steamId": i, "name": f"GameB{i}", "revenue": 100000 * i, "copiesSold": 5000 * i}
+            for i in range(50, 151)
+        ]
+
+        call_count = 0
+        async def mock_list_games(tag, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if "TagA" in tag:
+                return _with_meta(tag_a_games)
+            elif "TagB" in tag:
+                return _with_meta(tag_b_games)
+            return _with_meta([])
+
+        mock_gamalytic.list_games_by_tag = mock_list_games
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
+
+        # Input games: appids 1-80 (all in tag A, 50-80 also in tag B)
+        input_games = [
+            {"appid": i, "name": f"Game{i}", "owners": 10000 * (81 - i), "revenue": None}
+            for i in range(1, 81)
+        ]
+
+        enriched, warnings, meta = await _enrich_with_gamalytic_bulk(
+            input_games, mock_gamalytic, tags=["TagA", "TagB"]
+        )
+
+        assert meta["method"] == "union_bulk"
+        assert isinstance(meta["tag_used"], list)
+        assert "TagA" in meta["tag_used"]
+        assert "TagB" in meta["tag_used"]
+        # Union should have 150 unique games (1-100 from A + 101-150 from B)
+        assert meta["total_gamalytic"] == 150
+        # Match rate: all 80 input appids found in union (100%)
+        assert meta["match_rate"] == 1.0
+        # Revenue should be merged
+        assert meta["matched"] > 0
+        game1 = next(g for g in enriched if g["appid"] == 1)
+        assert game1.get("revenue") is not None
+        # Both tags were fetched
+        assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_union_bulk_partial_failure_still_enriches(self):
+        """If one tag fails, the other still enriches successfully."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import _enrich_with_gamalytic_bulk
+        from src.schemas import APIError as APIErrorSchema
+
+        mock_gamalytic = MagicMock()
+
+        # Tag A fails, Tag B succeeds
+        tag_b_games = [
+            {"steamId": i, "name": f"Game{i}", "revenue": 500000, "copiesSold": 25000}
+            for i in range(1, 51)
+        ]
+
+        async def mock_list_games(tag, **kwargs):
+            if "TagA" in tag:
+                return APIErrorSchema(status_code=500, message="Server error")
+            return _with_meta(tag_b_games)
+
+        mock_gamalytic.list_games_by_tag = mock_list_games
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
+
+        input_games = [
+            {"appid": i, "name": f"Game{i}", "owners": 10000, "revenue": None}
+            for i in range(1, 31)
+        ]
+
+        enriched, warnings, meta = await _enrich_with_gamalytic_bulk(
+            input_games, mock_gamalytic, tags=["TagA", "TagB"]
+        )
+
+        # Should still use union_bulk (one tag succeeded)
+        assert meta["method"] == "union_bulk"
+        assert isinstance(meta["tag_used"], list)
+        assert len(meta["tag_used"]) == 1  # Only TagB succeeded
+        assert meta["matched"] > 0
+
+    @pytest.mark.asyncio
+    async def test_union_bulk_all_fail_falls_back(self):
+        """When all tags fail bulk, falls back to per-game enrichment."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import _enrich_with_gamalytic_bulk
+        from src.schemas import APIError as APIErrorSchema, CommercialData
+        from datetime import datetime, timezone
+
+        mock_gamalytic = MagicMock()
+
+        async def mock_list_games(tag, **kwargs):
+            return APIErrorSchema(status_code=500, message="Server error")
+
+        mock_gamalytic.list_games_by_tag = mock_list_games
+        mock_gamalytic.get_commercial_data = AsyncMock(return_value=CommercialData(
+            appid=1, name="Test", price=9.99,
+            revenue_min=100000, revenue_max=500000,
+            confidence="medium", source="gamalytic",
+            fetched_at=datetime.now(timezone.utc),
+        ))
+
+        input_games = [
+            {"appid": i, "name": f"Game{i}", "owners": 5000, "revenue": None}
+            for i in range(1, 6)
+        ]
+
+        enriched, warnings, meta = await _enrich_with_gamalytic_bulk(
+            input_games, mock_gamalytic, tags=["TagA", "TagB"]
+        )
+
+        assert meta["method"] == "per_game_fallback"
+        assert any("fallback" in w.lower() for w in warnings)
+
+    @pytest.mark.asyncio
+    async def test_backward_compat_primary_tag_still_works(self):
+        """Passing primary_tag= keyword directly still works (backward compat)."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.market_tools import _enrich_with_gamalytic_bulk
+
+        mock_gamalytic = MagicMock()
+        gamalytic_games = [
+            {"steamId": i, "name": f"Game{i}", "revenue": 1000000 * i, "copiesSold": 50000 * i}
+            for i in range(1, 51)
+        ]
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=_with_meta(gamalytic_games))
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
+
+        input_games = [
+            {"appid": i, "name": f"Game{i}", "owners": 10000 * (51 - i), "revenue": None}
+            for i in range(1, 31)
+        ]
+
+        enriched, warnings, meta = await _enrich_with_gamalytic_bulk(
+            input_games, mock_gamalytic, primary_tag="Roguelike"
+        )
+
+        assert meta["method"] == "bulk"
+        assert meta["tag_used"] == "Roguelike"
+        assert meta["matched"] > 0
 
 
 # ---------------------------------------------------------------------------
