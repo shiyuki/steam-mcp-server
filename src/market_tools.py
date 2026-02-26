@@ -834,6 +834,18 @@ async def _fetch_game_list_steamspy(
                                         label=f"supplement_enrich({len(new_appids)})",
                                     )
                                     new_games = [r for r in enrich_gr.results if isinstance(r, dict)]
+                                    # Recover dropped appids as minimal dicts so Gamalytic enrichment can populate them
+                                    surviving_appids = {g["appid"] for g in new_games}
+                                    for appid in new_appids:
+                                        if appid not in surviving_appids:
+                                            new_games.append({"appid": appid, "name": None, "revenue": None,
+                                                               "owners": None, "ccu": None, "price": None,
+                                                               "review_score": None, "median_forever": None,
+                                                               "average_forever": None, "positive": None,
+                                                               "negative": None, "followers": None,
+                                                               "copies_sold": None, "tags": {},
+                                                               "release_date": None, "developer": None,
+                                                               "publisher": None})
                                     games.extend(new_games)
                                     data_source = "steamspy+steam_store"
                                     logger.info(f"Supplement added {len(new_games)} additional games (of {len(new_appids)} new appids)")
@@ -876,6 +888,18 @@ async def _fetch_game_list_steamspy(
                 label=f"store_fallback_enrich({len(store_appids)})",
             )
             games = [r for r in enrich_gr.results if isinstance(r, dict)]
+            # Recover dropped appids as minimal dicts so Gamalytic enrichment can populate them
+            surviving_appids = {g["appid"] for g in games}
+            for appid in store_appids:
+                if appid not in surviving_appids:
+                    games.append({"appid": appid, "name": None, "revenue": None,
+                                   "owners": None, "ccu": None, "price": None,
+                                   "review_score": None, "median_forever": None,
+                                   "average_forever": None, "positive": None,
+                                   "negative": None, "followers": None,
+                                   "copies_sold": None, "tags": {},
+                                   "release_date": None, "developer": None,
+                                   "publisher": None})
             return games, "steam_store_fallback"
 
         except Exception as exc:
@@ -923,6 +947,18 @@ async def _fetch_game_list_steamspy(
             label=f"multi_tag_enrich({len(store_appids)})",
         )
         games = [r for r in enrich_gr.results if isinstance(r, dict)]
+        # Recover dropped appids as minimal dicts so Gamalytic enrichment can populate them
+        surviving_appids = {g["appid"] for g in games}
+        for appid in store_appids:
+            if appid not in surviving_appids:
+                games.append({"appid": appid, "name": None, "revenue": None,
+                               "owners": None, "ccu": None, "price": None,
+                               "review_score": None, "median_forever": None,
+                               "average_forever": None, "positive": None,
+                               "negative": None, "followers": None,
+                               "copies_sold": None, "tags": {},
+                               "release_date": None, "developer": None,
+                               "publisher": None})
         return games, "steam_store"
 
 
