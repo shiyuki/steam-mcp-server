@@ -618,6 +618,8 @@ def _game_summary_to_dict(game_summary) -> dict:
         "review_score": game_summary.review_score,
         "median_forever": game_summary.median_forever,
         "average_forever": game_summary.average_forever,
+        "positive": game_summary.positive,
+        "negative": game_summary.negative,
         # Revenue not yet in GameSummary (added by Gamalytic enrichment in Phase 2)
         "revenue": None,
         "followers": None,
@@ -745,6 +747,8 @@ async def _fetch_game_list_steamspy(
                 "review_score": result.review_score,
                 "median_forever": result.median_forever,
                 "average_forever": result.average_forever,
+                "positive": result.positive,
+                "negative": result.negative,
                 "revenue": None,
                 "followers": None,
                 "copies_sold": None,
@@ -846,7 +850,7 @@ async def _fetch_game_list_steamspy(
                 )
                 return [], "steam_store_fallback"
 
-            store_result = await steam_store.search_by_tag_ids([tag_id], count=500)
+            store_result = await steam_store.search_by_tag_ids_paginated([tag_id], max_results=2000)
             if isinstance(store_result, APIErrorSchema):
                 logger.warning(f"Steam Store fallback search failed: {store_result.message}")
                 return [], "steam_store_fallback"
@@ -893,12 +897,12 @@ async def _fetch_game_list_steamspy(
             return [], f"steam_store:tag_error:{','.join(missing_tags)}"
 
         # Fetch appids from Steam Store using all integer tag IDs (intersection)
-        store_result = await steam_store.search_by_tag_ids(tag_ids, count=50)
+        store_result = await steam_store.search_by_tag_ids_paginated(tag_ids, max_results=1000)
         if isinstance(store_result, APIErrorSchema):
             logger.warning(f"Steam Store multi-tag search failed: {store_result.message}")
             return [], "steam_store"
 
-        # search_by_tag_ids returns tuple[int, list[int]]
+        # search_by_tag_ids_paginated returns tuple[int, list[int]]
         total_count, store_appids = store_result
         if not store_appids:
             return [], "steam_store"

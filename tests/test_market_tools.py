@@ -1230,7 +1230,7 @@ class TestMultiTagErrorSurfacing:
 
         # Steam Store tag map is missing 'Deckbuilder' but has 'Roguelike'
         mock_steam_store.get_tag_map = AsyncMock(return_value={"roguelike": 12345})
-        mock_steam_store.search_by_tag_ids = AsyncMock(return_value=(0, []))
+        mock_steam_store.search_by_tag_ids_paginated = AsyncMock(return_value=(0, []))
 
         result = await analyze_market_single(
             steamspy=mock_steamspy,
@@ -1257,8 +1257,8 @@ class TestMultiTagErrorSurfacing:
             "roguelike": 12345,
             "deckbuilder": 67890,
         })
-        # search_by_tag_ids returns 0 results (no games match intersection)
-        mock_steam_store.search_by_tag_ids = AsyncMock(return_value=(0, []))
+        # search_by_tag_ids_paginated returns 0 results (no games match intersection)
+        mock_steam_store.search_by_tag_ids_paginated = AsyncMock(return_value=(0, []))
 
         result = await analyze_market_single(
             steamspy=mock_steamspy,
@@ -1825,7 +1825,7 @@ class TestFetchGameListFallbacks:
 
         # Steam Store returns 3 appids
         mock_steam_store.get_tag_map = AsyncMock(return_value={"roguelike": 1234})
-        mock_steam_store.search_by_tag_ids = AsyncMock(return_value=(3, [101, 102, 103]))
+        mock_steam_store.search_by_tag_ids_paginated = AsyncMock(return_value=(3, [101, 102, 103]))
 
         # SteamSpy per-game enrichment succeeds
         mock_steamspy.get_engagement_data = AsyncMock(return_value=EngagementData(
@@ -1844,7 +1844,7 @@ class TestFetchGameListFallbacks:
         assert len(games) == 3
         assert data_source == "steam_store_fallback"
         mock_steam_store.get_tag_map.assert_called_once()
-        mock_steam_store.search_by_tag_ids.assert_called_once_with([1234], count=500)
+        mock_steam_store.search_by_tag_ids_paginated.assert_called_once_with([1234], max_results=2000)
 
     @pytest.mark.asyncio
     async def test_single_tag_steam_store_fallback_on_empty_result(self):
@@ -1867,7 +1867,7 @@ class TestFetchGameListFallbacks:
 
         # Steam Store resolves tag and returns appids
         mock_steam_store.get_tag_map = AsyncMock(return_value={"obscuretag": 9999})
-        mock_steam_store.search_by_tag_ids = AsyncMock(return_value=(2, [201, 202]))
+        mock_steam_store.search_by_tag_ids_paginated = AsyncMock(return_value=(2, [201, 202]))
 
         mock_steamspy.get_engagement_data = AsyncMock(return_value=EngagementData(
             appid=201, name="Game201", ccu=50, owners_min=500, owners_max=2000,
@@ -1909,7 +1909,7 @@ class TestFetchGameListFallbacks:
 
         assert games == []
         assert data_source == "steam_store_fallback"
-        mock_steam_store.search_by_tag_ids.assert_not_called()
+        mock_steam_store.search_by_tag_ids_paginated.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_appids_gamalytic_fallback_recovers_failed(self):
