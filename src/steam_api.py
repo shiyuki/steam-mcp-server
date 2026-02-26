@@ -1144,6 +1144,37 @@ class SteamStoreClient:
                 message=f"Steam Store search error: {e}"
             )
 
+    async def get_total_released_count(self, tag_ids: list[int]) -> int | None:
+        """Get total number of released games matching tag IDs on Steam Store.
+
+        Uses Released_DESC sort which includes all released games (not just
+        review-ranked ones). Single lightweight request (count=1) to get
+        total_count only. Used for methodology reporting alongside the
+        Reviews_DESC-filtered analysis set.
+
+        Returns:
+            Total count of released games, or None on failure
+        """
+        try:
+            tags_param = ",".join(str(tid) for tid in tag_ids)
+            data, _, _ = await self.http.get_with_metadata(
+                "https://store.steampowered.com/search/results/",
+                params={
+                    "query": "",
+                    "start": "0",
+                    "count": "1",
+                    "tags": tags_param,
+                    "sort_by": "Released_DESC",
+                    "infinite": "1",
+                },
+                cache_ttl=3600,
+                headers={"X-Requested-With": "XMLHttpRequest"},
+            )
+            return data.get("total_count", 0)
+        except Exception as e:
+            logger.warning(f"Failed to get released count for tags {tag_ids}: {e}")
+            return None
+
     async def search_by_tag_ids_paginated(
         self, tag_ids: list[int], max_results: int = 2000, page_size: int = 50
     ) -> tuple[int, list[int]] | APIError:

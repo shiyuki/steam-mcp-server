@@ -416,9 +416,17 @@ def _build_top_games(games: list[dict], top_n: int) -> list[GameProfile]:
 
 def _build_methodology_dict(tags: list[str], data_source: str, n_games: int, skipped: list[SkippedMetric]) -> dict:
     """Return flat methodology dict for inclusion in result."""
+    if "steam_store" in data_source and len(tags) > 1:
+        source_label = f"Steam Store multi-tag search for '{', '.join(tags)}'"
+    elif "steam_store" in data_source:
+        source_label = f"Steam Store search for '{', '.join(tags)}'"
+    elif tags:
+        source_label = f"SteamSpy tag search for '{', '.join(tags)}'"
+    else:
+        source_label = f"Custom AppID list ({n_games} games)"
     return {
         "data_source": data_source,
-        "game_list_source": f"SteamSpy tag search for '{', '.join(tags)}'",
+        "game_list_source": source_label,
         "total_games_analyzed": n_games,
         "skipped_metrics": [s.model_dump() for s in skipped],
         "biases": list(STANDARD_BIASES),
@@ -1575,6 +1583,8 @@ async def _analyze_market_single_impl(
     return_games: bool = False,
 ) -> dict | tuple[dict, list]:
     """Inner implementation of analyze_market_single, wrapped with overall timeout."""
+    from src.schemas import APIError as APIErrorSchema
+
     fetch_start = time.monotonic()
     games, data_source = await _fetch_game_list_steamspy(steamspy, steam_store, gamalytic, tags, appids=appids)
     fetch_ms = round((time.monotonic() - fetch_start) * 1000)
@@ -1592,6 +1602,22 @@ async def _analyze_market_single_impl(
         if return_games:
             return error_result, []
         return error_result
+
+    # Fire lightweight Released_DESC count in parallel with enrichment (tag-based only).
+    # Our analysis uses Reviews_DESC which only includes review-ranked games (~50-65% of
+    # released titles). This parallel call gets the true Steam Store total for reporting.
+    total_released_count: int | None = None
+    _released_count_task = None
+    if tags and not appids:
+        async def _get_released_count():
+            tag_map = await steam_store.get_tag_map()
+            if isinstance(tag_map, APIErrorSchema):
+                return None
+            tag_ids = [tag_map[t.lower()] for t in tags if t.lower() in tag_map]
+            if not tag_ids:
+                return None
+            return await steam_store.get_total_released_count(tag_ids)
+        _released_count_task = asyncio.create_task(_get_released_count())
 
     # Two-tier Gamalytic enrichment: bulk for tag-based, per-game for appid-based
     enrich_start = time.monotonic()
@@ -1669,6 +1695,13 @@ async def _analyze_market_single_impl(
                     f"don't have '{tags[0]}' in top-20 SteamSpy tags: {flagged_names}"
                 )
 
+    # Await the parallel released count task if it was started
+    if _released_count_task is not None:
+        try:
+            total_released_count = await _released_count_task
+        except Exception:
+            total_released_count = None
+
     # Run analysis on all games
     result = _run_market_analysis(
         games=enriched_games,
@@ -1686,6 +1719,16 @@ async def _analyze_market_single_impl(
         if return_games:
             return result, enriched_games
         return result
+
+    # Patch released count into methodology
+    if total_released_count is not None and result.get("methodology"):
+        result["methodology"]["total_released_on_steam"] = total_released_count
+        result["methodology"]["notes"].append(
+            f"Analysis covers {len(enriched_games)} review-ranked games out of "
+            f"{total_released_count} total released titles on Steam Store for this tag. "
+            f"Games without sufficient reviews are excluded from analysis to ensure "
+            f"data quality (revenue estimates, engagement metrics)."
+        )
 
     # Add validation flags to result (games flagged but NOT removed)
     if validation_flags:
