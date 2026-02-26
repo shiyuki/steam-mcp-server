@@ -1399,7 +1399,7 @@ class TestSupplementAndMultiTag:
         # appid 1 is already in SteamSpy results, 1951 and 1952 are new
         mock_steamspy.search_by_tag = AsyncMock(return_value=search_result)
         mock_steam_store.get_tag_map = AsyncMock(return_value={"roguelike": 12345})
-        mock_steam_store.search_by_tag_ids = AsyncMock(return_value=(2500, [1, 1951, 1952]))
+        mock_steam_store.search_by_tag_ids_paginated = AsyncMock(return_value=(2500, [1, 1951, 1952]))
         mock_steamspy.get_engagement_data = AsyncMock(side_effect=lambda appid: _make_engagement_data(appid))
 
         games, data_source = await _fetch_game_list_steamspy(
@@ -1408,15 +1408,15 @@ class TestSupplementAndMultiTag:
 
         # 1950 original + 2 new (appid 1 was filtered as duplicate)
         assert len(games) == n_steamspy + 2
-        assert data_source == "steamspy+steam_store"
+        assert data_source == "steamspy+steam_store_paginated"
 
         # New appids should be present
         appids_in_result = {g["appid"] for g in games}
         assert 1951 in appids_in_result
         assert 1952 in appids_in_result
 
-        # search_by_tag_ids called with integer tag ID (not string), correct param name
-        mock_steam_store.search_by_tag_ids.assert_called_once_with([12345], count=50)
+        # search_by_tag_ids_paginated called with integer tag ID, max_results=2000
+        mock_steam_store.search_by_tag_ids_paginated.assert_called_once_with([12345], max_results=2000)
 
     @pytest.mark.asyncio
     async def test_supplement_path_tag_map_failure_graceful(self):

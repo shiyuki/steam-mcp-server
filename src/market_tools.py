@@ -1689,8 +1689,8 @@ async def _analyze_market_single_impl(
         return error_result
 
     # Fire lightweight Released_DESC count in parallel with enrichment (tag-based only).
-    # Our analysis uses Reviews_DESC which only includes review-ranked games (~50-65% of
-    # released titles). This parallel call gets the true Steam Store total for reporting.
+    # Our SteamSpy-based analysis may have fewer games than the full Steam Store population.
+    # This parallel call gets the true Steam Store Released_DESC total for reporting.
     total_released_count: int | None = None
     _released_count_task = None
     if tags and not appids:
@@ -1809,10 +1809,10 @@ async def _analyze_market_single_impl(
     if total_released_count is not None and result.get("methodology"):
         result["methodology"]["total_released_on_steam"] = total_released_count
         result["methodology"]["notes"].append(
-            f"Analysis covers {len(enriched_games)} review-ranked games out of "
+            f"Analysis covers {len(enriched_games)} games out of "
             f"{total_released_count} total released titles on Steam Store for this tag. "
-            f"Games without sufficient reviews are excluded from analysis to ensure "
-            f"data quality (revenue estimates, engagement metrics)."
+            f"SteamSpy coverage may be partial for niche tags; supplement with Steam Store "
+            f"paginated search when fewer than {STEAMSPY_MIN_EXPECTED} games are found."
         )
 
     # Add validation flags to result (games flagged but NOT removed)

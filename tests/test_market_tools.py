@@ -1827,15 +1827,17 @@ class TestFetchGameListFallbacks:
         mock_steam_store.get_tag_map = AsyncMock(return_value={"roguelike": 1234})
         mock_steam_store.search_by_tag_ids_paginated = AsyncMock(return_value=(3, [101, 102, 103]))
 
-        # SteamSpy per-game enrichment succeeds
-        mock_steamspy.get_engagement_data = AsyncMock(return_value=EngagementData(
-            appid=101, name="FallbackGame", ccu=100, owners_min=1000, owners_max=5000,
-            owners_midpoint=3000.0, average_forever=10.0, average_2weeks=1.0,
-            median_forever=8.0, median_2weeks=0.5, positive=200, negative=10, price=9.99,
-            review_score=80.0, tags={"Roguelike": 100},
-            developer="Dev", publisher="Pub",
-            fetched_at=datetime.now(timezone.utc), total_reviews=210,
-        ))
+        # SteamSpy per-game enrichment succeeds for all 3 appids
+        def fallback_engagement(appid):
+            return EngagementData(
+                appid=appid, name=f"FallbackGame{appid}", ccu=100, owners_min=1000, owners_max=5000,
+                owners_midpoint=3000.0, average_forever=10.0, average_2weeks=1.0,
+                median_forever=8.0, median_2weeks=0.5, positive=200, negative=10, price=9.99,
+                review_score=80.0, tags={"Roguelike": 100},
+                developer="Dev", publisher="Pub",
+                fetched_at=datetime.now(timezone.utc), total_reviews=210,
+            )
+        mock_steamspy.get_engagement_data = AsyncMock(side_effect=fallback_engagement)
 
         games, data_source = await _fetch_game_list_steamspy(
             mock_steamspy, mock_steam_store, mock_gamalytic, ["Roguelike"]
@@ -1869,14 +1871,16 @@ class TestFetchGameListFallbacks:
         mock_steam_store.get_tag_map = AsyncMock(return_value={"obscuretag": 9999})
         mock_steam_store.search_by_tag_ids_paginated = AsyncMock(return_value=(2, [201, 202]))
 
-        mock_steamspy.get_engagement_data = AsyncMock(return_value=EngagementData(
-            appid=201, name="Game201", ccu=50, owners_min=500, owners_max=2000,
-            owners_midpoint=1250.0, average_forever=5.0, average_2weeks=0.5,
-            median_forever=4.0, median_2weeks=0.2, positive=100, negative=5, price=4.99,
-            review_score=95.0, tags={},
-            developer="Dev", publisher="Pub",
-            fetched_at=datetime.now(timezone.utc), total_reviews=105,
-        ))
+        def obscure_engagement(appid):
+            return EngagementData(
+                appid=appid, name=f"Game{appid}", ccu=50, owners_min=500, owners_max=2000,
+                owners_midpoint=1250.0, average_forever=5.0, average_2weeks=0.5,
+                median_forever=4.0, median_2weeks=0.2, positive=100, negative=5, price=4.99,
+                review_score=95.0, tags={},
+                developer="Dev", publisher="Pub",
+                fetched_at=datetime.now(timezone.utc), total_reviews=105,
+            )
+        mock_steamspy.get_engagement_data = AsyncMock(side_effect=obscure_engagement)
 
         games, data_source = await _fetch_game_list_steamspy(
             mock_steamspy, mock_steam_store, mock_gamalytic, ["ObscureTag"]
@@ -2015,6 +2019,228 @@ class TestFetchGameListFallbacks:
         result = await _gamalytic_fallback(mock_gamalytic, [])
 
         assert result == []
+
+    @pytest.mark.asyncio
+    async def test_single_tag_small_result_triggers_supplement(self):
+        """When SteamSpy returns fewer than STEAMSPY_MIN_EXPECTED games, Steam Store supplement fires."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.schemas import SearchResult, GameSummary, EngagementData
+        from src.market_tools import _fetch_game_list_steamspy, STEAMSPY_MIN_EXPECTED
+        from datetime import datetime, timezone
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+
+        # SteamSpy returns only 30 games (well below STEAMSPY_MIN_EXPECTED=200)
+        small_games = [
+            GameSummary(appid=i, name=f"Game{i}", owners_midpoint=float(i * 1000))
+            for i in range(1, 31)
+        ]
+        mock_steamspy.search_by_tag = AsyncMock(return_value=SearchResult(
+            tag="Life Sim", appids=[g.appid for g in small_games],
+            total_found=30, games=small_games,
+            data_source="steamspy", fetched_at="2026-01-01T00:00:00Z", cache_age_seconds=0,
+        ))
+
+        # Steam Store supplement returns 70 new appids
+        new_appids = list(range(1001, 1071))  # 70 new appids
+        mock_steam_store.get_tag_map = AsyncMock(return_value={"life sim": 5555})
+        mock_steam_store.search_by_tag_ids_paginated = AsyncMock(return_value=(1200, new_appids))
+
+        # SteamSpy per-game enrichment succeeds for new appids
+        def engagement_side_effect(appid):
+            return EngagementData(
+                appid=appid, name=f"SupGame{appid}", ccu=50, owners_min=500, owners_max=2000,
+                owners_midpoint=1250.0, average_forever=5.0, average_2weeks=0.5,
+                median_forever=4.0, median_2weeks=0.2, positive=100, negative=5, price=9.99,
+                review_score=90.0, tags={"Life Sim": 80},
+                developer="Dev", publisher="Pub",
+                fetched_at=datetime.now(timezone.utc), total_reviews=105,
+            )
+        mock_steamspy.get_engagement_data = AsyncMock(side_effect=engagement_side_effect)
+
+        games, data_source = await _fetch_game_list_steamspy(
+            mock_steamspy, mock_steam_store, mock_gamalytic, ["Life Sim"]
+        )
+
+        assert len(games) >= 100  # 30 original + 70 supplement
+        assert data_source == "steamspy+steam_store_paginated"
+        mock_steam_store.get_tag_map.assert_called_once()
+        mock_steam_store.search_by_tag_ids_paginated.assert_called_once_with([5555], max_results=2000)
+
+    @pytest.mark.asyncio
+    async def test_single_tag_small_result_supplement_failure_graceful(self):
+        """When Steam Store tag map fails during small-result supplement, returns original small result gracefully."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.schemas import SearchResult, GameSummary, APIError as APIErrorSchema
+        from src.market_tools import _fetch_game_list_steamspy
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+
+        # SteamSpy returns only 10 games
+        small_games = [
+            GameSummary(appid=i, name=f"TinyGame{i}", owners_midpoint=float(i * 500))
+            for i in range(1, 11)
+        ]
+        mock_steamspy.search_by_tag = AsyncMock(return_value=SearchResult(
+            tag="Tiny Niche", appids=[g.appid for g in small_games],
+            total_found=10, games=small_games,
+            data_source="steamspy", fetched_at="2026-01-01T00:00:00Z", cache_age_seconds=0,
+        ))
+
+        # Steam Store tag map fails
+        mock_steam_store.get_tag_map = AsyncMock(return_value=APIErrorSchema(
+            error_code=500, error_type="api_error", message="Steam Store unavailable"
+        ))
+
+        games, data_source = await _fetch_game_list_steamspy(
+            mock_steamspy, mock_steam_store, mock_gamalytic, ["Tiny Niche"]
+        )
+
+        # Should return original 10 games without crashing
+        assert len(games) == 10
+        assert data_source == "steamspy"
+        # Paginated search should not have been called
+        mock_steam_store.search_by_tag_ids_paginated.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_single_tag_medium_result_no_supplement(self):
+        """When SteamSpy returns 200-1899 games, no supplement is triggered."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.schemas import SearchResult, GameSummary
+        from src.market_tools import _fetch_game_list_steamspy
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+
+        # SteamSpy returns 500 games (medium — no supplement)
+        medium_games = [
+            GameSummary(appid=i, name=f"MedGame{i}", owners_midpoint=float(i * 2000))
+            for i in range(1, 501)
+        ]
+        mock_steamspy.search_by_tag = AsyncMock(return_value=SearchResult(
+            tag="RPG", appids=[g.appid for g in medium_games],
+            total_found=500, games=medium_games,
+            data_source="steamspy", fetched_at="2026-01-01T00:00:00Z", cache_age_seconds=0,
+        ))
+
+        games, data_source = await _fetch_game_list_steamspy(
+            mock_steamspy, mock_steam_store, mock_gamalytic, ["RPG"]
+        )
+
+        assert len(games) == 500
+        assert data_source == "steamspy"
+        # Neither supplement path should fire
+        mock_steam_store.search_by_tag_ids_paginated.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_single_tag_large_result_supplement_uses_paginated(self):
+        """Large-result supplement (>=1900) uses search_by_tag_ids_paginated (not non-paginated search_by_tag_ids)."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.schemas import SearchResult, GameSummary, EngagementData
+        from src.market_tools import _fetch_game_list_steamspy, STEAMSPY_SUPPLEMENT_THRESHOLD
+        from datetime import datetime, timezone
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+
+        # SteamSpy returns 2000 games (>= STEAMSPY_SUPPLEMENT_THRESHOLD=1900)
+        large_games = [
+            GameSummary(appid=i, name=f"LargeGame{i}", owners_midpoint=float(i * 5000))
+            for i in range(1, 2001)
+        ]
+        mock_steamspy.search_by_tag = AsyncMock(return_value=SearchResult(
+            tag="Action", appids=[g.appid for g in large_games],
+            total_found=2000, games=large_games,
+            data_source="steamspy", fetched_at="2026-01-01T00:00:00Z", cache_age_seconds=0,
+        ))
+
+        # Steam Store supplement returns 50 new appids (non-overlapping)
+        supplement_appids = list(range(5001, 5051))  # 50 new appids
+        mock_steam_store.get_tag_map = AsyncMock(return_value={"action": 4321})
+        mock_steam_store.search_by_tag_ids_paginated = AsyncMock(return_value=(2050, supplement_appids))
+
+        def engagement_side_effect(appid):
+            return EngagementData(
+                appid=appid, name=f"SupAction{appid}", ccu=200, owners_min=5000, owners_max=20000,
+                owners_midpoint=12500.0, average_forever=10.0, average_2weeks=1.0,
+                median_forever=8.0, median_2weeks=0.5, positive=500, negative=20, price=14.99,
+                review_score=96.0, tags={"Action": 200},
+                developer="Dev", publisher="Pub",
+                fetched_at=datetime.now(timezone.utc), total_reviews=520,
+            )
+        mock_steamspy.get_engagement_data = AsyncMock(side_effect=engagement_side_effect)
+
+        games, data_source = await _fetch_game_list_steamspy(
+            mock_steamspy, mock_steam_store, mock_gamalytic, ["Action"]
+        )
+
+        assert len(games) >= 2050  # 2000 original + 50 supplement
+        assert data_source == "steamspy+steam_store_paginated"
+        # Verify paginated search was used (not non-paginated)
+        mock_steam_store.search_by_tag_ids_paginated.assert_called_once_with([4321], max_results=2000)
+
+    @pytest.mark.asyncio
+    async def test_fallback_enrichment_dropout_recovery(self):
+        """When SteamSpy per-game fails in fallback path, failed appids are recovered as minimal dicts."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.schemas import APIError as APIErrorSchema, EngagementData
+        from src.market_tools import _fetch_game_list_steamspy
+        from datetime import datetime, timezone
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+
+        # SteamSpy bulk tag fails — triggers fallback
+        mock_steamspy.search_by_tag = AsyncMock(return_value=APIErrorSchema(
+            error_code=503, error_type="api_error", message="SteamSpy down"
+        ))
+
+        # Steam Store paginated returns 100 appids
+        store_appids = list(range(101, 201))  # appids 101-200
+        mock_steam_store.get_tag_map = AsyncMock(return_value={"life sim": 5555})
+        mock_steam_store.search_by_tag_ids_paginated = AsyncMock(return_value=(100, store_appids))
+
+        # SteamSpy per-game succeeds for first 20, fails for remaining 80
+        def engagement_side_effect(appid):
+            if appid <= 120:  # appids 101-120 succeed (20 games)
+                return EngagementData(
+                    appid=appid, name=f"GoodGame{appid}", ccu=100, owners_min=1000, owners_max=5000,
+                    owners_midpoint=3000.0, average_forever=8.0, average_2weeks=0.8,
+                    median_forever=6.0, median_2weeks=0.4, positive=300, negative=15, price=9.99,
+                    review_score=95.0, tags={"Life Sim": 90},
+                    developer="Dev", publisher="Pub",
+                    fetched_at=datetime.now(timezone.utc), total_reviews=315,
+                )
+            # appids 121-200 fail (80 games)
+            return APIErrorSchema(error_code=429, error_type="rate_limit", message="rate limited")
+        mock_steamspy.get_engagement_data = AsyncMock(side_effect=engagement_side_effect)
+
+        games, data_source = await _fetch_game_list_steamspy(
+            mock_steamspy, mock_steam_store, mock_gamalytic, ["Life Sim"]
+        )
+
+        # All 100 appids should survive (20 full dicts + 80 minimal dicts)
+        assert len(games) == 100
+        assert data_source == "steam_store_fallback"
+
+        # 20 games should have valid enrichment data
+        valid_games = [g for g in games if g.get("name") is not None]
+        assert len(valid_games) == 20
+
+        # 80 games should be minimal dicts with None values
+        minimal_games = [g for g in games if g.get("revenue") is None and g.get("name") is None]
+        assert len(minimal_games) == 80
+
+        # All minimal dicts should have appid set
+        for g in minimal_games:
+            assert g["appid"] in range(121, 201)
 
 
 # ---------------------------------------------------------------------------
@@ -2474,15 +2700,17 @@ class TestReleasedCountMethodology:
         )
         mock_steam_store.get_total_released_count = AsyncMock(return_value=released_count)
 
-        # SteamSpy per-game enrichment for multi-tag path
-        mock_steamspy.get_engagement_data = AsyncMock(return_value=EngagementData(
-            appid=101, name="MultiTagGame", ccu=50, owners_min=500, owners_max=2000,
-            owners_midpoint=1250.0, average_forever=5.0, average_2weeks=0.5,
-            median_forever=4.0, median_2weeks=0.3, positive=100, negative=5, price=14.99,
-            review_score=85.0, tags={"Visual Novel": 400, "Choices Matter": 300},
-            developer="Dev", publisher="Pub",
-            fetched_at=datetime.now(timezone.utc), total_reviews=105,
-        ))
+        # SteamSpy per-game enrichment for multi-tag path (side_effect for correct per-appid dicts)
+        def multi_tag_engagement(appid):
+            return EngagementData(
+                appid=appid, name=f"MultiTagGame{appid}", ccu=50, owners_min=500, owners_max=2000,
+                owners_midpoint=1250.0, average_forever=5.0, average_2weeks=0.5,
+                median_forever=4.0, median_2weeks=0.3, positive=100, negative=5, price=14.99,
+                review_score=85.0, tags={"Visual Novel": 400, "Choices Matter": 300},
+                developer="Dev", publisher="Pub",
+                fetched_at=datetime.now(timezone.utc), total_reviews=105,
+            )
+        mock_steamspy.get_engagement_data = AsyncMock(side_effect=multi_tag_engagement)
 
         # Gamalytic per-game enrichment (multi-tag uses per-game, not bulk)
         mock_gamalytic.list_games_by_tag = AsyncMock(return_value=_with_meta([]))
@@ -2514,9 +2742,8 @@ class TestReleasedCountMethodology:
         # Verify the note explains the difference
         notes = meth["notes"]
         assert len(notes) == 1
-        assert "30 review-ranked games" in notes[0]
+        assert "30 games" in notes[0]
         assert "4563 total released titles" in notes[0]
-        assert "without sufficient reviews are excluded" in notes[0]
         # Verify correct tag IDs were used
         mock_store.get_total_released_count.assert_called_once_with([1234])
 
@@ -2557,7 +2784,7 @@ class TestReleasedCountMethodology:
         # Note should reference both counts
         notes = meth["notes"]
         assert len(notes) == 1
-        assert "50 review-ranked games" in notes[0]
+        assert "50 games" in notes[0]
         assert "3855 total released titles" in notes[0]
         # Released count should use both tag IDs
         mock_store.get_total_released_count.assert_called_once_with([3799, 6426])
@@ -2689,5 +2916,5 @@ class TestReleasedCountMethodology:
         assert result["total_games"] == 30
         # The note should clearly show the gap
         note = meth["notes"][0]
-        assert "30 review-ranked games" in note
+        assert "30 games" in note
         assert "6876 total released titles" in note
