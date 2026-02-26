@@ -287,7 +287,7 @@ def _build_game_profile(game: dict) -> GameProfile:
     """
     return GameProfile(
         appid=game.get("appid", 0),
-        name=game.get("name", ""),
+        name=game.get("name") or "",
         revenue=game.get("revenue"),
         review_score=game.get("review_score"),
         release_date=game.get("release_date"),
@@ -297,9 +297,9 @@ def _build_game_profile(game: dict) -> GameProfile:
         followers=game.get("followers"),
         copies_sold=game.get("copies_sold"),
         price=game.get("price"),
-        tags=game.get("tags", {}),
-        developer=game.get("developer", ""),
-        publisher=game.get("publisher", ""),
+        tags=game.get("tags") or {},
+        developer=game.get("developer") or "",
+        publisher=game.get("publisher") or "",
     )
 
 
@@ -1072,36 +1072,99 @@ async def _enrich_with_gamalytic(
     return list(enriched_games), warnings
 
 
+async def _fetch_gamalytic_for_single_tag(
+    gamalytic: "GamalyticClient",
+    tag: str,
+) -> tuple[list[dict] | None, dict | None, str | None]:
+    """Fetch Gamalytic bulk data for a single tag with normalization fallback chain.
+
+    Tries: exact tag name -> GAMALYTIC_TAG_NORMALIZATIONS -> stripped hyphens/underscores.
+
+    Returns:
+        (gamalytic_games, pagination_meta, effective_tag_name) on success.
+        (None, None, None) on complete failure.
+    """
+    from src.schemas import APIError as APIErrorSchema
+
+    tag_to_try = tag
+    gamalytic_games = None
+    pagination_meta = None
+
+    # Try exact tag name first
+    result = await gamalytic.list_games_by_tag(tag_to_try)
+    if isinstance(result, APIErrorSchema):
+        logger.warning(f"Gamalytic bulk list failed for tag '{tag_to_try}': {result.message}")
+        return None, None, None
+
+    games_list, pagination_meta = result
+    if len(games_list) == 0:
+        # Tag returned 0 games — try normalized form
+        normalized = GAMALYTIC_TAG_NORMALIZATIONS.get(tag_to_try.lower())
+        if normalized and normalized.lower() != tag_to_try.lower():
+            logger.info(f"Gamalytic 0 results for '{tag_to_try}', trying normalized '{normalized}'")
+            result2 = await gamalytic.list_games_by_tag(normalized)
+            if not isinstance(result2, APIErrorSchema):
+                games_list2, pagination_meta2 = result2
+                if len(games_list2) > 0:
+                    gamalytic_games = games_list2
+                    pagination_meta = pagination_meta2
+                    tag_to_try = normalized
+                    logger.info(f"Normalized tag '{normalized}' returned {len(gamalytic_games)} games")
+        if gamalytic_games is None:
+            # Also try stripping hyphens as a generic fallback
+            stripped = tag_to_try.replace("-", "").replace("_", " ")
+            if stripped.lower() != tag_to_try.lower():
+                logger.info(f"Gamalytic 0 results, trying stripped '{stripped}'")
+                result3 = await gamalytic.list_games_by_tag(stripped)
+                if not isinstance(result3, APIErrorSchema):
+                    games_list3, pagination_meta3 = result3
+                    if len(games_list3) > 0:
+                        gamalytic_games = games_list3
+                        pagination_meta = pagination_meta3
+                        tag_to_try = stripped
+    else:
+        gamalytic_games = games_list
+
+    if gamalytic_games is None or len(gamalytic_games) == 0:
+        return None, None, None
+
+    return gamalytic_games, pagination_meta, tag_to_try
+
+
 async def _enrich_with_gamalytic_bulk(
     games: list[dict],
     gamalytic: "GamalyticClient",
     steamspy: "SteamSpyClient | None" = None,
     primary_tag: str | None = None,
+    tags: list[str] | None = None,
 ) -> tuple[list[dict], list[str], dict]:
-    """Enrich game dicts with Gamalytic revenue data using two-tier bulk enrichment.
+    """Enrich game dicts with Gamalytic revenue data using bulk enrichment.
 
     Strategy:
-    1. If primary_tag is provided, try bulk fetch via gamalytic.list_games_by_tag(tag) [Tier 1]
-    2. Cross-validate: check top-10 SteamSpy games (by owners) against Gamalytic results
-    3. If match_rate >= BULK_MATCH_THRESHOLD (0.6): merge by AppID (bulk path)
-    4. If match_rate < 0.6 OR no tag: fall back to per-game enrichment for top GAMALYTIC_SAMPLE_SIZE
-    5. After Tier 1 merge, identify games with >0.1% of total genre revenue [Tier 2]
-    6. For Tier 2 games: fetch full CommercialData (40+ fields) + SteamSpy tag weights,
-       deep-merge over Tier 1 data
+    1. Single tag: bulk fetch via gamalytic.list_games_by_tag(tag) [Tier 1]
+    2. Multiple tags: fetch bulk for each tag concurrently, union lookups [union-bulk]
+    3. No tags: per-game fallback for top GAMALYTIC_SAMPLE_SIZE games
+    4. Cross-validate: check AppID overlap against input games
+    5. If match_rate >= BULK_MATCH_THRESHOLD (0.6): merge by AppID (bulk path)
+    6. After Tier 1 merge, Tier 1.5 fills gaps, Tier 2 deep-enriches top revenue games
 
-    The steamspy parameter is needed for Tier 2 SteamSpy tag weight fetches. If None,
-    Tier 2 skips tag weight enrichment (but still does Gamalytic deep enrichment).
+    The steamspy parameter is needed for Tier 1.5/2 SteamSpy tag weight fetches.
+
+    Args:
+        tags: List of Steam tags. Single-element uses bulk, multi-element uses union-bulk.
+              Preferred over primary_tag (kept for backward compatibility).
+        primary_tag: Single tag string (deprecated, use tags instead).
 
     Returns:
         (enriched_games, warnings, enrichment_meta) where enrichment_meta is a dict with:
-        - method: "bulk" | "per_game_fallback" | "per_game" (no tag)
+        - method: "bulk" | "union_bulk" | "per_game_fallback" | "per_game"
         - matched: int (games with Gamalytic revenue merged in Tier 1)
         - tier2_count: int (games that got deep Tier 2 enrichment)
         - tier2_threshold: float (revenue threshold used, e.g., 0.1)
         - total_revenue: float (sum of all Tier 1 revenue for threshold calculation)
         - total_gamalytic: int (games in Gamalytic response)
-        - match_rate: float (AppID overlap ratio for top-10 check)
-        - tag_used: str | None (Gamalytic tag that worked, may differ from input)
+        - match_rate: float (AppID overlap ratio)
+        - tag_used: str | list[str] | None (Gamalytic tag(s) that worked)
     """
     import asyncio
     from src.schemas import APIError as APIErrorSchema
@@ -1118,8 +1181,15 @@ async def _enrich_with_gamalytic_bulk(
         "tag_used": None,
     }
 
-    # --- Path 1: No tag provided (custom AppID list) -> per-game fallback ---
-    if not primary_tag:
+    # Resolve tags vs primary_tag for backward compatibility
+    effective_tags: list[str] = []
+    if tags and len(tags) >= 1:
+        effective_tags = list(tags)
+    elif primary_tag:
+        effective_tags = [primary_tag]
+
+    # --- Path 1: No tags (custom AppID list) -> per-game fallback ---
+    if not effective_tags:
         sorted_by_owners = sorted(games, key=lambda g: g.get("owners") or 0, reverse=True)
         top_games = sorted_by_owners[:GAMALYTIC_SAMPLE_SIZE]
         remaining = sorted_by_owners[GAMALYTIC_SAMPLE_SIZE:]
@@ -1132,79 +1202,121 @@ async def _enrich_with_gamalytic_bulk(
         })
         return enriched + remaining, enrich_warnings, enrichment_meta
 
-    # --- Path 2: Tag provided -> try bulk endpoint ---
-    tag_to_try = primary_tag
-    gamalytic_games = None
-    pagination_meta = None  # Track pagination health for warnings
-
-    # Try exact tag name first
-    result = await gamalytic.list_games_by_tag(tag_to_try)
-    if isinstance(result, APIErrorSchema):
-        logger.warning(f"Gamalytic bulk list failed for tag '{tag_to_try}': {result.message}")
-    else:
-        games_list, pagination_meta = result
-        if len(games_list) == 0:
-            # Tag returned 0 games — try normalized form
-            normalized = GAMALYTIC_TAG_NORMALIZATIONS.get(tag_to_try.lower())
-            if normalized and normalized.lower() != tag_to_try.lower():
-                logger.info(f"Gamalytic 0 results for '{tag_to_try}', trying normalized '{normalized}'")
-                result2 = await gamalytic.list_games_by_tag(normalized)
-                if not isinstance(result2, APIErrorSchema):
-                    games_list2, pagination_meta2 = result2
-                    if len(games_list2) > 0:
-                        gamalytic_games = games_list2
-                        pagination_meta = pagination_meta2
-                        tag_to_try = normalized
-                        logger.info(f"Normalized tag '{normalized}' returned {len(gamalytic_games)} games")
-            if gamalytic_games is None:
-                # Also try stripping hyphens as a generic fallback
-                stripped = tag_to_try.replace("-", "").replace("_", " ")
-                if stripped.lower() != tag_to_try.lower():
-                    logger.info(f"Gamalytic 0 results, trying stripped '{stripped}'")
-                    result3 = await gamalytic.list_games_by_tag(stripped)
-                    if not isinstance(result3, APIErrorSchema):
-                        games_list3, pagination_meta3 = result3
-                        if len(games_list3) > 0:
-                            gamalytic_games = games_list3
-                            pagination_meta = pagination_meta3
-                            tag_to_try = stripped
-        else:
-            gamalytic_games = games_list
-
-    # Surface pagination warnings if Gamalytic returned partial data
-    if pagination_meta and pagination_meta.get("is_partial"):
-        pg_warn = (
-            f"Gamalytic pagination: partial data — fetched {pagination_meta['pages_fetched']}/"
-            f"{pagination_meta.get('total_pages', '?')} pages "
-            f"({len(gamalytic_games or [])} of {pagination_meta.get('total_expected', '?')} expected games). "
-            f"Error: {pagination_meta.get('error', 'unknown')}"
-        )
-        warnings.append(pg_warn)
-        logger.warning(pg_warn)
-
-    # If bulk fetch failed entirely, fall back to per-game
-    if gamalytic_games is None or len(gamalytic_games) == 0:
-        logger.info(f"Gamalytic bulk unavailable for tag '{primary_tag}', falling back to per-game enrichment")
-        warnings.append(f"Gamalytic bulk list returned no results for tag '{primary_tag}'. Used per-game fallback.")
+    # --- Helper: per-game fallback (shared by Path 2 and Path 3 failure cases) ---
+    async def _per_game_fallback(method: str = "per_game_fallback") -> tuple[list[dict], list[str], dict]:
         sorted_by_owners = sorted(games, key=lambda g: g.get("owners") or 0, reverse=True)
         top_games = sorted_by_owners[:GAMALYTIC_SAMPLE_SIZE]
         remaining = sorted_by_owners[GAMALYTIC_SAMPLE_SIZE:]
         enriched, enrich_warnings = await _enrich_with_gamalytic(top_games, gamalytic)
         matched = sum(1 for g in enriched if g.get("revenue") is not None)
         enrichment_meta.update({
-            "method": "per_game_fallback",
+            "method": method,
             "matched": matched,
             "total_gamalytic": len(top_games),
-            "tag_used": None,
         })
         return enriched + remaining, warnings + enrich_warnings, enrichment_meta
 
-    # --- Cross-validation: check AppID overlap ---
-    gamalytic_lookup = {g.get("steamId"): g for g in gamalytic_games if g.get("steamId")}
-    enrichment_meta["total_gamalytic"] = len(gamalytic_lookup)
-    enrichment_meta["tag_used"] = tag_to_try
+    # --- Build gamalytic_lookup from bulk endpoint(s) ---
+    gamalytic_lookup: dict[int, dict] = {}
+    pagination_meta: dict | None = None
 
-    # Cross-validation: check AppID overlap across the full dataset (not top-10 sample)
+    if len(effective_tags) == 1:
+        # --- Path 2: Single tag -> bulk endpoint ---
+        tag = effective_tags[0]
+        gamalytic_games, pagination_meta, tag_to_try = await _fetch_gamalytic_for_single_tag(gamalytic, tag)
+
+        # Surface pagination warnings
+        if pagination_meta and pagination_meta.get("is_partial"):
+            pg_warn = (
+                f"Gamalytic pagination: partial data — fetched {pagination_meta['pages_fetched']}/"
+                f"{pagination_meta.get('total_pages', '?')} pages "
+                f"({len(gamalytic_games or [])} of {pagination_meta.get('total_expected', '?')} expected games). "
+                f"Error: {pagination_meta.get('error', 'unknown')}"
+            )
+            warnings.append(pg_warn)
+            logger.warning(pg_warn)
+
+        if gamalytic_games is None:
+            logger.info(f"Gamalytic bulk unavailable for tag '{tag}', falling back to per-game enrichment")
+            warnings.append(f"Gamalytic bulk list returned no results for tag '{tag}'. Used per-game fallback.")
+            enrichment_meta["tag_used"] = None
+            return await _per_game_fallback()
+
+        gamalytic_lookup = {g.get("steamId"): g for g in gamalytic_games if g.get("steamId")}
+        enrichment_meta["tag_used"] = tag_to_try
+
+        # Quota tracking (bulk uses 1 quota unit per page, not per game)
+        pages_used = (len(gamalytic_games) + 199) // 200
+        quota_warning = increment_gamalytic_counter(pages_used)
+        if quota_warning:
+            warnings.append(quota_warning)
+
+    else:
+        # --- Path 3: Multiple tags -> union-bulk ---
+        logger.info(f"Union-bulk: fetching Gamalytic bulk for {len(effective_tags)} tags: {effective_tags}")
+        fetch_tasks = [
+            _fetch_gamalytic_for_single_tag(gamalytic, tag)
+            for tag in effective_tags
+        ]
+        fetch_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+
+        succeeded_tags: list[str] = []
+        all_pagination_metas: list[dict] = []
+        total_pages_used = 0
+
+        for tag, result in zip(effective_tags, fetch_results):
+            if isinstance(result, Exception):
+                logger.warning(f"Union-bulk: tag '{tag}' fetch raised {type(result).__name__}: {result}")
+                warnings.append(f"Union-bulk: tag '{tag}' fetch failed: {result}")
+                continue
+            games_list, pg_meta, effective_tag = result
+            if games_list is None:
+                logger.info(f"Union-bulk: tag '{tag}' returned no games, skipping")
+                continue
+
+            succeeded_tags.append(effective_tag or tag)
+            if pg_meta:
+                all_pagination_metas.append(pg_meta)
+                if pg_meta.get("is_partial"):
+                    pg_warn = (
+                        f"Gamalytic pagination for '{effective_tag or tag}': "
+                        f"partial — fetched {pg_meta['pages_fetched']}/"
+                        f"{pg_meta.get('total_pages', '?')} pages "
+                        f"({len(games_list)} of {pg_meta.get('total_expected', '?')} expected). "
+                        f"Error: {pg_meta.get('error', 'unknown')}"
+                    )
+                    warnings.append(pg_warn)
+                    logger.warning(pg_warn)
+
+            # Union: first tag wins for duplicates (data is identical across tags)
+            for g in games_list:
+                steam_id = g.get("steamId")
+                if steam_id and steam_id not in gamalytic_lookup:
+                    gamalytic_lookup[steam_id] = g
+            total_pages_used += (len(games_list) + 199) // 200
+
+        if not gamalytic_lookup:
+            logger.info("Union-bulk: all tags failed, falling back to per-game enrichment")
+            warnings.append(f"Union-bulk: all tags failed Gamalytic bulk fetch ({effective_tags}). Used per-game fallback.")
+            enrichment_meta["tag_used"] = None
+            return await _per_game_fallback()
+
+        succeeded_str = ", ".join(succeeded_tags)
+        logger.info(f"Union-bulk: {len(gamalytic_lookup)} unique games from tags [{succeeded_str}]")
+        enrichment_meta["tag_used"] = succeeded_tags
+        pagination_meta = {
+            "is_partial": any(m.get("is_partial") for m in all_pagination_metas),
+            "tags_fetched": succeeded_tags,
+            "per_tag_pages": all_pagination_metas,
+        }
+
+        # Quota tracking for all pages fetched across tags
+        quota_warning = increment_gamalytic_counter(total_pages_used)
+        if quota_warning:
+            warnings.append(quota_warning)
+
+    # --- Shared: Cross-validation ---
+    enrichment_meta["total_gamalytic"] = len(gamalytic_lookup)
     all_appids = [g.get("appid") for g in games if g.get("appid")]
     if all_appids:
         matches = sum(1 for appid in all_appids if appid in gamalytic_lookup)
@@ -1213,31 +1325,25 @@ async def _enrich_with_gamalytic_bulk(
         match_rate = 0.0
     enrichment_meta["match_rate"] = round(match_rate, 2)
 
+    tag_label = enrichment_meta["tag_used"]
+    if isinstance(tag_label, list):
+        tag_label = ", ".join(tag_label)
+
     if match_rate < BULK_MATCH_THRESHOLD:
         logger.warning(
             f"Gamalytic bulk cross-validation failed: {match_rate:.0%} AppID overlap "
-            f"(threshold: {BULK_MATCH_THRESHOLD:.0%}). Tag naming may differ between "
-            f"SteamSpy '{primary_tag}' and Gamalytic '{tag_to_try}'. Falling back to per-game."
+            f"(threshold: {BULK_MATCH_THRESHOLD:.0%}). Tag(s): '{tag_label}'. Falling back to per-game."
         )
         warnings.append(
-            f"Gamalytic tag mismatch: only {match_rate:.0%} of full dataset found in "
-            f"Gamalytic '{tag_to_try}' results. Used per-game fallback for top {GAMALYTIC_SAMPLE_SIZE}."
+            f"Gamalytic tag mismatch: only {match_rate:.0%} of dataset found in "
+            f"Gamalytic '{tag_label}' results. Used per-game fallback for top {GAMALYTIC_SAMPLE_SIZE}."
         )
-        sorted_by_owners = sorted(games, key=lambda g: g.get("owners") or 0, reverse=True)
-        top_games = sorted_by_owners[:GAMALYTIC_SAMPLE_SIZE]
-        remaining = sorted_by_owners[GAMALYTIC_SAMPLE_SIZE:]
-        enriched, enrich_warnings = await _enrich_with_gamalytic(top_games, gamalytic)
-        matched = sum(1 for g in enriched if g.get("revenue") is not None)
-        enrichment_meta.update({
-            "method": "per_game_fallback",
-            "matched": matched,
-        })
-        return enriched + remaining, warnings + enrich_warnings, enrichment_meta
+        return await _per_game_fallback()
 
     # --- TIER 1: Bulk merge (cross-validation passed) ---
     logger.info(
         f"Gamalytic bulk cross-validation passed: {match_rate:.0%} overlap. "
-        f"Merging {len(gamalytic_lookup)} Gamalytic records into {len(games)} SteamSpy games."
+        f"Merging {len(gamalytic_lookup)} Gamalytic records into {len(games)} games."
     )
 
     enriched_games = []
@@ -1273,12 +1379,6 @@ async def _enrich_with_gamalytic_bulk(
             enriched_games.append(game)
 
     enrichment_meta["matched"] = matched_count
-
-    # Quota tracking (bulk uses 1 quota unit per page, not per game)
-    pages_used = (len(gamalytic_games) + 199) // 200
-    quota_warning = increment_gamalytic_counter(pages_used)
-    if quota_warning:
-        warnings.append(quota_warning)
 
     # --- TIER 1.5: Per-game enrichment for unenriched games ---
     tier1_5_appids = [
@@ -1348,7 +1448,20 @@ async def _enrich_with_gamalytic_bulk(
             if comm:
                 rev = _commercial_data_to_revenue(comm)
                 if rev is not None:
-                    enriched["revenue"] = rev
+                    current_rev = enriched.get("revenue")
+                    if current_rev is None or rev > current_rev:
+                        enriched["revenue"] = rev
+                        if current_rev is not None:
+                            logger.info(
+                                "Tier 1.5 revenue upgrade for appid %d: $%.0f -> $%.0f",
+                                appid, current_rev, rev,
+                            )
+                    elif current_rev is not None:
+                        logger.info(
+                            "Tier 1.5 revenue downgrade blocked for appid %d: "
+                            "keeping $%.0f (Tier 1.5 wanted $%.0f)",
+                            appid, current_rev, rev,
+                        )
                 if getattr(comm, "copies_sold", None) is not None:
                     enriched["copies_sold"] = comm.copies_sold
                 if getattr(comm, "review_score", None) is not None:
@@ -1440,10 +1553,23 @@ async def _enrich_with_gamalytic_bulk(
                 # Deep-merge CommercialData fields (overwrites Tier 1 bulk fields with richer per-game data)
                 comm = tier2_commercial.get(appid)
                 if comm:
-                    # Revenue: use per-game midpoint (more precise than bulk single int)
+                    # Revenue: use per-game midpoint only if it is higher than current value
                     rev = _commercial_data_to_revenue(comm)
                     if rev is not None:
-                        enriched["revenue"] = rev
+                        current_rev = enriched.get("revenue")
+                        if current_rev is None or rev > current_rev:
+                            enriched["revenue"] = rev
+                            if current_rev is not None:
+                                logger.info(
+                                    "Tier 2 revenue upgrade for appid %d: $%.0f -> $%.0f",
+                                    appid, current_rev, rev,
+                                )
+                        elif current_rev is not None:
+                            logger.info(
+                                "Tier 2 revenue downgrade blocked for appid %d: "
+                                "keeping $%.0f (Tier 2 wanted $%.0f)",
+                                appid, current_rev, rev,
+                            )
                     # Extended fields only available from per-game endpoint
                     if getattr(comm, "copies_sold", None) is not None:
                         enriched["copies_sold"] = comm.copies_sold
@@ -1503,7 +1629,7 @@ async def _enrich_with_gamalytic_bulk(
                 f"({len(tier2_commercial)} Gamalytic, {len(tier2_tags)} SteamSpy tags)"
             )
 
-    enrichment_meta["method"] = "bulk"
+    enrichment_meta["method"] = "union_bulk" if isinstance(enrichment_meta.get("tag_used"), list) else "bulk"
     if pagination_meta:
         enrichment_meta["gamalytic_pagination"] = pagination_meta
     return enriched_games, warnings, enrichment_meta
@@ -1707,10 +1833,8 @@ async def _analyze_market_single_impl(
 
     # Two-tier Gamalytic enrichment: bulk for tag-based, per-game for appid-based
     enrich_start = time.monotonic()
-    # Use first tag as primary for bulk lookup (multi-tag uses Steam Store path, not SteamSpy tag)
-    primary_tag = tags[0] if tags and len(tags) == 1 else None
     enriched_games, enrich_warnings, enrichment_meta = await _enrich_with_gamalytic_bulk(
-        games, gamalytic, steamspy=steamspy, primary_tag=primary_tag
+        games, gamalytic, steamspy=steamspy, tags=tags if tags else None
     )
     enrich_ms = round((time.monotonic() - enrich_start) * 1000)
 
@@ -2839,9 +2963,8 @@ async def compare_markets_analysis(
 
         # Enrich with Gamalytic (consistent with analyze_market_single pipeline)
         enrich_start = time.monotonic()
-        primary_tag = tags[0] if tags and len(tags) == 1 else None
         enriched_games, enrich_warnings, enrichment_meta = await _enrich_with_gamalytic_bulk(
-            games, gamalytic, steamspy=steamspy, primary_tag=primary_tag
+            games, gamalytic, steamspy=steamspy, tags=tags if tags else None
         )
         enrich_ms = round((time.monotonic() - enrich_start) * 1000)
 
