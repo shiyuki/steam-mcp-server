@@ -308,6 +308,7 @@ def _build_game_profile(game: dict) -> GameProfile:
 # ---------------------------------------------------------------------------
 
 STEAMSPY_SUPPLEMENT_THRESHOLD = 1900  # trigger SteamSpy supplement at >= this many games
+STEAMSPY_MIN_EXPECTED = 200  # Below this, SteamSpy result is suspiciously small — supplement with Steam Store
 
 
 def _compute_health_scores(analysis_result: dict) -> MarketHealthScores:
@@ -816,12 +817,12 @@ async def _fetch_game_list_steamspy(
                         if tag_id is None:
                             logger.warning(f"Tag '{tag}' not found in Steam tag map ({len(tag_map)} tags) — skipping supplement")
                         else:
-                            # Fetch appids from Steam Store using integer tag ID
-                            store_result = await steam_store.search_by_tag_ids([tag_id], count=50)
+                            # Fetch appids from Steam Store using integer tag ID (paginated, up to 2000)
+                            store_result = await steam_store.search_by_tag_ids_paginated([tag_id], max_results=2000)
                             if isinstance(store_result, APIErrorSchema):
                                 logger.warning(f"Steam Store supplement search failed: {store_result.message}")
                             else:
-                                # search_by_tag_ids returns tuple[int, list[int]]
+                                # search_by_tag_ids_paginated returns tuple[int, list[int]]
                                 total_count, store_appids = store_result
                                 existing_appids = {g["appid"] for g in games}
                                 new_appids = [a for a in store_appids if a not in existing_appids]
@@ -847,10 +848,58 @@ async def _fetch_game_list_steamspy(
                                                                "release_date": None, "developer": None,
                                                                "publisher": None})
                                     games.extend(new_games)
-                                    data_source = "steamspy+steam_store"
+                                    data_source = "steamspy+steam_store_paginated"
                                     logger.info(f"Supplement added {len(new_games)} additional games (of {len(new_appids)} new appids)")
                 except Exception as exc:
                     logger.warning(f"Steam Store supplement failed: {exc}")
+
+            elif len(games) < STEAMSPY_MIN_EXPECTED:
+                logger.info(f"Small result set ({len(games)} games < {STEAMSPY_MIN_EXPECTED}): supplementing with Steam Store paginated search")
+                try:
+                    # Resolve tag name to integer tag ID via get_tag_map
+                    tag_map = await steam_store.get_tag_map()
+                    if isinstance(tag_map, APIErrorSchema):
+                        logger.warning(f"Steam Store tag map fetch failed: {tag_map.message} — skipping small-result supplement")
+                    else:
+                        tag_id = tag_map.get(tag.lower())
+                        if tag_id is None:
+                            logger.warning(f"Tag '{tag}' not found in Steam tag map ({len(tag_map)} tags) — skipping small-result supplement")
+                        else:
+                            # Fetch up to 2000 appids from Steam Store using integer tag ID
+                            store_result = await steam_store.search_by_tag_ids_paginated([tag_id], max_results=2000)
+                            if isinstance(store_result, APIErrorSchema):
+                                logger.warning(f"Steam Store small-result supplement search failed: {store_result.message}")
+                            else:
+                                # search_by_tag_ids_paginated returns tuple[int, list[int]]
+                                total_count, store_appids = store_result
+                                existing_appids = {g["appid"] for g in games}
+                                new_appids = [a for a in store_appids if a not in existing_appids]
+                                if new_appids:
+                                    # Enrich new appids with SteamSpy engagement data concurrently
+                                    enrich_tasks = [_fetch_one(appid) for appid in new_appids]
+                                    enrich_gr = await gather_with_timeout(
+                                        enrich_tasks,
+                                        timeout=compute_gather_timeout(len(new_appids), STEAMSPY_RATE),
+                                        label=f"small_supplement_enrich({len(new_appids)})",
+                                    )
+                                    new_games = [r for r in enrich_gr.results if isinstance(r, dict)]
+                                    # Recover dropped appids as minimal dicts so Gamalytic enrichment can populate them
+                                    surviving_appids = {g["appid"] for g in new_games}
+                                    for appid in new_appids:
+                                        if appid not in surviving_appids:
+                                            new_games.append({"appid": appid, "name": None, "revenue": None,
+                                                               "owners": None, "ccu": None, "price": None,
+                                                               "review_score": None, "median_forever": None,
+                                                               "average_forever": None, "positive": None,
+                                                               "negative": None, "followers": None,
+                                                               "copies_sold": None, "tags": {},
+                                                               "release_date": None, "developer": None,
+                                                               "publisher": None})
+                                    games.extend(new_games)
+                                    data_source = "steamspy+steam_store_paginated"
+                                    logger.info(f"Small-result supplement added {len(new_games)} additional games (of {len(new_appids)} new appids)")
+                except Exception as exc:
+                    logger.warning(f"Steam Store small-result supplement failed: {exc}")
 
             return games, data_source
 
