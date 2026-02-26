@@ -702,6 +702,7 @@ def register_tools(mcp: FastMCP):
                 date_range=date_range if date_range else None,
                 platform=platform,
                 sort=sort,
+                cursor=cursor if cursor else "",
             )
 
         return json.dumps(result.model_dump(), default=str)
@@ -940,6 +941,36 @@ def register_tools(mcp: FastMCP):
             # genre_games is populated from Step 1's enriched game list (Gamalytic-enriched)
             if not genre_games:
                 genre_games = []
+
+            # Step 2b: Find target game in enriched genre data (avoids cache pollution from enrichment phase)
+            # During Step 1, analyze_market_single runs Tier 1 bulk + Tier 1.5 + Tier 2 enrichment.
+            # The Tier 1 bulk fetch caches a low bulk revenue for the target game (e.g., $7.3M for StS).
+            # Step 2's get_commercial_data call then hits that stale cache instead of fetching per-game data.
+            # Solution: use the post-enrichment revenue from the genre_games list, which reflects Tier 2 data.
+            target_enriched = None
+            if genre_games:
+                target_enriched = next((g for g in genre_games if g.get("appid") == appid), None)
+
+            if target_enriched:
+                enriched_rev = target_enriched.get("revenue")
+                current_rev = game_data.get("revenue")
+                if enriched_rev is not None and (current_rev is None or enriched_rev > current_rev):
+                    game_data["revenue"] = enriched_rev
+                    if current_rev is not None:
+                        logger.info(
+                            "evaluate_game: using enriched genre revenue for appid %d: "
+                            "$%.0f (was $%.0f from API cache)",
+                            appid, enriched_rev, current_rev,
+                        )
+                    else:
+                        logger.info(
+                            "evaluate_game: using enriched genre revenue for appid %d: $%.0f",
+                            appid, enriched_rev,
+                        )
+                # Also fill gaps from enriched data
+                for field in ("copies_sold", "followers", "name", "review_score", "release_date"):
+                    if target_enriched.get(field) is not None and not game_data.get(field):
+                        game_data[field] = target_enriched[field]
 
             # Step 4: Optionally get review data (compact, non-blocking)
             reviews_data = None
