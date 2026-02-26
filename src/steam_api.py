@@ -1144,6 +1144,55 @@ class SteamStoreClient:
                 message=f"Steam Store search error: {e}"
             )
 
+    async def search_by_tag_ids_paginated(
+        self, tag_ids: list[int], max_results: int = 2000, page_size: int = 50
+    ) -> tuple[int, list[int]] | APIError:
+        """Search Steam Store with automatic pagination up to max_results."""
+        all_appids: list[int] = []
+        seen: set[int] = set()
+        total_count = 0
+        start = 0
+        pages_fetched = 0
+
+        while start < max_results:
+            result = await self.search_by_tag_ids(tag_ids, start=start, count=page_size)
+            if isinstance(result, APIError):
+                if not all_appids:
+                    return result
+                logger.warning(
+                    f"Paginated search: page at start={start} failed, "
+                    f"returning {len(all_appids)} appids collected so far"
+                )
+                break
+
+            pages_fetched += 1
+            page_total, page_appids = result
+            total_count = page_total
+
+            new_appids = [a for a in page_appids if a not in seen]
+            if not new_appids:
+                break
+
+            for a in new_appids:
+                seen.add(a)
+                all_appids.append(a)
+
+            if len(all_appids) >= max_results:
+                all_appids = all_appids[:max_results]
+                break
+
+            start += page_size
+
+            if start >= total_count:
+                break
+
+        logger.info(
+            f"Paginated search: collected {len(all_appids)} appids "
+            f"(total_count={total_count}, pages={pages_fetched}, "
+            f"cap={max_results})"
+        )
+        return total_count, all_appids
+
 
 class GamalyticClient:
     """Client for Gamalytic API (revenue estimation) with review-based fallback."""
@@ -1856,7 +1905,7 @@ class SteamReviewClient:
     # ---------------------------------------------------------------------------
 
     async def _fetch_review_page(
-        self, appid: int, cursor: str, params: dict
+        self, appid: int, cursor: str, params: dict, *, cache_ttl: int = 0
     ) -> tuple[dict, str]:
         """Fetch a single page of reviews from the Steam Review API.
 
@@ -1864,6 +1913,7 @@ class SteamReviewClient:
             appid: Steam AppID
             cursor: Pagination cursor ("*" for first page)
             params: Base filter params to include
+            cache_ttl: Cache TTL in seconds (default 0 = no cache for cursor pagination)
 
         Returns:
             Tuple of (response_data_dict, new_cursor_string)
@@ -1877,7 +1927,7 @@ class SteamReviewClient:
         data, _, _ = await self.http.get_with_metadata(
             self.REVIEW_URL.format(appid=appid),
             params=full_params,
-            cache_ttl=900,  # 15 minutes
+            cache_ttl=cache_ttl,
         )
         new_cursor = data.get("cursor", "")
         return (data, new_cursor)
@@ -1893,6 +1943,7 @@ class SteamReviewClient:
         day_range: int | None,
         platform: str,
         sort: str,
+        start_cursor: str = "*",
     ) -> tuple[list[dict], dict | None, str, int]:
         """Paginate the review text sequence (helpful-sort or recent-sort).
 
@@ -1920,7 +1971,7 @@ class SteamReviewClient:
         if day_range is not None:
             base_params["day_range"] = str(day_range)
 
-        cursor = "*"
+        cursor = start_cursor
         seen_ids: set[str] = set()
         all_reviews: list[dict] = []
         pages_fetched = 0
@@ -2470,6 +2521,7 @@ class SteamReviewClient:
         date_range: str | None = None,
         platform: str = "all",
         sort: str = "helpful",
+        cursor: str = "",
     ) -> ReviewsData:
         """Fetch Steam reviews for a game with pagination, stats, and sentiment.
 
@@ -2488,10 +2540,12 @@ class SteamReviewClient:
             date_range: Relative ("30d", "6m", "1y") or absolute ISO ("2024-01-01,2024-06-30")
             platform: Platform filter (local-only; Steam API doesn't expose this directly)
             sort: "helpful" (default) or "recent"
+            cursor: Pagination cursor from previous call (empty = first call)
 
         Returns:
             ReviewsData with reviews/snippets, aggregates, histogram, sentiment, and meta
         """
+        is_continuation = bool(cursor)
         # Build QueryParams echo
         query_params = QueryParams(
             appid=appid,
@@ -2545,32 +2599,43 @@ class SteamReviewClient:
         else:
             helpful_limit, recent_limit = 3000, 3000
 
-        # Run review text + dual stats scans + EA dates + language distribution in parallel
+        # Run review text fetch (with cursor support for continuation)
+        start_cursor = cursor if is_continuation else "*"
         text_task = self._fetch_review_text(
             appid, limit, language, review_type, purchase_type,
-            filter_offtopic, day_range_param, platform, sort
+            filter_offtopic, day_range_param, platform, sort,
+            start_cursor=start_cursor,
         )
-        stats_helpful_task = self._fetch_stats_scan(appid, language, helpful_limit, filter_mode="all")
-        stats_recent_task = self._fetch_stats_scan(appid, language, recent_limit, filter_mode="recent")
-        ea_task = self._resolve_ea_dates(appid)
-        lang_task = self._fetch_language_distribution(appid)
 
-        (
-            (raw_text, query_summary, last_cursor, pages_text),
-            stats_helpful,
-            stats_recent,
-            ea_dates,
-            lang_dist,
-        ) = await asyncio.gather(text_task, stats_helpful_task, stats_recent_task, ea_task, lang_task)
+        if is_continuation:
+            # Continuation: skip expensive stats/EA/lang scans — return reviews only
+            raw_text, query_summary, last_cursor, pages_text = await text_task
+            stats_reviews: list[dict] = []
+            ea_dates = None
+            lang_dist = None
+        else:
+            # First call: run stats scans + EA dates + language distribution in parallel
+            stats_helpful_task = self._fetch_stats_scan(appid, language, helpful_limit, filter_mode="all")
+            stats_recent_task = self._fetch_stats_scan(appid, language, recent_limit, filter_mode="recent")
+            ea_task = self._resolve_ea_dates(appid)
+            lang_task = self._fetch_language_distribution(appid)
 
-        # Merge helpful + recent stats scans (dedup by recommendationid)
-        seen_ids: set[str] = set()
-        stats_reviews: list[dict] = []
-        for r in stats_helpful + stats_recent:
-            rid = str(r.get("recommendationid", ""))
-            if rid and rid not in seen_ids:
-                seen_ids.add(rid)
-                stats_reviews.append(r)
+            (
+                (raw_text, query_summary, last_cursor, pages_text),
+                stats_helpful,
+                stats_recent,
+                ea_dates,
+                lang_dist,
+            ) = await asyncio.gather(text_task, stats_helpful_task, stats_recent_task, ea_task, lang_task)
+
+            # Merge helpful + recent stats scans (dedup by recommendationid)
+            stats_reviews: list[dict] = []
+            seen_ids: set[str] = set()
+            for r in stats_helpful + stats_recent:
+                rid = str(r.get("recommendationid", ""))
+                if rid and rid not in seen_ids:
+                    seen_ids.add(rid)
+                    stats_reviews.append(r)
 
         # Determine partial status (set during _fetch_review_text if mid-pagination failure)
         # We can't directly get it from the tuple, but partial is implicitly detected by
@@ -2614,9 +2679,12 @@ class SteamReviewClient:
         if query_summary:
             aggregates = self._build_aggregates(query_summary, parsed_reviews)
 
-        # Compute histogram and sentiment from stats scan
-        histogram = self._compute_histogram(stats_reviews)
-        fixed_rolling, yearly, ratio_timeline = self._compute_sentiment_periods(stats_reviews, ea_dates)
+        # Compute histogram and sentiment from stats scan (skip on continuation)
+        histogram = self._compute_histogram(stats_reviews) if stats_reviews else None
+        if stats_reviews and ea_dates is not None:
+            fixed_rolling, yearly, ratio_timeline = self._compute_sentiment_periods(stats_reviews, ea_dates)
+        else:
+            fixed_rolling, yearly, ratio_timeline = None, None, None
 
         # Build meta
         total_available = query_summary.get("total_reviews", 0) if query_summary else 0
