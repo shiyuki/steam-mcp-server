@@ -1122,7 +1122,7 @@ class SteamStoreClient:
                     "start": str(start),
                     "count": str(count),
                     "tags": tags_param,
-                    "sort_by": "Released_DESC",
+                    "sort_by": "Reviews_DESC",
                     "infinite": "1",
                 },
                 cache_ttl=3600,  # 1 hour cache
