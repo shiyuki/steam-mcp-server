@@ -1500,7 +1500,7 @@ class TestSupplementAndMultiTag:
         assert appids_in_result == {1001, 1002, 1003}
 
         # search_by_tag_ids_paginated called with both integer IDs and max_results
-        mock_steam_store.search_by_tag_ids_paginated.assert_called_once_with([12345, 67890], max_results=1000)
+        mock_steam_store.search_by_tag_ids_paginated.assert_called_once_with([12345, 67890], max_results=2000)
 
     @pytest.mark.asyncio
     async def test_multi_tag_missing_tag_returns_empty(self):

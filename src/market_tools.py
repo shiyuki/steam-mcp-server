@@ -417,11 +417,12 @@ def _build_top_games(games: list[dict], top_n: int) -> list[GameProfile]:
 
 def _build_methodology_dict(tags: list[str], data_source: str, n_games: int, skipped: list[SkippedMetric]) -> dict:
     """Return flat methodology dict for inclusion in result."""
-    if "steam_store" in data_source and len(tags) > 1:
+    if "steam_store" in data_source and len(tags) > 1 and not data_source.startswith("steamspy"):
         source_label = f"Steam Store multi-tag search for '{', '.join(tags)}'"
-    elif "steam_store" in data_source:
-        source_label = f"Steam Store search for '{', '.join(tags)}'"
+    elif data_source == "steam_store_fallback" or (data_source.startswith("steam_store") and len(tags) == 1):
+        source_label = f"Steam Store fallback for '{', '.join(tags)}'"
     elif tags:
+        # SteamSpy primary path (includes supplement variants: steamspy+steam_store_paginated)
         source_label = f"SteamSpy tag search for '{', '.join(tags)}'"
     else:
         source_label = f"Custom AppID list ({n_games} games)"
@@ -978,7 +979,7 @@ async def _fetch_game_list_steamspy(
             return [], f"steam_store:tag_error:{','.join(missing_tags)}"
 
         # Fetch appids from Steam Store using all integer tag IDs (intersection)
-        store_result = await steam_store.search_by_tag_ids_paginated(tag_ids, max_results=1000)
+        store_result = await steam_store.search_by_tag_ids_paginated(tag_ids, max_results=2000)
         if isinstance(store_result, APIErrorSchema):
             logger.warning(f"Steam Store multi-tag search failed: {store_result.message}")
             return [], "steam_store"
