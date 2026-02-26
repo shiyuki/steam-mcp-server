@@ -1487,7 +1487,7 @@ class TestSupplementAndMultiTag:
             "deckbuilder": 67890,
         })
         # Returns tuple[int, list[int]]
-        mock_steam_store.search_by_tag_ids = AsyncMock(return_value=(150, [1001, 1002, 1003]))
+        mock_steam_store.search_by_tag_ids_paginated = AsyncMock(return_value=(150, [1001, 1002, 1003]))
         mock_steamspy.get_engagement_data = AsyncMock(side_effect=lambda appid: _make_engagement_data(appid))
 
         games, data_source = await _fetch_game_list_steamspy(
@@ -1499,8 +1499,8 @@ class TestSupplementAndMultiTag:
         appids_in_result = {g["appid"] for g in games}
         assert appids_in_result == {1001, 1002, 1003}
 
-        # search_by_tag_ids called with both integer IDs, correct param name
-        mock_steam_store.search_by_tag_ids.assert_called_once_with([12345, 67890], count=50)
+        # search_by_tag_ids_paginated called with both integer IDs and max_results
+        mock_steam_store.search_by_tag_ids_paginated.assert_called_once_with([12345, 67890], max_results=1000)
 
     @pytest.mark.asyncio
     async def test_multi_tag_missing_tag_returns_empty(self):
@@ -1511,7 +1511,7 @@ class TestSupplementAndMultiTag:
 
         # "deckbuilder" is not in tag map
         mock_steam_store.get_tag_map = AsyncMock(return_value={"roguelike": 12345})
-        mock_steam_store.search_by_tag_ids = AsyncMock()
+        mock_steam_store.search_by_tag_ids_paginated = AsyncMock()
 
         games, data_source = await _fetch_game_list_steamspy(
             mock_steamspy, mock_steam_store, mock_gamalytic, tags=["Roguelike", "Deckbuilder"], appids=None
@@ -1521,7 +1521,7 @@ class TestSupplementAndMultiTag:
         # data_source encodes the missing tag name for upstream error surfacing
         assert data_source.startswith("steam_store:tag_error:")
         assert "Deckbuilder" in data_source
-        mock_steam_store.search_by_tag_ids.assert_not_called()
+        mock_steam_store.search_by_tag_ids_paginated.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_multi_tag_search_failure_returns_empty(self):
@@ -1534,7 +1534,7 @@ class TestSupplementAndMultiTag:
             "roguelike": 12345,
             "deckbuilder": 67890,
         })
-        mock_steam_store.search_by_tag_ids = AsyncMock(
+        mock_steam_store.search_by_tag_ids_paginated = AsyncMock(
             return_value=APIError(error_code=503, error_type="api_error", message="Steam Store unavailable")
         )
 
@@ -1688,4 +1688,215 @@ class TestEvaluateGameGamalyticFallback:
         )
         assert captured_game_data.get("owners") == 5_000_000.0, (
             f"Expected owners=5000000.0 from SteamSpy, got {captured_game_data.get('owners')}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestEvaluateGameCachePollution
+# ---------------------------------------------------------------------------
+
+class TestEvaluateGameCachePollution:
+    """Regression tests for evaluate_game Step 2b: cache pollution fix.
+
+    When analyze_market_single runs Tier 1 bulk enrichment, the target game's
+    revenue is cached at the low bulk value ($7.3M). Step 2's get_commercial_data
+    call then hits that stale cache. Step 2b must extract the post-enrichment
+    revenue from the genre_games list and override the stale value.
+    """
+
+    def _make_commercial_data_stale(self, appid=646570, gamalytic_revenue=7_300_000.0):
+        """Simulate stale bulk cache: low revenue that Tier 1 bulk produced."""
+        return CommercialData(
+            fetched_at=datetime(2026, 2, 25, tzinfo=timezone.utc),
+            appid=appid,
+            name="Slay the Spire",
+            revenue_min=6_000_000.0,
+            revenue_max=9_000_000.0,
+            confidence="low",
+            source="gamalytic",
+            gamalytic_revenue=gamalytic_revenue,
+        )
+
+    def _make_commercial_data_fresh(self, appid=646570, gamalytic_revenue=95_000_000.0):
+        """Simulate fresh per-game data: accurate revenue from Gamalytic."""
+        return CommercialData(
+            fetched_at=datetime(2026, 2, 25, tzinfo=timezone.utc),
+            appid=appid,
+            name="Slay the Spire",
+            revenue_min=90_000_000.0,
+            revenue_max=100_000_000.0,
+            confidence="high",
+            source="gamalytic",
+            gamalytic_revenue=gamalytic_revenue,
+        )
+
+    def _make_game_metadata(self, appid=646570):
+        return GameMetadata(
+            fetched_at=datetime(2026, 2, 25, tzinfo=timezone.utc),
+            appid=appid,
+            name="Slay the Spire",
+            release_date="2019-01-23",
+        )
+
+    def _make_engagement(self, appid=646570):
+        return EngagementData(
+            fetched_at=datetime(2026, 2, 25, tzinfo=timezone.utc),
+            appid=appid,
+            name="Slay the Spire",
+            ccu=5000,
+            owners_min=2_000_000,
+            owners_max=5_000_000,
+            owners_midpoint=3_500_000,
+            average_forever=100.0,
+            average_2weeks=10.0,
+            median_forever=80.0,
+            median_2weeks=8.0,
+            positive=100000,
+            negative=5000,
+            total_reviews=105000,
+            price=24.99,
+            review_score=92.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_genre_path_uses_enriched_revenue_over_stale_cache(self):
+        """Step 2b overrides stale cache revenue with higher enriched revenue from genre_games.
+
+        Scenario: target appid 646570 appears in genre_games with revenue=$95M (post-Tier2).
+        get_commercial_data returns stale $7.3M (from Tier1 bulk cache).
+        Expected: game_data["revenue"] == 95_000_000 after Step 2b override.
+        """
+        from src.tools import register_tools
+        from mcp.server.fastmcp import FastMCP
+        import src.tools as tools_module
+
+        mcp = FastMCP("test")
+        register_tools(mcp)
+
+        # Tier 1 bulk cached stale revenue
+        stale_commercial = self._make_commercial_data_stale(gamalytic_revenue=7_300_000.0)
+        metadata = self._make_game_metadata()
+        engagement = self._make_engagement()
+
+        # genre_games contains target with enriched (Tier 2) revenue
+        genre_games_enriched = [
+            {"appid": 646570, "name": "Slay the Spire", "revenue": 95_000_000, "review_score": 97.5},
+            {"appid": 99999, "name": "Other Game", "revenue": 1_000_000},
+        ]
+        genre_result_stub = {"game_count": 100, "methodology": {"data_source": "steamspy+gamalytic_bulk"}}
+
+        captured_game_data = {}
+
+        async def fake_evaluate_game_analysis(**kwargs):
+            captured_game_data.update(kwargs.get("game_data", {}))
+            return {"appid": kwargs.get("appid"), "cache_pollution_test": True}
+
+        with patch("src.tools.analyze_market_single", new=AsyncMock(return_value=(genre_result_stub, genre_games_enriched))), \
+             patch.object(tools_module._gamalytic, "get_commercial_data", new=AsyncMock(return_value=stale_commercial)), \
+             patch.object(tools_module._steamspy, "get_engagement_data", new=AsyncMock(return_value=engagement)), \
+             patch.object(tools_module._steam_store, "get_app_details", new=AsyncMock(return_value=metadata)), \
+             patch.object(tools_module._review_client, "fetch_reviews", side_effect=Exception("skip reviews")), \
+             patch("src.tools.evaluate_game_analysis", new=AsyncMock(side_effect=fake_evaluate_game_analysis)):
+            tools = {t.name: t for t in mcp._tool_manager.list_tools()}
+            result_json = await tools["evaluate_game"].fn(appid=646570, genre="Roguelike")
+            result = json.loads(result_json)
+
+        assert "error" not in result, f"Unexpected error: {result}"
+        assert captured_game_data.get("revenue") == 95_000_000, (
+            f"Expected enriched revenue 95000000 from genre_games, "
+            f"got {captured_game_data.get('revenue')} (stale cache was 7300000)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_genre_path_target_not_in_list_uses_api(self):
+        """When target appid is NOT in genre_games, API revenue is used as-is.
+
+        Scenario: genre_games does not contain appid 646570.
+        get_commercial_data returns $95M (fresh per-game fetch, no stale cache).
+        Expected: game_data["revenue"] == 95_000_000 from the API.
+        """
+        from src.tools import register_tools
+        from mcp.server.fastmcp import FastMCP
+        import src.tools as tools_module
+
+        mcp = FastMCP("test")
+        register_tools(mcp)
+
+        fresh_commercial = self._make_commercial_data_fresh(gamalytic_revenue=95_000_000.0)
+        metadata = self._make_game_metadata()
+        engagement = self._make_engagement()
+
+        # genre_games does NOT contain appid 646570 — target wasn't in genre list
+        genre_games_without_target = [
+            {"appid": 11111, "name": "Game A", "revenue": 500_000},
+            {"appid": 22222, "name": "Game B", "revenue": 200_000},
+        ]
+        genre_result_stub = {"game_count": 50, "methodology": {"data_source": "steamspy+gamalytic_bulk"}}
+
+        captured_game_data = {}
+
+        async def fake_evaluate_game_analysis(**kwargs):
+            captured_game_data.update(kwargs.get("game_data", {}))
+            return {"appid": kwargs.get("appid"), "not_in_list_test": True}
+
+        with patch("src.tools.analyze_market_single", new=AsyncMock(return_value=(genre_result_stub, genre_games_without_target))), \
+             patch.object(tools_module._gamalytic, "get_commercial_data", new=AsyncMock(return_value=fresh_commercial)), \
+             patch.object(tools_module._steamspy, "get_engagement_data", new=AsyncMock(return_value=engagement)), \
+             patch.object(tools_module._steam_store, "get_app_details", new=AsyncMock(return_value=metadata)), \
+             patch.object(tools_module._review_client, "fetch_reviews", side_effect=Exception("skip reviews")), \
+             patch("src.tools.evaluate_game_analysis", new=AsyncMock(side_effect=fake_evaluate_game_analysis)):
+            tools = {t.name: t for t in mcp._tool_manager.list_tools()}
+            result_json = await tools["evaluate_game"].fn(appid=646570, genre="Roguelike")
+            result = json.loads(result_json)
+
+        assert "error" not in result, f"Unexpected error: {result}"
+        assert captured_game_data.get("revenue") == 95_000_000.0, (
+            f"Expected API revenue 95000000 when target not in genre_games, "
+            f"got {captured_game_data.get('revenue')}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_custom_baseline_unaffected(self):
+        """Custom baseline path (genre_appids=) is unaffected by Step 2b.
+
+        Scenario: user provides genre_appids instead of genre tag.
+        genre_games is empty (custom list not enriched as genre).
+        get_commercial_data returns $95M.
+        Expected: game_data["revenue"] == 95_000_000 from the API (no Step 2b override).
+        """
+        from src.tools import register_tools
+        from mcp.server.fastmcp import FastMCP
+        import src.tools as tools_module
+
+        mcp = FastMCP("test")
+        register_tools(mcp)
+
+        fresh_commercial = self._make_commercial_data_fresh(gamalytic_revenue=95_000_000.0)
+        metadata = self._make_game_metadata()
+        engagement = self._make_engagement()
+
+        # Empty genre_games — custom baseline path typically returns empty list
+        genre_games_empty = []
+        genre_result_stub = {"game_count": 3, "methodology": {"data_source": "steamspy"}}
+
+        captured_game_data = {}
+
+        async def fake_evaluate_game_analysis(**kwargs):
+            captured_game_data.update(kwargs.get("game_data", {}))
+            return {"appid": kwargs.get("appid"), "custom_baseline_test": True}
+
+        with patch("src.tools.analyze_market_single", new=AsyncMock(return_value=(genre_result_stub, genre_games_empty))), \
+             patch.object(tools_module._gamalytic, "get_commercial_data", new=AsyncMock(return_value=fresh_commercial)), \
+             patch.object(tools_module._steamspy, "get_engagement_data", new=AsyncMock(return_value=engagement)), \
+             patch.object(tools_module._steam_store, "get_app_details", new=AsyncMock(return_value=metadata)), \
+             patch.object(tools_module._review_client, "fetch_reviews", side_effect=Exception("skip reviews")), \
+             patch("src.tools.evaluate_game_analysis", new=AsyncMock(side_effect=fake_evaluate_game_analysis)):
+            tools = {t.name: t for t in mcp._tool_manager.list_tools()}
+            result_json = await tools["evaluate_game"].fn(appid=646570, genre_appids="12345,67890")
+            result = json.loads(result_json)
+
+        assert "error" not in result, f"Unexpected error: {result}"
+        assert captured_game_data.get("revenue") == 95_000_000.0, (
+            f"Expected API revenue 95000000 for custom baseline path, "
+            f"got {captured_game_data.get('revenue')}"
         )
