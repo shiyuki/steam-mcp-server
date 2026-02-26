@@ -592,3 +592,146 @@ class TestMultiTagSearch:
             await tools["search_genre"].fn(genre="RPG", limit=5, sort_by="owners")
 
             spy_mock.assert_called_once()
+
+
+# --- SteamStoreClient.search_by_tag_ids_paginated() ---
+
+class TestSearchByTagIdsPaginated:
+    """Tests for the paginated Steam Store search wrapper."""
+
+    def _make_html(self, appids: list[int]) -> str:
+        """Create minimal HTML containing the given appids."""
+        parts = [f'<a data-ds-appid="{aid}"></a>' for aid in appids]
+        return "".join(parts)
+
+    @pytest.mark.asyncio
+    async def test_paginated_collects_multiple_pages(self, mock_http):
+        """Three pages of 50 results each with max=150 returns all 150 appids."""
+        page1_appids = list(range(1, 51))    # 50 appids: 1..50
+        page2_appids = list(range(51, 101))  # 50 appids: 51..100
+        page3_appids = list(range(101, 151)) # 50 appids: 101..150
+
+        mock_http.get_with_metadata.side_effect = [
+            ({"results_html": self._make_html(page1_appids), "total_count": 150}, datetime.now(timezone.utc), 0),
+            ({"results_html": self._make_html(page2_appids), "total_count": 150}, datetime.now(timezone.utc), 0),
+            ({"results_html": self._make_html(page3_appids), "total_count": 150}, datetime.now(timezone.utc), 0),
+        ]
+
+        client = SteamStoreClient(mock_http)
+        result = await client.search_by_tag_ids_paginated([10235], max_results=150, page_size=50)
+
+        assert not isinstance(result, APIError)
+        total_count, appids = result
+        assert total_count == 150
+        assert len(appids) == 150
+        assert appids == page1_appids + page2_appids + page3_appids
+
+    @pytest.mark.asyncio
+    async def test_paginated_respects_max_results_cap(self, mock_http):
+        """With cap=120 and 150 total, returns exactly 120 appids."""
+        page1_appids = list(range(1, 51))
+        page2_appids = list(range(51, 101))
+        page3_appids = list(range(101, 151))
+
+        mock_http.get_with_metadata.side_effect = [
+            ({"results_html": self._make_html(page1_appids), "total_count": 150}, datetime.now(timezone.utc), 0),
+            ({"results_html": self._make_html(page2_appids), "total_count": 150}, datetime.now(timezone.utc), 0),
+            ({"results_html": self._make_html(page3_appids), "total_count": 150}, datetime.now(timezone.utc), 0),
+        ]
+
+        client = SteamStoreClient(mock_http)
+        result = await client.search_by_tag_ids_paginated([10235], max_results=120, page_size=50)
+
+        assert not isinstance(result, APIError)
+        total_count, appids = result
+        assert len(appids) == 120
+        assert appids == (page1_appids + page2_appids + page3_appids[:20])
+
+    @pytest.mark.asyncio
+    async def test_paginated_stops_at_empty_page(self, mock_http):
+        """When page 2 returns empty HTML, stops and returns only page 1 results."""
+        page1_appids = list(range(1, 51))
+
+        mock_http.get_with_metadata.side_effect = [
+            ({"results_html": self._make_html(page1_appids), "total_count": 200}, datetime.now(timezone.utc), 0),
+            ({"results_html": "", "total_count": 200}, datetime.now(timezone.utc), 0),
+        ]
+
+        client = SteamStoreClient(mock_http)
+        result = await client.search_by_tag_ids_paginated([10235], max_results=200, page_size=50)
+
+        assert not isinstance(result, APIError)
+        total_count, appids = result
+        assert len(appids) == 50
+        assert appids == page1_appids
+
+    @pytest.mark.asyncio
+    async def test_paginated_deduplicates_across_pages(self, mock_http):
+        """Appids appearing on multiple pages are deduplicated."""
+        page1_appids = [1, 2, 3, 4, 5]
+        page2_appids = [3, 4, 5, 6, 7]  # 3, 4, 5 are duplicates
+
+        mock_http.get_with_metadata.side_effect = [
+            ({"results_html": self._make_html(page1_appids), "total_count": 7}, datetime.now(timezone.utc), 0),
+            ({"results_html": self._make_html(page2_appids), "total_count": 7}, datetime.now(timezone.utc), 0),
+            # Third page would have start=10 > total_count=7, but dedup stops us first
+        ]
+
+        client = SteamStoreClient(mock_http)
+        result = await client.search_by_tag_ids_paginated([10235], max_results=100, page_size=5)
+
+        assert not isinstance(result, APIError)
+        total_count, appids = result
+        assert appids == [1, 2, 3, 4, 5, 6, 7]
+        assert len(appids) == 7
+
+    @pytest.mark.asyncio
+    async def test_paginated_first_page_error_returns_error(self, mock_http):
+        """APIError on page 1 (no prior results) returns APIError directly."""
+        mock_http.get_with_metadata.side_effect = Exception("Network timeout")
+
+        client = SteamStoreClient(mock_http)
+        result = await client.search_by_tag_ids_paginated([10235], max_results=100, page_size=50)
+
+        assert isinstance(result, APIError)
+        assert result.error_code == 502
+
+    @pytest.mark.asyncio
+    async def test_paginated_mid_page_error_returns_partial(self, mock_http):
+        """APIError on page 2 returns page 1 results (graceful degradation)."""
+        page1_appids = list(range(1, 51))
+
+        mock_http.get_with_metadata.side_effect = [
+            ({"results_html": self._make_html(page1_appids), "total_count": 200}, datetime.now(timezone.utc), 0),
+            Exception("Network timeout on page 2"),
+        ]
+
+        client = SteamStoreClient(mock_http)
+        result = await client.search_by_tag_ids_paginated([10235], max_results=200, page_size=50)
+
+        assert not isinstance(result, APIError)
+        total_count, appids = result
+        assert len(appids) == 50
+        assert appids == page1_appids
+
+    @pytest.mark.asyncio
+    async def test_paginated_stops_when_start_exceeds_total_count(self, mock_http):
+        """With total_count=75 and page_size=50, fetches 2 pages only (no 3rd)."""
+        page1_appids = list(range(1, 51))   # 50 appids
+        page2_appids = list(range(51, 76))  # 25 appids (total 75)
+
+        mock_http.get_with_metadata.side_effect = [
+            ({"results_html": self._make_html(page1_appids), "total_count": 75}, datetime.now(timezone.utc), 0),
+            ({"results_html": self._make_html(page2_appids), "total_count": 75}, datetime.now(timezone.utc), 0),
+        ]
+
+        client = SteamStoreClient(mock_http)
+        result = await client.search_by_tag_ids_paginated([10235], max_results=500, page_size=50)
+
+        assert not isinstance(result, APIError)
+        total_count, appids = result
+        assert total_count == 75
+        assert len(appids) == 75
+        assert appids == page1_appids + page2_appids
+        # Verify only 2 HTTP calls were made (not 3)
+        assert mock_http.get_with_metadata.call_count == 2
