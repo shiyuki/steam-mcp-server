@@ -2401,3 +2401,293 @@ class TestTier15Enrichment:
         assert meta["tier1_5_tags_found"] == 0
         assert meta["tier1_5_commercial_found"] == 2
         mock_gamalytic.get_commercial_data.assert_not_called()
+
+
+class TestReleasedCountMethodology:
+    """Tests for total_released_on_steam in methodology output.
+
+    Verifies that analyze_market_single fires a parallel Released_DESC count
+    request and reports it in methodology alongside the review-ranked analysis set.
+    """
+
+    def _make_search_result(self, tag: str = "Roguelike", n: int = 30):
+        from src.schemas import GameSummary, SearchResult
+        games = [
+            GameSummary(
+                appid=i, name=f"Game {i}", developer="Dev", publisher="Pub",
+                ccu=100, owners_min=1000 * (n + 1 - i), owners_max=5000 * (n + 1 - i),
+                owners_midpoint=float(3000 * (n + 1 - i)),
+                average_forever=10.0, average_2weeks=1.0,
+                median_forever=8.0, median_2weeks=0.5,
+                positive=200, negative=10, price=9.99,
+            )
+            for i in range(1, n + 1)
+        ]
+        return SearchResult(
+            tag=tag, appids=[g.appid for g in games], total_found=n,
+            games=games, data_source="steamspy",
+            fetched_at="2026-01-01T00:00:00Z", cache_age_seconds=0,
+        )
+
+    def _setup_single_tag_mocks(self, n_games=30, released_count=4563):
+        """Set up mocks for single-tag path: SteamSpy succeeds, released count available."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+
+        mock_steamspy.search_by_tag = AsyncMock(return_value=self._make_search_result(n=n_games))
+        mock_steamspy.get_engagement_data = AsyncMock(return_value=None)
+
+        _inline_games = [
+            {"steamId": i, "name": f"Game {i}", "revenue": 500_000 * (n_games + 1 - i), "copiesSold": 10000}
+            for i in range(1, n_games + 1)
+        ]
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=_with_meta(_inline_games))
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
+
+        # Released count: get_tag_map resolves tag, get_total_released_count returns count
+        mock_steam_store.get_tag_map = AsyncMock(return_value={"roguelike": 1234})
+        mock_steam_store.get_total_released_count = AsyncMock(return_value=released_count)
+
+        return mock_steamspy, mock_steam_store, mock_gamalytic
+
+    def _setup_multi_tag_mocks(self, n_appids=50, released_count=3855):
+        """Set up mocks for multi-tag path: Steam Store search + per-game enrichment."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.schemas import EngagementData
+        from datetime import datetime, timezone
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+
+        appids = list(range(101, 101 + n_appids))
+
+        # Multi-tag path: get_tag_map + search_by_tag_ids_paginated
+        mock_steam_store.get_tag_map = AsyncMock(return_value={
+            "visual novel": 3799, "choices matter": 6426,
+        })
+        mock_steam_store.search_by_tag_ids_paginated = AsyncMock(
+            return_value=(n_appids, appids)
+        )
+        mock_steam_store.get_total_released_count = AsyncMock(return_value=released_count)
+
+        # SteamSpy per-game enrichment for multi-tag path
+        mock_steamspy.get_engagement_data = AsyncMock(return_value=EngagementData(
+            appid=101, name="MultiTagGame", ccu=50, owners_min=500, owners_max=2000,
+            owners_midpoint=1250.0, average_forever=5.0, average_2weeks=0.5,
+            median_forever=4.0, median_2weeks=0.3, positive=100, negative=5, price=14.99,
+            review_score=85.0, tags={"Visual Novel": 400, "Choices Matter": 300},
+            developer="Dev", publisher="Pub",
+            fetched_at=datetime.now(timezone.utc), total_reviews=105,
+        ))
+
+        # Gamalytic per-game enrichment (multi-tag uses per-game, not bulk)
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=_with_meta([]))
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[
+            {"steamId": aid, "name": f"Game {aid}", "revenue": 100_000 * (i + 1), "copiesSold": 5000}
+            for i, aid in enumerate(appids)
+        ])
+
+        return mock_steamspy, mock_steam_store, mock_gamalytic
+
+    @pytest.mark.asyncio
+    async def test_single_tag_reports_released_count(self):
+        """Single-tag analysis includes total_released_on_steam in methodology."""
+        from src.market_tools import analyze_market_single
+
+        mock_spy, mock_store, mock_gam = self._setup_single_tag_mocks(
+            n_games=30, released_count=4563,
+        )
+
+        result = await analyze_market_single(
+            steamspy=mock_spy, steam_store=mock_store, gamalytic=mock_gam,
+            tags=["Roguelike"], metrics=["concentration"], top_n=1,
+        )
+
+        assert "error" not in result
+        meth = result["methodology"]
+        assert meth["total_released_on_steam"] == 4563
+        assert result["total_games"] == 30
+        # Verify the note explains the difference
+        notes = meth["notes"]
+        assert len(notes) == 1
+        assert "30 review-ranked games" in notes[0]
+        assert "4563 total released titles" in notes[0]
+        assert "without sufficient reviews are excluded" in notes[0]
+        # Verify correct tag IDs were used
+        mock_store.get_total_released_count.assert_called_once_with([1234])
+
+    @pytest.mark.asyncio
+    async def test_single_tag_game_list_source_label(self):
+        """Single-tag SteamSpy path shows 'SteamSpy tag search' in game_list_source."""
+        from src.market_tools import analyze_market_single
+
+        mock_spy, mock_store, mock_gam = self._setup_single_tag_mocks()
+
+        result = await analyze_market_single(
+            steamspy=mock_spy, steam_store=mock_store, gamalytic=mock_gam,
+            tags=["Roguelike"], metrics=["concentration"], top_n=1,
+        )
+
+        assert "error" not in result
+        assert "SteamSpy tag search" in result["methodology"]["game_list_source"]
+
+    @pytest.mark.asyncio
+    async def test_multi_tag_reports_released_count(self):
+        """Multi-tag analysis includes total_released_on_steam in methodology."""
+        from src.market_tools import analyze_market_single
+
+        mock_spy, mock_store, mock_gam = self._setup_multi_tag_mocks(
+            n_appids=50, released_count=3855,
+        )
+
+        result = await analyze_market_single(
+            steamspy=mock_spy, steam_store=mock_store, gamalytic=mock_gam,
+            tags=["Visual Novel", "Choices Matter"],
+            metrics=["concentration"], top_n=1,
+        )
+
+        assert "error" not in result
+        meth = result["methodology"]
+        assert meth["total_released_on_steam"] == 3855
+        assert result["total_games"] == 50
+        # Note should reference both counts
+        notes = meth["notes"]
+        assert len(notes) == 1
+        assert "50 review-ranked games" in notes[0]
+        assert "3855 total released titles" in notes[0]
+        # Released count should use both tag IDs
+        mock_store.get_total_released_count.assert_called_once_with([3799, 6426])
+
+    @pytest.mark.asyncio
+    async def test_multi_tag_game_list_source_label(self):
+        """Multi-tag path shows 'Steam Store multi-tag search' in game_list_source."""
+        from src.market_tools import analyze_market_single
+
+        mock_spy, mock_store, mock_gam = self._setup_multi_tag_mocks()
+
+        result = await analyze_market_single(
+            steamspy=mock_spy, steam_store=mock_store, gamalytic=mock_gam,
+            tags=["Visual Novel", "Choices Matter"],
+            metrics=["concentration"], top_n=1,
+        )
+
+        assert "error" not in result
+        source = result["methodology"]["game_list_source"]
+        assert "Steam Store multi-tag search" in source
+        assert "Visual Novel" in source
+        assert "Choices Matter" in source
+
+    @pytest.mark.asyncio
+    async def test_released_count_graceful_on_tag_map_failure(self):
+        """Released count is None (no crash, no note) when get_tag_map fails."""
+        from unittest.mock import AsyncMock
+        from src.schemas import APIError as APIErrorSchema
+        from src.market_tools import analyze_market_single
+
+        mock_spy, mock_store, mock_gam = self._setup_single_tag_mocks()
+        # Override: tag map fails for the released-count call
+        # get_tag_map is called TWICE: once by _fetch_game_list_steamspy (not needed for
+        # single-tag SteamSpy success path), and once by _get_released_count.
+        # We want _fetch_game_list_steamspy to succeed (SteamSpy path, no tag map needed),
+        # but _get_released_count to fail.
+        mock_store.get_tag_map = AsyncMock(return_value=APIErrorSchema(
+            error_code=502, error_type="api_error", message="Steam down"
+        ))
+
+        result = await analyze_market_single(
+            steamspy=mock_spy, steam_store=mock_store, gamalytic=mock_gam,
+            tags=["Roguelike"], metrics=["concentration"], top_n=1,
+        )
+
+        assert "error" not in result
+        meth = result["methodology"]
+        # No released count, no note about it
+        assert "total_released_on_steam" not in meth
+        assert len(meth["notes"]) == 0
+
+    @pytest.mark.asyncio
+    async def test_released_count_graceful_on_count_failure(self):
+        """Released count is None when get_total_released_count returns None."""
+        from unittest.mock import AsyncMock
+        from src.market_tools import analyze_market_single
+
+        mock_spy, mock_store, mock_gam = self._setup_single_tag_mocks()
+        mock_store.get_total_released_count = AsyncMock(return_value=None)
+
+        result = await analyze_market_single(
+            steamspy=mock_spy, steam_store=mock_store, gamalytic=mock_gam,
+            tags=["Roguelike"], metrics=["concentration"], top_n=1,
+        )
+
+        assert "error" not in result
+        meth = result["methodology"]
+        assert "total_released_on_steam" not in meth
+        assert len(meth["notes"]) == 0
+
+    @pytest.mark.asyncio
+    async def test_appids_path_skips_released_count(self):
+        """Custom AppID list path does not fire released count request."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.schemas import EngagementData
+        from src.market_tools import analyze_market_single
+        from datetime import datetime, timezone
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+
+        appids = [101, 102, 103]
+        mock_steamspy.get_engagement_data = AsyncMock(return_value=EngagementData(
+            appid=101, name="Game", ccu=50, owners_min=500, owners_max=2000,
+            owners_midpoint=1250.0, average_forever=5.0, average_2weeks=0.5,
+            median_forever=4.0, median_2weeks=0.3, positive=100, negative=5, price=9.99,
+            review_score=85.0, tags={"Action": 100},
+            developer="Dev", publisher="Pub",
+            fetched_at=datetime.now(timezone.utc), total_reviews=105,
+        ))
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[
+            {"steamId": aid, "name": f"Game {aid}", "revenue": 500_000, "copiesSold": 10000}
+            for aid in appids
+        ])
+        mock_steam_store.get_total_released_count = AsyncMock()
+
+        result = await analyze_market_single(
+            steamspy=mock_steamspy, steam_store=mock_steam_store, gamalytic=mock_gamalytic,
+            tags=[], appids=appids,
+            metrics=["concentration"], top_n=1, skip_min_check=True,
+        )
+
+        assert "error" not in result
+        meth = result["methodology"]
+        # No released count for custom appid lists
+        assert "total_released_on_steam" not in meth
+        assert len(meth["notes"]) == 0
+        # get_total_released_count should never be called
+        mock_steam_store.get_total_released_count.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_released_count_higher_than_analyzed(self):
+        """Released count is always >= analyzed count — methodology note reflects the gap."""
+        from src.market_tools import analyze_market_single
+
+        mock_spy, mock_store, mock_gam = self._setup_single_tag_mocks(
+            n_games=30, released_count=6876,
+        )
+
+        result = await analyze_market_single(
+            steamspy=mock_spy, steam_store=mock_store, gamalytic=mock_gam,
+            tags=["Roguelike"], metrics=["concentration"], top_n=1,
+        )
+
+        assert "error" not in result
+        meth = result["methodology"]
+        assert meth["total_released_on_steam"] == 6876
+        assert result["total_games"] == 30
+        # The note should clearly show the gap
+        note = meth["notes"][0]
+        assert "30 review-ranked games" in note
+        assert "6876 total released titles" in note

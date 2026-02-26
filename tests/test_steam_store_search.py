@@ -596,6 +596,55 @@ class TestMultiTagSearch:
 
 # --- SteamStoreClient.search_by_tag_ids_paginated() ---
 
+class TestGetTotalReleasedCount:
+    """Tests for SteamStoreClient.get_total_released_count."""
+
+    @pytest.mark.asyncio
+    async def test_returns_total_count_from_released_desc(self, mock_http):
+        """Returns total_count from a Released_DESC search with count=1."""
+        mock_http.get_with_metadata.return_value = (
+            {"results_html": "", "total_count": 4563},
+            datetime.now(timezone.utc), 0,
+        )
+
+        client = SteamStoreClient(mock_http)
+        result = await client.get_total_released_count([10235])
+
+        assert result == 4563
+        # Verify the request used Released_DESC and count=1
+        call_args = mock_http.get_with_metadata.call_args
+        params = call_args.kwargs.get("params") or call_args[1].get("params")
+        assert params["sort_by"] == "Released_DESC"
+        assert params["count"] == "1"
+        assert params["tags"] == "10235"
+
+    @pytest.mark.asyncio
+    async def test_multi_tag_ids_joined(self, mock_http):
+        """Multiple tag IDs are comma-joined in the request."""
+        mock_http.get_with_metadata.return_value = (
+            {"results_html": "", "total_count": 3855},
+            datetime.now(timezone.utc), 0,
+        )
+
+        client = SteamStoreClient(mock_http)
+        result = await client.get_total_released_count([3799, 6426])
+
+        assert result == 3855
+        call_args = mock_http.get_with_metadata.call_args
+        params = call_args.kwargs.get("params") or call_args[1].get("params")
+        assert params["tags"] == "3799,6426"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_exception(self, mock_http):
+        """Returns None (not crash) when the HTTP call fails."""
+        mock_http.get_with_metadata.side_effect = Exception("network error")
+
+        client = SteamStoreClient(mock_http)
+        result = await client.get_total_released_count([10235])
+
+        assert result is None
+
+
 class TestSearchByTagIdsPaginated:
     """Tests for the paginated Steam Store search wrapper."""
 
