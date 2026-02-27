@@ -998,6 +998,13 @@ def register_tools(mcp: FastMCP):
                 reviews_data=reviews_data,
                 price_tier=price_tier.strip() if price_tier.strip() else None,
             )
+            # Phase 10: Propagate commercial data quality (PROV-03)
+            if not isinstance(game_commercial, APIError):
+                if game_commercial.api_warnings:
+                    result.setdefault("warnings", []).extend(game_commercial.api_warnings)
+                result["commercial_data_quality"] = game_commercial.data_quality
+            else:
+                result["commercial_data_quality"] = "unavailable"
             return json.dumps(result, default=str)
         except Exception as e:
             logger.error("evaluate_game failed: %s", e)

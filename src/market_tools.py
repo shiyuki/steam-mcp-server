@@ -1983,6 +1983,24 @@ async def _analyze_market_single_impl(
         existing_warnings = result.get("warnings", [])
         result["warnings"] = existing_warnings + enrich_warnings
 
+    # Phase 10: Surface Gamalytic enrichment failure count (WARN-02, PROV-02)
+    total_enriched = len(enriched_games)
+    gamalytic_matched = enrichment_meta.get("matched", 0)
+    gamalytic_failed = total_enriched - gamalytic_matched
+    if gamalytic_failed > 0 and total_enriched > 0:
+        pct_with_data = round(gamalytic_matched / total_enriched * 100, 1)
+        result.setdefault("warnings", []).append(
+            f"Gamalytic data available for {gamalytic_matched}/{total_enriched} games ({pct_with_data}%). "
+            f"{gamalytic_failed} games use review-based estimates or have no revenue data."
+        )
+    # Data quality summary for PROV-02
+    result["data_quality_summary"] = {
+        "gamalytic_count": gamalytic_matched,
+        "review_estimate_count": gamalytic_failed,
+        "total": total_enriched,
+        "gamalytic_pct": round(gamalytic_matched / total_enriched * 100, 1) if total_enriched > 0 else 0.0,
+    }
+
     if return_games:
         return result, enriched_games
     return result
@@ -2978,6 +2996,16 @@ async def compare_markets_analysis(
 
         if enrich_warnings:
             warnings.extend(enrich_warnings)
+
+        # Phase 10: Surface Gamalytic enrichment failure count per market (WARN-02)
+        gamalytic_matched = enrichment_meta.get("matched", 0)
+        gamalytic_failed = len(enriched_games) - gamalytic_matched
+        if gamalytic_failed > 0 and len(enriched_games) > 0:
+            pct_with_data = round(gamalytic_matched / len(enriched_games) * 100, 1)
+            warnings.append(
+                f"[{label}] Gamalytic data available for {gamalytic_matched}/{len(enriched_games)} games ({pct_with_data}%). "
+                f"{gamalytic_failed} games use review-based estimates or have no revenue data."
+            )
 
         # Run pure analysis on enriched games
         analysis = _run_market_analysis(
