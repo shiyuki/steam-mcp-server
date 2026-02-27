@@ -4,8 +4,9 @@ import json
 import pytest
 import httpx
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, patch, call
 
+from src.config import Config
 from src.schemas import CommercialData, APIError
 from src.steam_api import GamalyticClient
 
@@ -1705,3 +1706,106 @@ class TestListGamesByTag:
 
         games, meta = result
         assert games[0]["steamId"] == 588650  # int, not string
+
+
+class TestGamalyticAuthHeader:
+    """Tests for Gamalytic API key auth header injection (KEY-01, KEY-02)."""
+
+    # Minimal Gamalytic API response for get_commercial_data
+    _GAMALYTIC_DATA = {
+        "steamId": "646570",
+        "name": "Slay the Spire",
+        "price": 24.99,
+        "revenue": 10000000,
+        "reviews": 50000,
+        "reviewScore": 97,
+    }
+    # Minimal SteamSpy response for triangulation pass-through
+    _STEAMSPY_DATA = {
+        "positive": 50000,
+        "negative": 1500,
+        "price": "2499",
+        "owners": "500,000 .. 1,000,000",  # ~750k * 24.99 * 0.7 ≈ $13M (within 20% of $10M range? borderline — use wide range)
+    }
+
+    @pytest.mark.asyncio
+    async def test_gamalytic_auth_header_sent_when_key_set(self):
+        """When GAMALYTIC_API_KEY is set, Authorization Bearer header is included in all calls."""
+        mock_http = AsyncMock()
+        mock_http.get_with_metadata.side_effect = [
+            (self._GAMALYTIC_DATA, datetime.now(timezone.utc), 0),
+            (self._STEAMSPY_DATA, datetime.now(timezone.utc), 0),
+        ]
+
+        with patch.object(Config, "GAMALYTIC_API_KEY", "test-pro-key-abc123"):
+            client = GamalyticClient(mock_http)
+            result = await client.get_commercial_data(646570)
+
+        # Verify Gamalytic call included the auth header
+        first_call = mock_http.get_with_metadata.call_args_list[0]
+        headers_passed = first_call.kwargs.get("headers", first_call[1].get("headers", {}))
+        assert "Authorization" in headers_passed
+        assert headers_passed["Authorization"] == "Bearer test-pro-key-abc123"
+
+    @pytest.mark.asyncio
+    async def test_gamalytic_no_auth_header_when_key_empty(self):
+        """When GAMALYTIC_API_KEY is empty, no Authorization header is sent (free tier)."""
+        mock_http = AsyncMock()
+        mock_http.get_with_metadata.side_effect = [
+            (self._GAMALYTIC_DATA, datetime.now(timezone.utc), 0),
+            (self._STEAMSPY_DATA, datetime.now(timezone.utc), 0),
+        ]
+
+        with patch.object(Config, "GAMALYTIC_API_KEY", ""):
+            client = GamalyticClient(mock_http)
+            result = await client.get_commercial_data(646570)
+
+        # Verify Gamalytic call used empty headers (no Authorization)
+        first_call = mock_http.get_with_metadata.call_args_list[0]
+        headers_passed = first_call.kwargs.get("headers", first_call[1].get("headers", {}))
+        assert "Authorization" not in headers_passed
+        assert headers_passed == {}
+
+    @pytest.mark.asyncio
+    async def test_gamalytic_list_games_auth_header_sent_when_key_set(self):
+        """list_games_by_tag includes Authorization header when key is set."""
+        mock_http = AsyncMock()
+        mock_http.get_with_metadata.return_value = (
+            {
+                "pages": 1, "total": 1,
+                "result": [{"steamId": "588650", "name": "Dead Cells", "revenue": 85000000}],
+            },
+            datetime.now(timezone.utc),
+            0,
+        )
+
+        with patch.object(Config, "GAMALYTIC_API_KEY", "test-pro-key-xyz"):
+            client = GamalyticClient(mock_http)
+            result = await client.list_games_by_tag("Roguelike")
+
+        first_call = mock_http.get_with_metadata.call_args_list[0]
+        headers_passed = first_call.kwargs.get("headers", first_call[1].get("headers", {}))
+        assert "Authorization" in headers_passed
+        assert headers_passed["Authorization"] == "Bearer test-pro-key-xyz"
+
+    @pytest.mark.asyncio
+    async def test_gamalytic_list_games_no_auth_header_when_key_empty(self):
+        """list_games_by_tag sends empty headers dict when key is absent."""
+        mock_http = AsyncMock()
+        mock_http.get_with_metadata.return_value = (
+            {
+                "pages": 1, "total": 1,
+                "result": [{"steamId": "588650", "name": "Dead Cells", "revenue": 85000000}],
+            },
+            datetime.now(timezone.utc),
+            0,
+        )
+
+        with patch.object(Config, "GAMALYTIC_API_KEY", ""):
+            client = GamalyticClient(mock_http)
+            result = await client.list_games_by_tag("Roguelike")
+
+        first_call = mock_http.get_with_metadata.call_args_list[0]
+        headers_passed = first_call.kwargs.get("headers", first_call[1].get("headers", {}))
+        assert "Authorization" not in headers_passed
+        assert headers_passed == {}
