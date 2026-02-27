@@ -1264,6 +1264,7 @@ class GamalyticClient:
         if Config.GAMALYTIC_API_KEY:
             gamalytic_headers["Authorization"] = f"Bearer {Config.GAMALYTIC_API_KEY}"
             # TODO: verify header name with Gamalytic Pro dashboard (may be x-api-key instead)
+        gamalytic_failure_reason: str | None = None
         try:
             data, fetched_at, cache_age = await self.http.get_with_metadata(
                 f"{self.BASE_URL}/game/{appid}",
@@ -1551,6 +1552,8 @@ class GamalyticClient:
                 current_player_count=current_player_count,
                 player_count_source=player_count_source,
                 player_count_note=player_count_note,
+                # Phase 10: Explicit data quality (success path)
+                data_quality="gamalytic",
             )
 
             # Triangulation: Compare with SteamSpy owner data
@@ -1564,14 +1567,24 @@ class GamalyticClient:
 
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
+            gamalytic_failure_reason = f"Gamalytic returned HTTP {status}"
+            if status == 429:
+                gamalytic_failure_reason += " (rate limit exceeded)"
             logger.warning(f"Gamalytic API error {status} for AppID {appid}, trying Steam Web API fallback")
             # Fall through to fallback
         except Exception as e:
+            gamalytic_failure_reason = f"Gamalytic unavailable: {type(e).__name__}"
             logger.warning(f"Gamalytic API error for AppID {appid}: {e}, trying Steam Web API fallback")
             # Fall through to fallback
 
         # Fallback path: Try Steam Web API for player count, then review-based estimate
         fallback_result = await self._get_review_based_estimate(appid)
+        # Phase 10: Inject warning fields before player count enhancement
+        if isinstance(fallback_result, CommercialData) and gamalytic_failure_reason:
+            fallback_result.api_warnings = [
+                f"{gamalytic_failure_reason}. Falling back to review-based estimate (+-300-500% accuracy)."
+            ]
+            fallback_result.data_quality = "review_estimate"
         if isinstance(fallback_result, CommercialData):
             # Try to get player count from Steam Web API (second-tier fallback)
             steam_ccu = await self._get_steam_player_count(appid)

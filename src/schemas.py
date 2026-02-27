@@ -172,6 +172,10 @@ class CommercialData(CachedResponse):
     player_count_source: str | None = None  # "gamalytic_history" / "steam_web_api" / "steamspy"
     player_count_note: str | None = None  # Warning when fallback used
 
+    # Phase 10: API quality and warning fields
+    api_warnings: list[str] = Field(default_factory=list)
+    data_quality: str = "gamalytic"  # "gamalytic" | "review_estimate"
+
 
 class EngagementData(CachedResponse):
     """Player engagement metrics for a single Steam game from SteamSpy."""
