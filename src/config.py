@@ -15,6 +15,7 @@ class Config:
     STEAM_API_KEY: str = os.getenv("STEAM_API_KEY", "")
     RATE_LIMIT_DELAY: float = float(os.getenv("RATE_LIMIT_DELAY", "1.5"))
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+    GAMALYTIC_API_KEY: str = os.getenv("GAMALYTIC_API_KEY", "")
 
     @classmethod
     def validate(cls) -> bool:

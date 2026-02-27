@@ -136,13 +136,16 @@ class TTLCache:
         return len(self._cache)
 
 
-def make_cache_key(host: str, endpoint: str, params: dict | None = None) -> str:
-    """Generate deterministic cache key from host, endpoint, and params.
+def make_cache_key(host: str, endpoint: str, params: dict | None = None, auth_state: str | None = None) -> str:
+    """Generate deterministic cache key from host, endpoint, params, and auth state.
 
     Args:
         host: API host (e.g., "steamspy.com")
         endpoint: API endpoint (e.g., "/api.php")
         params: Query parameters (optional)
+        auth_state: Authentication state marker (optional). When set, appended
+            as ":authed" suffix to prevent free-tier and Pro-tier responses from
+            sharing cache entries. Do NOT pass the actual key value here.
 
     Returns:
         Cache key string
@@ -152,11 +155,17 @@ def make_cache_key(host: str, endpoint: str, params: dict | None = None) -> str:
         'steamspy.com:/api.php'
         >>> make_cache_key("steamspy.com", "/api.php", {"request": "tag", "tag": "rpg"})
         'steamspy.com:/api.php:a1b2c3d4'
+        >>> make_cache_key("api.gamalytic.com", "/game/123", auth_state="authed")
+        'api.gamalytic.com:/game/123:authed'
     """
     if params is None or not params:
-        return f"{host}:{endpoint}"
+        base = f"{host}:{endpoint}"
+    else:
+        # Deterministic hash: sort_keys ensures same params = same hash
+        param_str = json.dumps(params, sort_keys=True)
+        param_hash = hashlib.md5(param_str.encode()).hexdigest()[:8]
+        base = f"{host}:{endpoint}:{param_hash}"
 
-    # Deterministic hash: sort_keys ensures same params = same hash
-    param_str = json.dumps(params, sort_keys=True)
-    param_hash = hashlib.md5(param_str.encode()).hexdigest()[:8]
-    return f"{host}:{endpoint}:{param_hash}"
+    if auth_state is not None:
+        return f"{base}:{auth_state}"
+    return base

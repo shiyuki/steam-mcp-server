@@ -10,12 +10,24 @@ from tenacity import (
     retry,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception_type,
+    retry_if_exception,
 )
 
 from src.cache import TTLCache, make_cache_key
 from src.rate_limiter import HostRateLimiter
 from src.timeout_utils import PER_REQUEST_TIMEOUT
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Return True if the exception should trigger a retry.
+
+    429 (Too Many Requests) is NOT retried — it indicates a quota limit
+    that won't clear within retry windows, wasting ~11s per game.
+    503 and other HTTP errors are still retried as transient failures.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code != 429
+    return isinstance(exc, (httpx.HTTPError, asyncio.TimeoutError))
 
 
 class CachedAPIClient:
@@ -51,7 +63,7 @@ class CachedAPIClient:
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1.5, min=1, max=10),
-        retry=retry_if_exception_type((httpx.HTTPError, asyncio.TimeoutError)),
+        retry=retry_if_exception(_is_retryable),
     )
     async def _fetch(self, url: str, params: dict = None, headers: dict = None) -> dict:
         """Make a rate-limited GET request with retry. No caching.
@@ -106,7 +118,13 @@ class CachedAPIClient:
 
         host = self._extract_host(url)
         endpoint = url.split(host)[-1] if host else url
-        cache_key = make_cache_key(host, endpoint, params)
+        auth_state = None
+        if headers:
+            for k in headers:
+                if k.lower() in ("authorization", "x-api-key"):
+                    auth_state = "authed"
+                    break
+        cache_key = make_cache_key(host, endpoint, params, auth_state=auth_state)
 
         entry = await self.cache.get_or_fetch(
             key=cache_key,
@@ -135,7 +153,13 @@ class CachedAPIClient:
 
         host = self._extract_host(url)
         endpoint = url.split(host)[-1] if host else url
-        cache_key = make_cache_key(host, endpoint, params)
+        auth_state = None
+        if headers:
+            for k in headers:
+                if k.lower() in ("authorization", "x-api-key"):
+                    auth_state = "authed"
+                    break
+        cache_key = make_cache_key(host, endpoint, params, auth_state=auth_state)
 
         entry = await self.cache.get_or_fetch(
             key=cache_key,
