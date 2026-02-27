@@ -121,7 +121,7 @@ class CachedAPIClient:
         auth_state = None
         if headers:
             for k in headers:
-                if k.lower() in ("authorization", "x-api-key"):
+                if k.lower() in ("authorization", "x-api-key", "api-key"):
                     auth_state = "authed"
                     break
         cache_key = make_cache_key(host, endpoint, params, auth_state=auth_state)
@@ -156,7 +156,7 @@ class CachedAPIClient:
         auth_state = None
         if headers:
             for k in headers:
-                if k.lower() in ("authorization", "x-api-key"):
+                if k.lower() in ("authorization", "x-api-key", "api-key"):
                     auth_state = "authed"
                     break
         cache_key = make_cache_key(host, endpoint, params, auth_state=auth_state)

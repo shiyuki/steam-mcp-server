@@ -1260,15 +1260,15 @@ class GamalyticClient:
             CommercialData with revenue range and extended metadata, or APIError on failure
         """
         # Primary path: Try Gamalytic API first
-        gamalytic_params: dict[str, str] = {}
+        gamalytic_headers: dict[str, str] = {}
         if Config.GAMALYTIC_API_KEY:
-            gamalytic_params["api_key"] = Config.GAMALYTIC_API_KEY
+            gamalytic_headers["api-key"] = Config.GAMALYTIC_API_KEY
         gamalytic_failure_reason: str | None = None
         try:
             data, fetched_at, cache_age = await self.http.get_with_metadata(
                 f"{self.BASE_URL}/game/{appid}",
-                params=gamalytic_params,
                 cache_ttl=21600,  # 6 hours
+                headers=gamalytic_headers or None,
             )
 
             # Gamalytic response: {"steamId": "504230", "name": "Celeste", "price": 19.99, "revenue": 17990584, ...}
@@ -1845,12 +1845,14 @@ class GamalyticClient:
                     "sort": "revenue",
                     "sort_mode": "desc",
                 }
+                gamalytic_headers: dict[str, str] = {}
                 if Config.GAMALYTIC_API_KEY:
-                    page_params["api_key"] = Config.GAMALYTIC_API_KEY
+                    gamalytic_headers["api-key"] = Config.GAMALYTIC_API_KEY
                 data, _, _ = await self.http.get_with_metadata(
                     f"{self.BASE_URL}/steam-games/list",
                     params=page_params,
                     cache_ttl=3600,  # 1 hour cache — bulk data is stable
+                    headers=gamalytic_headers or None,
                 )
 
                 # Parse response: {"pages": N, "total": M, "result": [...], "next": {...}}
@@ -2247,14 +2249,14 @@ class SteamReviewClient:
             EADateInfo with best-available date data
         """
         # Tier 1 — Gamalytic
-        gamalytic_params: dict[str, str] = {}
+        gamalytic_headers: dict[str, str] = {}
         if Config.GAMALYTIC_API_KEY:
-            gamalytic_params["api_key"] = Config.GAMALYTIC_API_KEY
+            gamalytic_headers["api-key"] = Config.GAMALYTIC_API_KEY
         try:
             data, _, _ = await self.http.get_with_metadata(
                 self.GAMALYTIC_URL.format(appid=appid),
-                params=gamalytic_params,
                 cache_ttl=21600,  # 6 hours — shares cache with fetch_commercial
+                headers=gamalytic_headers or None,
             )
             ea_date = _ms_to_iso(data.get("EAReleaseDate"))
             exit_date = _ms_to_iso(data.get("earlyAccessExitDate"))
