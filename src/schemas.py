@@ -794,7 +794,6 @@ class AnalyzeMarketResult(BaseModel):
     methodology: dict | None = None
     compute_time: ComputeTimingInfo | None = None
     raw_data: list[dict] | None = None
-    gamalytic_enrichment: dict | None = None
     quota_warning: str | None = None
 
 

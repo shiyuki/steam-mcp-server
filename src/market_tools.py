@@ -599,7 +599,6 @@ def _run_market_analysis(
         "methodology": methodology,
         "compute_time": compute_time.model_dump(),
         "raw_data": None,
-        "gamalytic_enrichment": None,
         "quota_warning": None,
     }
 
