@@ -1337,6 +1337,58 @@ class TestAnalyzeMarketSingle:
         assert "continuation_token" not in result
 
     @pytest.mark.asyncio
+    async def test_data_quality_summary_in_result(self):
+        """analyze_market_single result contains data_quality_summary dict with required keys."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.schemas import GameSummary, SearchResult
+        from src.market_tools import analyze_market_single
+
+        mock_steamspy = MagicMock()
+        mock_steam_store = MagicMock()
+        mock_gamalytic = MagicMock()
+        mock_steamspy.get_engagement_data = AsyncMock(return_value=None)
+
+        games = [
+            GameSummary(
+                appid=i, name=f"Game {i}", developer="Dev", publisher="Pub",
+                ccu=100, owners_min=1000 * (31 - i), owners_max=5000 * (31 - i),
+                owners_midpoint=3000.0 * (31 - i), average_forever=10.0, average_2weeks=1.0,
+                median_forever=8.0, median_2weeks=0.5, positive=200, negative=10, price=9.99,
+            )
+            for i in range(1, 31)
+        ]
+        mock_steamspy.search_by_tag = AsyncMock(return_value=SearchResult(
+            tag="Roguelike", appids=[g.appid for g in games], total_found=30,
+            games=games, data_source="steamspy",
+            fetched_at="2026-01-01T00:00:00Z", cache_age_seconds=0,
+        ))
+
+        # Gamalytic bulk returns all 30 games — full Gamalytic coverage
+        gamalytic_games = [
+            {"steamId": i, "name": f"Game {i}", "revenue": 1_000_000 * (31 - i), "copiesSold": 50000}
+            for i in range(1, 31)
+        ]
+        mock_gamalytic.list_games_by_tag = AsyncMock(return_value=_with_meta(gamalytic_games))
+        mock_gamalytic.get_commercial_batch = AsyncMock(return_value=[])
+
+        result = await analyze_market_single(
+            steamspy=mock_steamspy, steam_store=mock_steam_store,
+            gamalytic=mock_gamalytic, tags=["Roguelike"],
+        )
+
+        assert "data_quality_summary" in result
+        dqs = result["data_quality_summary"]
+        assert "gamalytic_count" in dqs
+        assert "review_estimate_count" in dqs
+        assert "total" in dqs
+        assert "gamalytic_pct" in dqs
+        assert isinstance(dqs["gamalytic_count"], int)
+        assert isinstance(dqs["review_estimate_count"], int)
+        assert isinstance(dqs["total"], int)
+        assert isinstance(dqs["gamalytic_pct"], float)
+        assert dqs["gamalytic_count"] + dqs["review_estimate_count"] == dqs["total"]
+
+    @pytest.mark.asyncio
     async def test_no_continuation_token_in_result(self):
         """Single-phase result never contains continuation_token."""
         from unittest.mock import AsyncMock, MagicMock

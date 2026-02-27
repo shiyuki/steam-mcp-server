@@ -802,6 +802,27 @@ class TestEADateResolution:
         assert result.ea_release_date is None
         assert result.full_release_date is None
 
+    @pytest.mark.asyncio
+    async def test_gamalytic_auth_header_injected_when_key_set(self):
+        """When GAMALYTIC_API_KEY is configured, _resolve_ea_dates passes api-key header."""
+        from unittest.mock import patch
+
+        gamalytic_data = {
+            "EAReleaseDate": None,
+            "earlyAccessExitDate": None,
+            "firstReleaseDate": 1509494400000,
+            "releaseDate": 1509494400000,
+            "earlyAccess": False,
+        }
+        self.mock_http.get_with_metadata.return_value = (gamalytic_data, datetime.now(timezone.utc), 0)
+
+        with patch("src.steam_api.Config.GAMALYTIC_API_KEY", "test-pro-key-abc"):
+            await self.client._resolve_ea_dates(12345)
+
+        call_kwargs = self.mock_http.get_with_metadata.call_args
+        passed_headers = call_kwargs.kwargs.get("headers") or {}
+        assert passed_headers.get("api-key") == "test-pro-key-abc"
+
 
 # ---------------------------------------------------------------------------
 # TestCompactMode
