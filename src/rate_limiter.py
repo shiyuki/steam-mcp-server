@@ -26,6 +26,7 @@ RATE_LIMITS: dict[str, RateLimitConfig] = {
     "store.steampowered.com": RateLimitConfig(max_rate=1, time_period=1.5),  # ~0.67 req/sec (Phase 1 conservative limit)
     "api.steampowered.com": RateLimitConfig(max_rate=1, time_period=1.5),  # Same as store
     "gamalytic.com": RateLimitConfig(max_rate=5, time_period=1.0),  # 5 req/s (Phase 8 verified)
+    "shared.akamai.steamstatic.com": RateLimitConfig(max_rate=10, time_period=1.0),  # CDN: high throughput
 }
 
 # Safe fallback for unknown hosts

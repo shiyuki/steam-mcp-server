@@ -86,6 +86,38 @@ class CachedAPIClient:
         response.raise_for_status()
         return response.json()
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1.5, min=1, max=10),
+        retry=retry_if_exception(_is_retryable),
+    )
+    async def _fetch_bytes(self, url: str, headers: dict = None) -> bytes:
+        """Make a rate-limited GET request returning raw bytes. No caching.
+
+        Args:
+            url: The URL to request
+            headers: Optional extra headers for the request
+
+        Returns:
+            bytes: Raw response content
+
+        Raises:
+            httpx.HTTPError: If request fails after retries
+            asyncio.TimeoutError: If request times out after retries
+        """
+        host = self._extract_host(url)
+        await self.rate_limiter.acquire(host)
+        response = await self.client.get(url, headers=headers)
+        response.raise_for_status()
+        return response.content
+
+    async def _fetch_bytes_with_timeout(self, url: str, headers: dict = None) -> bytes:
+        """Wrap _fetch_bytes() in a per-request timeout."""
+        return await asyncio.wait_for(
+            self._fetch_bytes(url, headers),
+            timeout=PER_REQUEST_TIMEOUT,
+        )
+
     async def _fetch_with_timeout(self, url: str, params: dict = None, headers: dict = None) -> dict:
         """Wrap _fetch() (including all retries) in a per-request timeout.
 
@@ -99,6 +131,31 @@ class CachedAPIClient:
             self._fetch(url, params, headers),
             timeout=PER_REQUEST_TIMEOUT,
         )
+
+    async def get_bytes(self, url: str, cache_ttl: float = None, headers: dict = None) -> bytes:
+        """Make a cached, rate-limited GET request returning raw bytes.
+
+        Args:
+            url: The URL to request
+            cache_ttl: Cache TTL in seconds. None uses cache default. 0 bypasses cache.
+            headers: Optional extra headers for the request
+
+        Returns:
+            bytes: Raw response content
+        """
+        if cache_ttl == 0:
+            return await self._fetch_bytes_with_timeout(url, headers)
+
+        host = self._extract_host(url)
+        endpoint = url.split(host)[-1] if host else url
+        cache_key = make_cache_key(f"bytes:{host}", endpoint)
+
+        entry = await self.cache.get_or_fetch(
+            key=cache_key,
+            fetch_func=lambda: self._fetch_bytes_with_timeout(url, headers),
+            ttl=cache_ttl,
+        )
+        return entry.value
 
     async def get(self, url: str, params: dict = None, cache_ttl: float = None, headers: dict = None) -> dict:
         """Make a cached, rate-limited GET request.

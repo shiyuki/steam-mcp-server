@@ -3,7 +3,7 @@
 import asyncio
 import json
 from datetime import datetime, timezone
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 
 from src.http_client import CachedAPIClient
 from src.cache import TTLCache
@@ -1101,3 +1101,90 @@ def register_tools(mcp: FastMCP):
         except Exception as e:
             logger.error("compare_markets failed: %s", e)
             return json.dumps({"error": str(e), "error_type": "comparison_error"})
+
+    # Image cache TTL: 24 hours (Steam CDN images rarely change)
+    _IMAGE_CACHE_TTL = 86400
+
+    @mcp.tool()
+    async def fetch_game_art(appid: int, include_screenshots: bool = True, max_screenshots: int = 4) -> list:
+        """Fetch header art and screenshots for a Steam game as viewable images.
+
+        Downloads the header capsule image and optionally up to 10 screenshots
+        from Steam's CDN. Returns them as image content blocks that Claude can
+        see directly, alongside a JSON context block with game metadata.
+
+        Args:
+            appid: Steam AppID (e.g., 646570 for Slay the Spire)
+            include_screenshots: Whether to include screenshots (default True)
+            max_screenshots: Maximum screenshots to download (1-10, default 4)
+
+        Returns:
+            List of [json_context, header_image, screenshot_1, ...] content blocks
+        """
+        if appid <= 0:
+            return [json.dumps({"error": "appid must be positive", "error_type": "validation"})]
+
+        if not 1 <= max_screenshots <= 10:
+            return [json.dumps({"error": "max_screenshots must be between 1 and 10", "error_type": "validation"})]
+
+        logger.info("Fetching game art for AppID: %d", appid)
+        result = await _steam_store.get_app_details(appid)
+
+        if isinstance(result, APIError):
+            return [json.dumps(result.model_dump())]
+
+        # Build context metadata
+        context = {
+            "appid": result.appid,
+            "name": result.name,
+            "developer": result.developer,
+            "publisher": result.publisher,
+            "tags": result.tags[:10],
+            "genres": result.genres,
+            "release_date": result.release_date,
+            "screenshots_available": result.screenshots_count,
+        }
+
+        content_blocks: list = []
+        images_failed: list[str] = []
+
+        # Download header image
+        header_url = result.header_image
+        if header_url:
+            try:
+                header_bytes = await _http_client.get_bytes(header_url, cache_ttl=_IMAGE_CACHE_TTL)
+                content_blocks.append(Image(data=header_bytes, format="jpeg"))
+            except Exception as e:
+                logger.warning("Failed to download header image for %d: %s", appid, e)
+                images_failed.append(f"header: {e}")
+
+        # Download screenshots
+        if include_screenshots and result.screenshots:
+            screenshot_urls = result.screenshots[:max_screenshots]
+            # Use thumbnail size (600x338) instead of full 1920x1080
+            thumbnail_urls = [
+                url.replace(".1920x1080.", ".600x338.") for url in screenshot_urls
+            ]
+
+            async def _download_screenshot(url: str, idx: int) -> tuple[int, Image | None, str | None]:
+                try:
+                    data = await _http_client.get_bytes(url, cache_ttl=_IMAGE_CACHE_TTL)
+                    return (idx, Image(data=data, format="jpeg"), None)
+                except Exception as e:
+                    return (idx, None, f"screenshot_{idx}: {e}")
+
+            tasks = [_download_screenshot(url, i) for i, url in enumerate(thumbnail_urls)]
+            results = await asyncio.gather(*tasks)
+
+            # Maintain order
+            for idx, img, err in sorted(results, key=lambda r: r[0]):
+                if img is not None:
+                    content_blocks.append(img)
+                if err is not None:
+                    images_failed.append(err)
+
+        context["images_returned"] = len(content_blocks)
+        if images_failed:
+            context["images_failed"] = images_failed
+
+        return [json.dumps(context)] + content_blocks
