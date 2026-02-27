@@ -653,9 +653,9 @@ class GamalyticHistoryEntry(BaseModel):
     reviews: int | None = None
     price: float | None = None
     score: float | None = None
-    rank: int | None = None
+    rank: float | None = None
     followers: int | None = None
-    gamalytic_players: int | None = None  # daily avg CCU (gamalytic_ prefix)
+    gamalytic_players: float | None = None  # daily avg CCU (gamalytic_ prefix)
     avg_playtime: float | None = None
     sales: int | None = None
     revenue: float | None = None
