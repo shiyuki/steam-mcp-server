@@ -49,7 +49,6 @@ from src.logging_config import get_logger
 from src.steam_api import _ms_to_iso, normalize_tag
 from src.schemas import (
     APIError,
-    AnalyzeMarketResult,
     CompareMarketsResult,
     CompetitorComparison,
     ComputeTimingInfo,
@@ -1703,7 +1702,7 @@ def _validate_genre_membership(
 
         validation_flags.append({
             "appid": game.get("appid"),
-            "name": game.get("name", "Unknown"),
+            "name": game.get("name") or "Unknown",
             "revenue": revenue,
             "revenue_pct": round(revenue / total_revenue * 100, 2),
             "genre_valid": genre_valid,
@@ -1899,7 +1898,7 @@ async def _analyze_market_single_impl(
                 f"out of {len(validation_flags)} checked for tag '{tags[0]}'"
             )
             if flagged:
-                flagged_names = ", ".join(f["name"] for f in flagged[:5])
+                flagged_names = ", ".join(f["name"] or "Unknown" for f in flagged[:5])
                 logger.warning(
                     f"Genre membership flagged: {len(flagged)} revenue-significant games "
                     f"don't have '{tags[0]}' in top-20 SteamSpy tags: {flagged_names}"

@@ -1560,6 +1560,26 @@ class TestGenreMembershipValidation:
         assert flags[0]["genre_valid"] is True
         assert flags[0]["tag_rank"] == 1
 
+    def test_none_name_uses_unknown_fallback(self):
+        """Games with name=None (from recovery dicts) get 'Unknown' in validation flags."""
+        from src.market_tools import _validate_genre_membership
+
+        games = [
+            {"appid": 1, "name": None, "revenue": 500_000,
+             "tags": {"Action": 1000, "RPG": 800}},
+            {"appid": 2, "name": "RealGame", "revenue": 500_000,
+             "tags": {"Rogue-like": 900, "Action": 800}},
+        ]
+        flags = _validate_genre_membership(games, "Rogue-like")
+        assert len(flags) == 2
+        # name=None should become "Unknown"
+        none_flag = [f for f in flags if f["appid"] == 1][0]
+        assert none_flag["name"] == "Unknown"
+        # Joining should not raise TypeError
+        flagged = [f for f in flags if not f["genre_valid"]]
+        names = ", ".join(f["name"] or "Unknown" for f in flagged[:5])
+        assert "Unknown" in names
+
 
 # ---------------------------------------------------------------------------
 # TestMultiTagErrorSurfacing
