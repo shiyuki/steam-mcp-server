@@ -628,6 +628,26 @@ class QueryParams(BaseModel):
     sort: str = "helpful"  # "helpful" or "recent"
 
 
+class DimensionKeywordStats(BaseModel):
+    """Keyword mention stats for one review dimension."""
+    mention_rate: float = 0.0  # fraction of reviews mentioning this dimension (0.0-1.0)
+    mention_count: int = 0     # number of reviews with at least one keyword match
+    top_keywords: dict[str, int] = Field(default_factory=dict)  # keyword -> count, top 5
+
+
+class DimensionProfile(BaseModel):
+    """Multi-dimension review focus profile. Shows what players talk about."""
+    art_visuals: DimensionKeywordStats = Field(default_factory=DimensionKeywordStats)
+    music_sound: DimensionKeywordStats = Field(default_factory=DimensionKeywordStats)
+    story_narrative: DimensionKeywordStats = Field(default_factory=DimensionKeywordStats)
+    gameplay_mechanics: DimensionKeywordStats = Field(default_factory=DimensionKeywordStats)
+    difficulty: DimensionKeywordStats = Field(default_factory=DimensionKeywordStats)
+    ui_ux: DimensionKeywordStats = Field(default_factory=DimensionKeywordStats)
+    performance: DimensionKeywordStats = Field(default_factory=DimensionKeywordStats)
+    content_value: DimensionKeywordStats = Field(default_factory=DimensionKeywordStats)
+    reviews_analyzed: int = 0  # how many reviews were scanned
+
+
 class ReviewsData(BaseModel):
     """Top-level response for fetch_reviews — full review intelligence output."""
     reviews: list[ReviewItem] = Field(default_factory=list)  # full detail level only
@@ -638,6 +658,7 @@ class ReviewsData(BaseModel):
     yearly: list[SentimentPeriod] = Field(default_factory=list)  # calendar year breakdown
     ratio_timeline: list[list] = Field(default_factory=list)  # [[period, ratio], ...]
     language_distribution: dict[str, int] = Field(default_factory=dict)  # language -> count
+    dimension_profile: DimensionProfile | None = None
     meta: ReviewsMeta | None = None
     query_params: QueryParams | None = None
 

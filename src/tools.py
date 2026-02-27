@@ -634,6 +634,7 @@ def register_tools(mcp: FastMCP):
         platform: str = "all",
         sort: str = "helpful",
         cursor: str = "",
+        include_dimensions: bool = True,
     ) -> str:
         """Fetch Steam review text with metadata and playtime distribution for any game.
 
@@ -659,9 +660,13 @@ def register_tools(mcp: FastMCP):
             platform: Platform filter: "all" (default), "windows", "mac", "linux", "steam_deck"
             sort: Sort order: "helpful" (default) or "recent"
             cursor: Pagination cursor from previous call. Pass cursor from meta.cursor to get next batch.
+            include_dimensions: Compute dimension profile showing what reviewers focus on —
+                art, music, story, gameplay, difficulty, UI/UX, performance, content value.
+                Returns keyword mention rates per dimension. Default True.
 
         Returns:
-            JSON with sections: reviews/snippets, aggregates, histogram, sentiment, yearly, meta, query_params.
+            JSON with sections: reviews/snippets, aggregates, histogram, sentiment, yearly, meta, query_params,
+            dimension_profile (keyword mention rates across 8 player-concern dimensions).
             On first call: all sections populated. On cursor continuation: reviews only (no aggregates/stats).
         """
         # Input validation
@@ -703,6 +708,7 @@ def register_tools(mcp: FastMCP):
                 platform=platform,
                 sort=sort,
                 cursor=cursor if cursor else "",
+                include_dimensions=include_dimensions,
             )
 
         return json.dumps(result.model_dump(), default=str)

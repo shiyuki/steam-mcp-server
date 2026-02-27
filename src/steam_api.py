@@ -1362,7 +1362,7 @@ class GamalyticClient:
 
             gamalytic_ea_date = None
             try:
-                raw = data.get("earlyAccessDate")
+                raw = data.get("EAReleaseDate") or data.get("earlyAccessDate")
                 if raw is not None:
                     gamalytic_ea_date = _ms_to_iso(raw)
             except Exception:
@@ -1406,7 +1406,14 @@ class GamalyticClient:
             country_entries = []
             try:
                 raw_countries = data.get("countryData", [])
-                if isinstance(raw_countries, list):
+                if isinstance(raw_countries, dict):
+                    # Pro API returns {country_code: share_pct, ...}
+                    for code, share in raw_countries.items():
+                        country_entries.append(CountryDataEntry(
+                            country_code=str(code),
+                            share_pct=float(share) if share is not None else None,
+                        ))
+                elif isinstance(raw_countries, list):
                     for c in raw_countries:
                         if isinstance(c, dict):
                             share_raw = c.get("share")
@@ -1414,8 +1421,8 @@ class GamalyticClient:
                                 country_code=str(c.get("country", "")),
                                 share_pct=float(share_raw) if share_raw is not None else None,
                             ))
-                    country_entries.sort(key=lambda x: x.share_pct or 0, reverse=True)
-                    country_entries = country_entries[:10]
+                country_entries.sort(key=lambda x: x.share_pct or 0, reverse=True)
+                country_entries = country_entries[:10]
             except Exception:
                 country_entries = []
 
@@ -1429,7 +1436,7 @@ class GamalyticClient:
                             overlap_entries.append(CompetitorEntry(
                                 appid=item.get("appId") or item.get("steamId"),
                                 name=str(item.get("name", "")),
-                                overlap_pct=item.get("overlap") or item.get("overlapPercent"),
+                                overlap_pct=item.get("link") or item.get("overlap") or item.get("overlapPercent"),
                                 revenue=item.get("revenue"),
                                 followers=item.get("followers"),
                                 score=item.get("score"),
@@ -1447,7 +1454,7 @@ class GamalyticClient:
                             also_played_entries.append(CompetitorEntry(
                                 appid=item.get("appId") or item.get("steamId"),
                                 name=str(item.get("name", "")),
-                                overlap_pct=item.get("overlap") or item.get("overlapPercent"),
+                                overlap_pct=item.get("link") or item.get("overlap") or item.get("overlapPercent"),
                                 revenue=item.get("revenue"),
                                 followers=item.get("followers"),
                                 score=item.get("score"),
@@ -1459,7 +1466,14 @@ class GamalyticClient:
             estimate_entries = []
             try:
                 raw_estimates = data.get("estimateDetails", [])
-                if isinstance(raw_estimates, list):
+                if isinstance(raw_estimates, dict):
+                    # Pro API returns {model_name: estimate_value, ...}
+                    for model_name, estimate_val in raw_estimates.items():
+                        estimate_entries.append(EstimateModelEntry(
+                            model_name=str(model_name),
+                            estimate=float(estimate_val) if estimate_val is not None else None,
+                        ))
+                elif isinstance(raw_estimates, list):
                     for est in raw_estimates:
                         if isinstance(est, dict):
                             estimate_entries.append(EstimateModelEntry(
@@ -1917,6 +1931,99 @@ class GamalyticClient:
 
         logger.info(f"Gamalytic list_games_by_tag '{tag}': fetched {len(all_games)} games across {page} pages")
         return all_games, _make_meta()
+
+
+DIMENSION_KEYWORDS: dict[str, list[str]] = {
+    "art_visuals": [
+        "beautiful", "gorgeous", "stunning", "art style", "artstyle",
+        "art direction", "visuals", "aesthetic", "graphics", "artwork",
+        "hand-drawn", "hand drawn", "animation", "pixel art", "colorful",
+        "colours", "colors",
+    ],
+    "music_sound": [
+        "soundtrack", "music", "sound design", "audio", "voice acting",
+        "voice actor", "ost", "sound effect", "sfx", "score",
+        "composer", "singing",
+    ],
+    "story_narrative": [
+        "story", "narrative", "plot", "writing", "characters", "dialogue",
+        "lore", "storyline", "storytelling", "cutscene", "ending",
+        "protagonist", "villain",
+    ],
+    "gameplay_mechanics": [
+        "gameplay", "mechanics", "combat", "controls", "satisfying",
+        "game loop", "progression", "build", "crafting", "movement",
+        "abilities", "skills",
+    ],
+    "difficulty": [
+        "difficult", "challenging", "hard", "punishing", "unfair",
+        "easy", "casual", "frustrating", "rage", "souls-like",
+        "hardcore", "forgiving",
+    ],
+    "ui_ux": [
+        "ui", "ux", "interface", "menu", "inventory", "hud",
+        "controller", "keybind", "accessibility", "font",
+        "readable", "navigate", "tooltip",
+    ],
+    "performance": [
+        "fps", "optimization", "optimized", "lag", "crash", "bug",
+        "stuttering", "frame rate", "framerate", "loading",
+        "performance", "stable", "unstable",
+    ],
+    "content_value": [
+        "hours of", "content", "replayability", "replay value",
+        "worth", "value", "bang for", "money", "dlc",
+        "update", "endgame", "end game", "longevity",
+    ],
+}
+
+_DIMENSION_PATTERNS: dict[str, list[tuple[str, re.Pattern]]] = {}
+for _dim, _kws in DIMENSION_KEYWORDS.items():
+    _DIMENSION_PATTERNS[_dim] = [
+        (kw, re.compile(r'\b' + re.escape(kw) + r'\b', re.IGNORECASE))
+        for kw in _kws
+    ]
+
+
+def _compute_dimension_profile(reviews: list) -> "DimensionProfile":
+    """Scan review texts for keyword mentions across 8 dimensions.
+
+    Args:
+        reviews: list of ReviewItem objects (must have .text attribute)
+
+    Returns:
+        DimensionProfile with mention rates and top keywords per dimension.
+    """
+    from .schemas import DimensionProfile, DimensionKeywordStats
+
+    n = len(reviews)
+    if n == 0:
+        return DimensionProfile(reviews_analyzed=0)
+
+    dim_results = {}
+    for dim, patterns in _DIMENSION_PATTERNS.items():
+        keyword_counts: dict[str, int] = {}
+        reviews_with_match = 0
+
+        for review in reviews:
+            text = review.text or ""
+            found_any = False
+            for kw, pattern in patterns:
+                if pattern.search(text):
+                    keyword_counts[kw] = keyword_counts.get(kw, 0) + 1
+                    found_any = True
+            if found_any:
+                reviews_with_match += 1
+
+        top_kws = dict(sorted(keyword_counts.items(), key=lambda x: -x[1])[:5])
+
+        dim_results[dim] = DimensionKeywordStats(
+            mention_rate=round(reviews_with_match / n, 3),
+            mention_count=reviews_with_match,
+            top_keywords=top_kws,
+        )
+
+    return DimensionProfile(reviews_analyzed=n, **dim_results)
 
 
 class SteamReviewClient:
@@ -2578,6 +2685,7 @@ class SteamReviewClient:
         platform: str = "all",
         sort: str = "helpful",
         cursor: str = "",
+        include_dimensions: bool = True,
     ) -> ReviewsData:
         """Fetch Steam reviews for a game with pagination, stats, and sentiment.
 
@@ -2785,6 +2893,13 @@ class SteamReviewClient:
                     perspective="top_negative",
                 ))
 
+        # Dimension profiling
+        dimension_profile = None
+        if include_dimensions:
+            # In compact mode, use parsed_reviews (full set fetched for stats),
+            # not just the 3 snippets
+            dimension_profile = _compute_dimension_profile(parsed_reviews)
+
         # Assemble ReviewsData
         if detail_level == "compact":
             return ReviewsData(
@@ -2795,6 +2910,7 @@ class SteamReviewClient:
                 yearly=yearly,
                 ratio_timeline=ratio_timeline,
                 language_distribution=lang_dist,
+                dimension_profile=dimension_profile,
                 meta=meta,
                 query_params=query_params,
             )
@@ -2807,6 +2923,7 @@ class SteamReviewClient:
                 yearly=yearly,
                 ratio_timeline=ratio_timeline,
                 language_distribution=lang_dist,
+                dimension_profile=dimension_profile,
                 meta=meta,
                 query_params=query_params,
             )
