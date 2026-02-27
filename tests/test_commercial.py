@@ -1708,8 +1708,8 @@ class TestListGamesByTag:
         assert games[0]["steamId"] == 588650  # int, not string
 
 
-class TestGamalyticAuthHeader:
-    """Tests for Gamalytic API key auth header injection (KEY-01, KEY-02)."""
+class TestGamalyticAuthParam:
+    """Tests for Gamalytic API key query param injection (KEY-01, KEY-02)."""
 
     # Minimal Gamalytic API response for get_commercial_data
     _GAMALYTIC_DATA = {
@@ -1725,12 +1725,12 @@ class TestGamalyticAuthHeader:
         "positive": 50000,
         "negative": 1500,
         "price": "2499",
-        "owners": "500,000 .. 1,000,000",  # ~750k * 24.99 * 0.7 ≈ $13M (within 20% of $10M range? borderline — use wide range)
+        "owners": "500,000 .. 1,000,000",
     }
 
     @pytest.mark.asyncio
-    async def test_gamalytic_auth_header_sent_when_key_set(self):
-        """When GAMALYTIC_API_KEY is set, Authorization Bearer header is included in all calls."""
+    async def test_gamalytic_api_key_in_params_when_key_set(self):
+        """When GAMALYTIC_API_KEY is set, api_key query param is included in Gamalytic calls."""
         mock_http = AsyncMock()
         mock_http.get_with_metadata.side_effect = [
             (self._GAMALYTIC_DATA, datetime.now(timezone.utc), 0),
@@ -1741,15 +1741,15 @@ class TestGamalyticAuthHeader:
             client = GamalyticClient(mock_http)
             result = await client.get_commercial_data(646570)
 
-        # Verify Gamalytic call included the auth header
+        # Verify Gamalytic call included api_key in params
         first_call = mock_http.get_with_metadata.call_args_list[0]
-        headers_passed = first_call.kwargs.get("headers", first_call[1].get("headers", {}))
-        assert "Authorization" in headers_passed
-        assert headers_passed["Authorization"] == "Bearer test-pro-key-abc123"
+        params_passed = first_call.kwargs.get("params", first_call[1].get("params", {}))
+        assert "api_key" in params_passed
+        assert params_passed["api_key"] == "test-pro-key-abc123"
 
     @pytest.mark.asyncio
-    async def test_gamalytic_no_auth_header_when_key_empty(self):
-        """When GAMALYTIC_API_KEY is empty, no Authorization header is sent (free tier)."""
+    async def test_gamalytic_no_api_key_in_params_when_key_empty(self):
+        """When GAMALYTIC_API_KEY is empty, no api_key param is sent (free tier)."""
         mock_http = AsyncMock()
         mock_http.get_with_metadata.side_effect = [
             (self._GAMALYTIC_DATA, datetime.now(timezone.utc), 0),
@@ -1760,15 +1760,14 @@ class TestGamalyticAuthHeader:
             client = GamalyticClient(mock_http)
             result = await client.get_commercial_data(646570)
 
-        # Verify Gamalytic call used empty headers (no Authorization)
+        # Verify Gamalytic call has empty params (no api_key)
         first_call = mock_http.get_with_metadata.call_args_list[0]
-        headers_passed = first_call.kwargs.get("headers", first_call[1].get("headers", {}))
-        assert "Authorization" not in headers_passed
-        assert headers_passed == {}
+        params_passed = first_call.kwargs.get("params", first_call[1].get("params", {}))
+        assert "api_key" not in params_passed
 
     @pytest.mark.asyncio
-    async def test_gamalytic_list_games_auth_header_sent_when_key_set(self):
-        """list_games_by_tag includes Authorization header when key is set."""
+    async def test_gamalytic_list_games_api_key_in_params_when_key_set(self):
+        """list_games_by_tag includes api_key query param when key is set."""
         mock_http = AsyncMock()
         mock_http.get_with_metadata.return_value = (
             {
@@ -1784,13 +1783,13 @@ class TestGamalyticAuthHeader:
             result = await client.list_games_by_tag("Roguelike")
 
         first_call = mock_http.get_with_metadata.call_args_list[0]
-        headers_passed = first_call.kwargs.get("headers", first_call[1].get("headers", {}))
-        assert "Authorization" in headers_passed
-        assert headers_passed["Authorization"] == "Bearer test-pro-key-xyz"
+        params_passed = first_call.kwargs.get("params", first_call[1].get("params", {}))
+        assert "api_key" in params_passed
+        assert params_passed["api_key"] == "test-pro-key-xyz"
 
     @pytest.mark.asyncio
-    async def test_gamalytic_list_games_no_auth_header_when_key_empty(self):
-        """list_games_by_tag sends empty headers dict when key is absent."""
+    async def test_gamalytic_list_games_no_api_key_in_params_when_key_empty(self):
+        """list_games_by_tag does not include api_key param when key is absent."""
         mock_http = AsyncMock()
         mock_http.get_with_metadata.return_value = (
             {
@@ -1806,9 +1805,8 @@ class TestGamalyticAuthHeader:
             result = await client.list_games_by_tag("Roguelike")
 
         first_call = mock_http.get_with_metadata.call_args_list[0]
-        headers_passed = first_call.kwargs.get("headers", first_call[1].get("headers", {}))
-        assert "Authorization" not in headers_passed
-        assert headers_passed == {}
+        params_passed = first_call.kwargs.get("params", first_call[1].get("params", {}))
+        assert "api_key" not in params_passed
 
 
 # ---------------------------------------------------------------------------

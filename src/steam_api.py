@@ -1260,17 +1260,15 @@ class GamalyticClient:
             CommercialData with revenue range and extended metadata, or APIError on failure
         """
         # Primary path: Try Gamalytic API first
-        gamalytic_headers = {}
+        gamalytic_params: dict[str, str] = {}
         if Config.GAMALYTIC_API_KEY:
-            gamalytic_headers["Authorization"] = f"Bearer {Config.GAMALYTIC_API_KEY}"
-            # TODO: verify header name with Gamalytic Pro dashboard (may be x-api-key instead)
+            gamalytic_params["api_key"] = Config.GAMALYTIC_API_KEY
         gamalytic_failure_reason: str | None = None
         try:
             data, fetched_at, cache_age = await self.http.get_with_metadata(
                 f"{self.BASE_URL}/game/{appid}",
-                params={},
+                params=gamalytic_params,
                 cache_ttl=21600,  # 6 hours
-                headers=gamalytic_headers,
             )
 
             # Gamalytic response: {"steamId": "504230", "name": "Celeste", "price": 19.99, "revenue": 17990584, ...}
@@ -1837,24 +1835,22 @@ class GamalyticClient:
                 "error": error,
             }
 
-        gamalytic_headers = {}
-        if Config.GAMALYTIC_API_KEY:
-            gamalytic_headers["Authorization"] = f"Bearer {Config.GAMALYTIC_API_KEY}"
-            # TODO: verify header name with Gamalytic Pro dashboard (may be x-api-key instead)
         try:
             while True:
+                page_params: dict[str, str] = {
+                    "tags": tag,
+                    "limit": str(limit_per_page),
+                    "page": str(page),
+                    "fields": fields,
+                    "sort": "revenue",
+                    "sort_mode": "desc",
+                }
+                if Config.GAMALYTIC_API_KEY:
+                    page_params["api_key"] = Config.GAMALYTIC_API_KEY
                 data, _, _ = await self.http.get_with_metadata(
                     f"{self.BASE_URL}/steam-games/list",
-                    params={
-                        "tags": tag,
-                        "limit": str(limit_per_page),
-                        "page": str(page),
-                        "fields": fields,
-                        "sort": "revenue",
-                        "sort_mode": "desc",
-                    },
+                    params=page_params,
                     cache_ttl=3600,  # 1 hour cache — bulk data is stable
-                    headers=gamalytic_headers,
                 )
 
                 # Parse response: {"pages": N, "total": M, "result": [...], "next": {...}}
@@ -2251,16 +2247,14 @@ class SteamReviewClient:
             EADateInfo with best-available date data
         """
         # Tier 1 — Gamalytic
-        gamalytic_headers = {}
+        gamalytic_params: dict[str, str] = {}
         if Config.GAMALYTIC_API_KEY:
-            gamalytic_headers["Authorization"] = f"Bearer {Config.GAMALYTIC_API_KEY}"
-            # TODO: verify header name with Gamalytic Pro dashboard (may be x-api-key instead)
+            gamalytic_params["api_key"] = Config.GAMALYTIC_API_KEY
         try:
             data, _, _ = await self.http.get_with_metadata(
                 self.GAMALYTIC_URL.format(appid=appid),
-                params={},
+                params=gamalytic_params,
                 cache_ttl=21600,  # 6 hours — shares cache with fetch_commercial
-                headers=gamalytic_headers,
             )
             ea_date = _ms_to_iso(data.get("EAReleaseDate"))
             exit_date = _ms_to_iso(data.get("earlyAccessExitDate"))
