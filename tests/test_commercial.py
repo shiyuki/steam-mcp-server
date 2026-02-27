@@ -1809,3 +1809,141 @@ class TestGamalyticAuthHeader:
         headers_passed = first_call.kwargs.get("headers", first_call[1].get("headers", {}))
         assert "Authorization" not in headers_passed
         assert headers_passed == {}
+
+
+# ---------------------------------------------------------------------------
+# Phase 10: Warning surfacing and data quality field tests
+# ---------------------------------------------------------------------------
+
+class TestApiWarningsAndDataQuality:
+    """Test Phase 10 warning surfacing: api_warnings and data_quality on CommercialData."""
+
+    @pytest.mark.asyncio
+    async def test_gamalytic_429_surfaces_api_warning(self, mock_http):
+        """WARN-01 + PROV-01: 429 from Gamalytic produces api_warnings and data_quality='review_estimate'."""
+        gamalytic_request = httpx.Request("GET", "https://api.gamalytic.com/game/646570")
+        gamalytic_response = httpx.Response(429, request=gamalytic_request)
+        steamspy_data = {
+            "positive": 8000,
+            "negative": 2000,
+            "price": "2499",
+            "ccu": 500,
+            "owners": "500,000 .. 1,000,000",
+        }
+        steam_web_request = httpx.Request(
+            "GET",
+            "https://api.steampowered.com/ISteamUserStats/GetNumberOfCurrentPlayers/v1/",
+        )
+        steam_web_response = httpx.Response(500, request=steam_web_request)
+        mock_http.get_with_metadata.side_effect = [
+            httpx.HTTPStatusError("Too Many Requests", request=gamalytic_request, response=gamalytic_response),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+            httpx.HTTPStatusError("Server Error", request=steam_web_request, response=steam_web_response),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData), "Fallback should still return CommercialData, not APIError"
+        assert len(result.api_warnings) > 0, "429 should produce at least one api_warning"
+        warning_text = result.api_warnings[0]
+        assert "429" in warning_text or "rate limit" in warning_text.lower(), (
+            f"Warning should mention 429 or rate limit, got: {warning_text!r}"
+        )
+        assert result.data_quality == "review_estimate", (
+            f"data_quality should be 'review_estimate' on fallback, got: {result.data_quality!r}"
+        )
+        assert result.source == "review_estimate", "Existing source field should still be 'review_estimate'"
+
+    @pytest.mark.asyncio
+    async def test_gamalytic_success_has_no_warnings(self, mock_http):
+        """PROV-01: Successful Gamalytic response produces empty api_warnings and data_quality='gamalytic'."""
+        gamalytic_data = {
+            "steamId": "504230",
+            "name": "Celeste",
+            "price": 19.99,
+            "revenue": 5000000,
+            "reviews": 8000,
+            "reviewScore": 95,
+        }
+        steamspy_data = {
+            "positive": 8000,
+            "negative": 200,
+            "price": "1999",
+            "owners": "400,000 .. 600,000",
+        }
+        mock_http.get_with_metadata.side_effect = [
+            (gamalytic_data, datetime.now(timezone.utc), 0),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(504230)
+
+        assert isinstance(result, CommercialData)
+        assert result.api_warnings == [], (
+            f"Successful Gamalytic call should produce empty api_warnings, got: {result.api_warnings!r}"
+        )
+        assert result.data_quality == "gamalytic", (
+            f"data_quality should be 'gamalytic' on success, got: {result.data_quality!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_gamalytic_generic_error_surfaces_warning(self, mock_http):
+        """Generic (non-HTTP) Gamalytic error also surfaces an api_warning with failure info."""
+        steamspy_data = {
+            "positive": 5000,
+            "negative": 500,
+            "price": "999",
+            "owners": "100,000 .. 200,000",
+        }
+        steam_web_request = httpx.Request(
+            "GET",
+            "https://api.steampowered.com/ISteamUserStats/GetNumberOfCurrentPlayers/v1/",
+        )
+        steam_web_response = httpx.Response(503, request=steam_web_request)
+        mock_http.get_with_metadata.side_effect = [
+            Exception("Connection refused"),
+            (steamspy_data, datetime.now(timezone.utc), 0),
+            httpx.HTTPStatusError("Service unavailable", request=steam_web_request, response=steam_web_response),
+        ]
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(123456)
+
+        assert isinstance(result, CommercialData)
+        assert len(result.api_warnings) > 0, "Generic error should produce api_warnings"
+        warning_text = result.api_warnings[0]
+        assert "Gamalytic" in warning_text, (
+            f"Warning should mention Gamalytic, got: {warning_text!r}"
+        )
+        assert result.data_quality == "review_estimate", (
+            f"data_quality should be 'review_estimate' on fallback, got: {result.data_quality!r}"
+        )
+
+    def test_data_quality_in_model_dump(self):
+        """WARN-03: api_warnings and data_quality are included in model_dump() output.
+
+        This confirms fetch_commercial_batch per-game entries include the fields
+        without any additional tool-layer changes.
+        """
+        commercial = CommercialData(
+            appid=1,
+            revenue_min=100,
+            revenue_max=200,
+            confidence="low",
+            source="review_estimate",
+            fetched_at=datetime.now(timezone.utc),
+            api_warnings=["test warning"],
+            data_quality="review_estimate",
+        )
+        dumped = commercial.model_dump()
+
+        assert "api_warnings" in dumped, "api_warnings must be present in model_dump()"
+        assert "data_quality" in dumped, "data_quality must be present in model_dump()"
+        assert dumped["api_warnings"] == ["test warning"], (
+            f"api_warnings should serialize correctly, got: {dumped['api_warnings']!r}"
+        )
+        assert dumped["data_quality"] == "review_estimate", (
+            f"data_quality should serialize correctly, got: {dumped['data_quality']!r}"
+        )
