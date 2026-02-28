@@ -2,6 +2,7 @@
 
 import pytest
 from datetime import datetime, timezone
+from pydantic import ValidationError
 from src.schemas import (
     GameMetadata,
     SearchResult,
@@ -10,6 +11,7 @@ from src.schemas import (
     CommercialData,
     GamalyticHistoryEntry,
     CompetitorEntry,
+    VisualProfile,
 )
 
 
@@ -370,3 +372,124 @@ class TestCompetitorEntryPhase13:
         assert restored.price == pytest.approx(24.99)
         assert restored.genres == ["Indie", "RPG", "Strategy"]
         assert restored.copies_sold == 7_481_736
+
+
+def _make_visual_profile(**overrides):
+    """Factory for VisualProfile with valid defaults for all required fields."""
+    defaults = dict(
+        appid=1,
+        character_style_primary='pixel',
+        environment_style_primary='pixel',
+        production_fidelity='low',
+        mood_primary='dark',
+        palette='dark',
+        ui_density='minimal',
+        perspective='top_down',
+        header_composition='logo_abstract',
+    )
+    defaults.update(overrides)
+    return VisualProfile(**defaults)
+
+
+class TestVisualProfile:
+    def test_valid_minimal_profile(self):
+        p = _make_visual_profile()
+        assert p.appid == 1
+        assert p.character_style_primary == 'pixel'
+        assert p.environment_style_primary == 'pixel'
+        assert p.production_fidelity == 'low'
+        assert p.mood_primary == 'dark'
+        assert p.palette == 'dark'
+        assert p.ui_density == 'minimal'
+        assert p.perspective == 'top_down'
+        assert p.header_composition == 'logo_abstract'
+
+    def test_valid_full_profile(self):
+        p = _make_visual_profile(
+            appid=646570,
+            name="Slay the Spire",
+            classified_at="2026-02-28T00:00:00Z",
+            character_style_primary='illustrated',
+            character_style_secondary='painterly',
+            environment_style_primary='illustrated',
+            environment_style_secondary='painterly',
+            production_fidelity='moderate',
+            mood_primary='dark',
+            mood_secondary='mysterious',
+            palette='muted_warm',
+            ui_density='dense',
+            ui_density_confidence='observed',
+            perspective='top_down',
+            header_composition='character_portrait',
+            genre_tags=['roguelike', 'deckbuilder'],
+            notes='Card-art style; heavy UI from card hand and map',
+        )
+        assert p.name == "Slay the Spire"
+        assert p.character_style_secondary == 'painterly'
+        assert p.environment_style_secondary == 'painterly'
+        assert p.mood_secondary == 'mysterious'
+        assert p.ui_density_confidence == 'observed'
+        assert p.genre_tags == ['roguelike', 'deckbuilder']
+        assert 'Card-art' in p.notes
+
+    def test_invalid_character_style_rejected(self):
+        with pytest.raises(ValidationError):
+            _make_visual_profile(character_style_primary='watercolor')
+
+    def test_invalid_environment_style_rejected(self):
+        with pytest.raises(ValidationError):
+            _make_visual_profile(environment_style_primary='crayon')
+
+    def test_invalid_production_fidelity_rejected(self):
+        with pytest.raises(ValidationError):
+            _make_visual_profile(production_fidelity='ultra')
+
+    def test_invalid_mood_rejected(self):
+        with pytest.raises(ValidationError):
+            _make_visual_profile(mood_primary='happy')
+
+    def test_invalid_palette_rejected(self):
+        with pytest.raises(ValidationError):
+            _make_visual_profile(palette='neon')
+
+    def test_invalid_perspective_rejected(self):
+        with pytest.raises(ValidationError):
+            _make_visual_profile(perspective='birds_eye')
+
+    def test_invalid_header_composition_rejected(self):
+        with pytest.raises(ValidationError):
+            _make_visual_profile(header_composition='collage')
+
+    def test_invalid_ui_density_rejected(self):
+        with pytest.raises(ValidationError):
+            _make_visual_profile(ui_density='cluttered')
+
+    def test_optional_secondary_fields_default_none(self):
+        p = _make_visual_profile()
+        assert p.character_style_secondary is None
+        assert p.environment_style_secondary is None
+        assert p.mood_secondary is None
+
+    def test_genre_tags_default_empty_list(self):
+        p = _make_visual_profile()
+        assert p.genre_tags == []
+
+    def test_ui_density_confidence_default_inferred(self):
+        p = _make_visual_profile()
+        assert p.ui_density_confidence == 'inferred'
+
+    def test_model_dump_roundtrip(self):
+        original = _make_visual_profile(
+            appid=646570,
+            name="Slay the Spire",
+            character_style_secondary='painterly',
+            mood_secondary='mysterious',
+            genre_tags=['roguelike'],
+        )
+        dumped = original.model_dump()
+        restored = VisualProfile(**dumped)
+        assert restored.appid == original.appid
+        assert restored.character_style_primary == original.character_style_primary
+        assert restored.character_style_secondary == original.character_style_secondary
+        assert restored.mood_secondary == original.mood_secondary
+        assert restored.genre_tags == original.genre_tags

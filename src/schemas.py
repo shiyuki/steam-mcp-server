@@ -1,6 +1,8 @@
 """Pydantic schemas for Steam API responses."""
 
 from datetime import datetime
+from typing import Literal, Optional
+
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 
@@ -917,3 +919,68 @@ class CompareMarketsResult(BaseModel):
     compute_time: ComputeTimingInfo | None = None
     warnings: list[str] = Field(default_factory=list)
     methodology: dict | None = None
+
+
+# ---------------------------------------------------------------------------
+# Phase 14: Visual Intelligence schemas (additive — existing schemas unchanged)
+# ---------------------------------------------------------------------------
+
+ArtStyle = Literal[
+    'pixel', 'illustrated', 'painterly', 'anime_cel',
+    '3d_stylized', '3d_realistic', 'vector_minimal'
+]
+ProductionFidelity = Literal['low', 'moderate', 'high', 'premium']
+Mood = Literal[
+    'dark', 'whimsical', 'epic', 'tense', 'cozy',
+    'horror', 'serene', 'mysterious', 'stylish'
+]
+Palette = Literal[
+    'vibrant_warm', 'vibrant_cool', 'muted_warm', 'muted_cool',
+    'dark', 'pastel', 'monochrome'
+]
+UIDensity = Literal['minimal', 'moderate', 'dense']
+UIDensityConfidence = Literal['observed', 'inferred']
+Perspective = Literal['top_down', 'isometric', 'side_view', 'first_person', 'third_person']
+HeaderComposition = Literal[
+    'action_scene', 'character_portrait', 'landscape',
+    'logo_abstract', 'ensemble_group'
+]
+
+
+class VisualProfile(BaseModel):
+    """Art style classification for a single Steam game.
+
+    Populated by Claude after calling fetch_game_art and analyzing
+    the header image and screenshots. Stored in global visual-profiles.json.
+
+    Classification rules (from MILESTONES.md):
+    - Classify by visual impression, not engine technology
+    - pixel art with 3D lighting = pixel (not 3d_stylized)
+    - character and environment styles are classified independently
+    """
+    # Identity
+    appid: int
+    name: str = ""
+    classified_at: str = ""
+
+    # Art style — character/environment split
+    character_style_primary: ArtStyle
+    character_style_secondary: Optional[ArtStyle] = None
+    environment_style_primary: ArtStyle
+    environment_style_secondary: Optional[ArtStyle] = None
+
+    # Production and mood
+    production_fidelity: ProductionFidelity
+    mood_primary: Mood
+    mood_secondary: Optional[Mood] = None
+
+    # Visual dimensions
+    palette: Palette
+    ui_density: UIDensity
+    ui_density_confidence: UIDensityConfidence = 'inferred'
+    perspective: Perspective
+    header_composition: HeaderComposition
+
+    # Context
+    genre_tags: list[str] = Field(default_factory=list)
+    notes: str = ""
