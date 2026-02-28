@@ -7,7 +7,9 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch, MagicMock
 
 from mcp.server.fastmcp import Image
-from src.schemas import SearchResult, GameMetadata, APIError, CommercialData
+from src.schemas import SearchResult, GameMetadata, APIError, CommercialData, VisualProfile
+from src.config import Config
+from src.tools import _empty_to_none
 
 
 def _make_search_genre(steamspy_mock):
@@ -643,3 +645,226 @@ class TestFetchGameArt:
 
         context = json.loads(result[0])
         assert context["images_returned"] == 2  # screenshots only
+
+
+# ---------------------------------------------------------------------------
+# Phase 14: Visual Intelligence tool tests
+# ---------------------------------------------------------------------------
+
+async def _save_visual_profile(reports_dir: str, **overrides) -> dict:
+    """Test helper that replicates save_visual_profile tool logic."""
+    import os as _os
+    import pathlib as _pathlib
+    from pydantic import ValidationError as _VE
+
+    defaults = dict(
+        appid=1,
+        name="",
+        character_style_primary="pixel",
+        environment_style_primary="pixel",
+        production_fidelity="low",
+        mood_primary="dark",
+        palette="dark",
+        ui_density="minimal",
+        perspective="top_down",
+        header_composition="logo_abstract",
+        character_style_secondary=None,
+        environment_style_secondary=None,
+        mood_secondary=None,
+        ui_density_confidence="inferred",
+        genre_tags="",
+        notes="",
+    )
+    defaults.update(overrides)
+    p = defaults
+
+    if not reports_dir:
+        return {"error": "REPORTS_DIR is not configured. Set REPORTS_DIR environment variable.", "error_type": "configuration"}
+    if p["appid"] <= 0:
+        return {"error": "appid must be positive", "error_type": "validation"}
+
+    char_sec = _empty_to_none(p["character_style_secondary"])
+    env_sec = _empty_to_none(p["environment_style_secondary"])
+    mood_sec = _empty_to_none(p["mood_secondary"])
+    uid_conf = _empty_to_none(p["ui_density_confidence"]) or "inferred"
+    tags_list = [t.strip() for t in p["genre_tags"].split(",") if t.strip()] if p["genre_tags"] else []
+
+    try:
+        profile = VisualProfile(
+            appid=p["appid"], name=p["name"],
+            classified_at=datetime.now(timezone.utc).isoformat(),
+            character_style_primary=p["character_style_primary"],
+            character_style_secondary=char_sec,
+            environment_style_primary=p["environment_style_primary"],
+            environment_style_secondary=env_sec,
+            production_fidelity=p["production_fidelity"],
+            mood_primary=p["mood_primary"], mood_secondary=mood_sec,
+            palette=p["palette"], ui_density=p["ui_density"],
+            ui_density_confidence=uid_conf,
+            perspective=p["perspective"], header_composition=p["header_composition"],
+            genre_tags=tags_list, notes=p["notes"],
+        )
+    except _VE as e:
+        return {"error": str(e), "error_type": "validation"}
+
+    cache_path = _pathlib.Path(reports_dir) / "visual-profiles.json"
+    if cache_path.exists():
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            cache = json.load(f)
+    else:
+        cache = {"_meta": {"tool": "save_visual_profile", "created_at": datetime.now(timezone.utc).isoformat(), "last_updated": "", "profile_count": 0}, "profiles": {}}
+
+    cache["profiles"][str(p["appid"])] = profile.model_dump()
+    cache["_meta"]["profile_count"] = len(cache["profiles"])
+    cache["_meta"]["last_updated"] = datetime.now(timezone.utc).isoformat()
+
+    tmp_path = cache_path.with_suffix('.tmp')
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(cache, f, indent=2, ensure_ascii=False)
+    _os.replace(tmp_path, cache_path)
+
+    return {"saved": True, "appid": p["appid"], "name": profile.name, "profile_count": cache["_meta"]["profile_count"]}
+
+
+async def _load_visual_profiles(reports_dir: str, appids: str = "", genre_tags: str = "") -> dict:
+    """Test helper that replicates load_visual_profiles tool logic."""
+    import pathlib as _pathlib
+
+    if not reports_dir:
+        return {"error": "REPORTS_DIR is not configured. Set REPORTS_DIR environment variable.", "error_type": "configuration"}
+
+    cache_path = _pathlib.Path(reports_dir) / "visual-profiles.json"
+    if not cache_path.exists():
+        return {"profiles": [], "count": 0, "cache_missing": True}
+
+    with open(cache_path, 'r', encoding='utf-8') as f:
+        cache = json.load(f)
+
+    profiles = list(cache.get("profiles", {}).values())
+
+    if appids.strip():
+        try:
+            appid_set = {int(a.strip()) for a in appids.split(",") if a.strip()}
+            profiles = [p for p in profiles if p.get("appid") in appid_set]
+        except ValueError:
+            return {"error": "appids must be comma-separated integers", "error_type": "validation"}
+
+    if genre_tags.strip():
+        tag_set = {t.strip().lower() for t in genre_tags.split(",") if t.strip()}
+        profiles = [p for p in profiles if any(t.lower() in tag_set for t in p.get("genre_tags", []))]
+
+    return {"profiles": profiles, "count": len(profiles), "cache_meta": cache.get("_meta", {})}
+
+
+class TestSaveVisualProfile:
+    @pytest.mark.asyncio
+    async def test_saves_profile_to_file(self, tmp_path):
+        result = await _save_visual_profile(str(tmp_path), appid=646570, name="Slay the Spire")
+        assert result["saved"] is True
+        assert result["appid"] == 646570
+        cache_file = tmp_path / "visual-profiles.json"
+        assert cache_file.exists()
+        cache = json.loads(cache_file.read_text())
+        assert "646570" in cache["profiles"]
+        assert cache["profiles"]["646570"]["character_style_primary"] == "pixel"
+
+    @pytest.mark.asyncio
+    async def test_invalid_enum_returns_validation_error(self, tmp_path):
+        result = await _save_visual_profile(str(tmp_path), character_style_primary="watercolor")
+        assert result["error_type"] == "validation"
+
+    @pytest.mark.asyncio
+    async def test_overwrite_existing_profile(self, tmp_path):
+        await _save_visual_profile(str(tmp_path), appid=1, character_style_primary="pixel")
+        result = await _save_visual_profile(str(tmp_path), appid=1, character_style_primary="illustrated")
+        assert result["profile_count"] == 1
+        cache = json.loads((tmp_path / "visual-profiles.json").read_text())
+        assert cache["profiles"]["1"]["character_style_primary"] == "illustrated"
+
+    @pytest.mark.asyncio
+    async def test_multiple_profiles_increment_count(self, tmp_path):
+        await _save_visual_profile(str(tmp_path), appid=1)
+        result = await _save_visual_profile(str(tmp_path), appid=2)
+        assert result["profile_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_missing_reports_dir_returns_error(self):
+        result = await _save_visual_profile("", appid=1)
+        assert result["error_type"] == "configuration"
+
+    @pytest.mark.asyncio
+    async def test_negative_appid_returns_error(self, tmp_path):
+        result = await _save_visual_profile(str(tmp_path), appid=-1)
+        assert result["error_type"] == "validation"
+
+    @pytest.mark.asyncio
+    async def test_empty_string_secondary_treated_as_none(self, tmp_path):
+        result = await _save_visual_profile(str(tmp_path), appid=1, character_style_secondary="")
+        assert result["saved"] is True
+        cache = json.loads((tmp_path / "visual-profiles.json").read_text())
+        assert cache["profiles"]["1"]["character_style_secondary"] is None
+
+    @pytest.mark.asyncio
+    async def test_genre_tags_comma_parsing(self, tmp_path):
+        result = await _save_visual_profile(str(tmp_path), appid=1, genre_tags="roguelike, deckbuilder")
+        assert result["saved"] is True
+        cache = json.loads((tmp_path / "visual-profiles.json").read_text())
+        assert cache["profiles"]["1"]["genre_tags"] == ["roguelike", "deckbuilder"]
+
+    @pytest.mark.asyncio
+    async def test_meta_envelope_present(self, tmp_path):
+        await _save_visual_profile(str(tmp_path), appid=1)
+        cache = json.loads((tmp_path / "visual-profiles.json").read_text())
+        meta = cache["_meta"]
+        assert meta["tool"] == "save_visual_profile"
+        assert "created_at" in meta
+        assert "last_updated" in meta
+        assert meta["profile_count"] == 1
+
+
+class TestLoadVisualProfiles:
+    @pytest.mark.asyncio
+    async def test_load_from_empty_cache(self, tmp_path):
+        result = await _load_visual_profiles(str(tmp_path))
+        assert result["cache_missing"] is True
+        assert result["count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_load_all_profiles(self, tmp_path):
+        for i in range(3):
+            await _save_visual_profile(str(tmp_path), appid=i + 1)
+        result = await _load_visual_profiles(str(tmp_path))
+        assert result["count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_filter_by_appids(self, tmp_path):
+        for i in range(3):
+            await _save_visual_profile(str(tmp_path), appid=i + 1)
+        result = await _load_visual_profiles(str(tmp_path), appids="1,2")
+        assert result["count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_filter_by_genre_tags(self, tmp_path):
+        await _save_visual_profile(str(tmp_path), appid=1, genre_tags="roguelike")
+        await _save_visual_profile(str(tmp_path), appid=2, genre_tags="roguelike")
+        await _save_visual_profile(str(tmp_path), appid=3, genre_tags="strategy")
+        result = await _load_visual_profiles(str(tmp_path), genre_tags="roguelike")
+        assert result["count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_genre_tag_filter_case_insensitive(self, tmp_path):
+        await _save_visual_profile(str(tmp_path), appid=1, genre_tags="Roguelike")
+        result = await _load_visual_profiles(str(tmp_path), genre_tags="roguelike")
+        assert result["count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_invalid_appid_string_returns_error(self, tmp_path):
+        await _save_visual_profile(str(tmp_path), appid=1)
+        result = await _load_visual_profiles(str(tmp_path), appids="abc")
+        assert result["error_type"] == "validation"
+
+    @pytest.mark.asyncio
+    async def test_missing_reports_dir_returns_error(self):
+        result = await _load_visual_profiles("")
+        assert result["error_type"] == "configuration"

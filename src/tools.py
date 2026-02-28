@@ -2,14 +2,18 @@
 
 import asyncio
 import json
+import os
+import pathlib
 from datetime import datetime, timezone
 from mcp.server.fastmcp import FastMCP, Image
+from pydantic import ValidationError
 
 from src.http_client import CachedAPIClient
 from src.cache import TTLCache
+from src.config import Config
 from src.rate_limiter import HostRateLimiter
 from src.steam_api import SteamSpyClient, SteamStoreClient, GamalyticClient, SteamReviewClient
-from src.schemas import APIError, SearchResult, GameSummary, EngagementData
+from src.schemas import APIError, SearchResult, GameSummary, EngagementData, VisualProfile
 from src.logging_config import get_logger
 from src.market_tools import (
     analyze_market_single,
@@ -30,6 +34,11 @@ _review_client: SteamReviewClient | None = None
 
 # Semaphore for review fetching concurrency control
 _review_semaphore = asyncio.Semaphore(5)
+
+
+def _empty_to_none(val: str | None) -> str | None:
+    """Convert empty/whitespace-only strings to None for optional enum params."""
+    return None if (val is None or val.strip() == "") else val.strip()
 
 
 def _validate_game_tags(
@@ -1194,3 +1203,198 @@ def register_tools(mcp: FastMCP):
             context["images_failed"] = images_failed
 
         return [json.dumps(context)] + content_blocks
+
+    # -----------------------------------------------------------------
+    # Phase 14: Visual Intelligence tools
+    # -----------------------------------------------------------------
+
+    @mcp.tool()
+    async def save_visual_profile(
+        appid: int,
+        character_style_primary: str,
+        environment_style_primary: str,
+        production_fidelity: str,
+        mood_primary: str,
+        palette: str,
+        ui_density: str,
+        perspective: str,
+        header_composition: str,
+        name: str = "",
+        character_style_secondary: str | None = None,
+        environment_style_secondary: str | None = None,
+        mood_secondary: str | None = None,
+        ui_density_confidence: str = "inferred",
+        genre_tags: str = "",
+        notes: str = "",
+    ) -> str:
+        """Save a visual art classification for a Steam game to the persistent cache.
+
+        Classifications persist globally across reports and server restarts.
+        Overwrites existing profile for the same appid (idempotent / update-safe).
+
+        Valid values:
+        - character/environment style: pixel, illustrated, painterly, anime_cel, 3d_stylized, 3d_realistic, vector_minimal
+        - production_fidelity: low, moderate, high, premium
+        - mood: dark, whimsical, epic, tense, cozy, horror, serene, mysterious, stylish
+        - palette: vibrant_warm, vibrant_cool, muted_warm, muted_cool, dark, pastel, monochrome
+        - ui_density: minimal, moderate, dense
+        - ui_density_confidence: observed, inferred
+        - perspective: top_down, isometric, side_view, first_person, third_person
+        - header_composition: action_scene, character_portrait, landscape, logo_abstract, ensemble_group
+
+        Args:
+            appid: Steam AppID (e.g., 646570 for Slay the Spire)
+            character_style_primary: Primary character art style
+            environment_style_primary: Primary environment art style
+            production_fidelity: Overall production polish level
+            mood_primary: Primary visual mood
+            palette: Color palette classification
+            ui_density: HUD/UI element density
+            perspective: Camera/view perspective
+            header_composition: Header capsule image composition type
+            name: Game name (optional, for readability)
+            character_style_secondary: Secondary character style blend (optional)
+            environment_style_secondary: Secondary environment style blend (optional)
+            mood_secondary: Secondary mood layer (optional)
+            ui_density_confidence: Whether UI density was observed or inferred (default: inferred)
+            genre_tags: Comma-separated genre tags for filtering (e.g., "roguelike,deckbuilder")
+            notes: Classifier observations (optional)
+
+        Returns:
+            JSON string with save confirmation or validation error
+        """
+        if not Config.REPORTS_DIR:
+            return json.dumps({"error": "REPORTS_DIR is not configured. Set REPORTS_DIR environment variable.", "error_type": "configuration"})
+        if appid <= 0:
+            return json.dumps({"error": "appid must be positive", "error_type": "validation"})
+
+        # Normalize optional enum params: empty string -> None
+        char_sec = _empty_to_none(character_style_secondary)
+        env_sec = _empty_to_none(environment_style_secondary)
+        mood_sec = _empty_to_none(mood_secondary)
+        uid_conf = _empty_to_none(ui_density_confidence) or "inferred"
+
+        tags_list = [t.strip() for t in genre_tags.split(",") if t.strip()] if genre_tags else []
+
+        try:
+            profile = VisualProfile(
+                appid=appid,
+                name=name,
+                classified_at=datetime.now(timezone.utc).isoformat(),
+                character_style_primary=character_style_primary,
+                character_style_secondary=char_sec,
+                environment_style_primary=environment_style_primary,
+                environment_style_secondary=env_sec,
+                production_fidelity=production_fidelity,
+                mood_primary=mood_primary,
+                mood_secondary=mood_sec,
+                palette=palette,
+                ui_density=ui_density,
+                ui_density_confidence=uid_conf,
+                perspective=perspective,
+                header_composition=header_composition,
+                genre_tags=tags_list,
+                notes=notes,
+            )
+        except ValidationError as e:
+            return json.dumps({"error": str(e), "error_type": "validation"})
+
+        cache_path = pathlib.Path(Config.REPORTS_DIR) / "visual-profiles.json"
+
+        # Load existing or init fresh
+        if cache_path.exists():
+            try:
+                with open(cache_path, 'r', encoding='utf-8') as f:
+                    cache = json.load(f)
+            except Exception as exc:
+                logger.error("save_visual_profile: cache read failed: %s", exc)
+                return json.dumps({"error": f"Cache read failed: {exc}", "error_type": "io_error"})
+        else:
+            cache = {
+                "_meta": {
+                    "tool": "save_visual_profile",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "last_updated": "",
+                    "profile_count": 0,
+                },
+                "profiles": {}
+            }
+
+        # Upsert by appid (idempotent)
+        key = str(appid)
+        cache["profiles"][key] = profile.model_dump()
+        cache["_meta"]["profile_count"] = len(cache["profiles"])
+        cache["_meta"]["last_updated"] = datetime.now(timezone.utc).isoformat()
+
+        # Atomic write: tmp then os.replace
+        tmp_path = cache_path.with_suffix('.tmp')
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(cache, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, cache_path)
+        except Exception as exc:
+            logger.error("save_visual_profile: file write failed: %s", exc)
+            return json.dumps({"error": f"Cache write failed: {exc}", "error_type": "io_error"})
+
+        logger.info("Saved visual profile for AppID %d (%s), total profiles: %d", appid, name, cache["_meta"]["profile_count"])
+        return json.dumps({
+            "saved": True,
+            "appid": appid,
+            "name": profile.name,
+            "profile_count": cache["_meta"]["profile_count"],
+        })
+
+    @mcp.tool()
+    async def load_visual_profiles(
+        appids: str = "",
+        genre_tags: str = "",
+    ) -> str:
+        """Load visual art classifications from the global cache, optionally filtered.
+
+        Returns profiles as JSON array with count and cache metadata.
+
+        Args:
+            appids: Comma-separated AppIDs to retrieve (empty = all profiles)
+            genre_tags: Comma-separated genre tags to filter by — returns profiles
+                        tagged with ANY of the listed tags (empty = all profiles)
+
+        Returns:
+            JSON string with profiles array, count, and cache metadata
+        """
+        if not Config.REPORTS_DIR:
+            return json.dumps({"error": "REPORTS_DIR is not configured. Set REPORTS_DIR environment variable.", "error_type": "configuration"})
+
+        cache_path = pathlib.Path(Config.REPORTS_DIR) / "visual-profiles.json"
+        if not cache_path.exists():
+            return json.dumps({"profiles": [], "count": 0, "cache_missing": True})
+
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                cache = json.load(f)
+        except Exception as exc:
+            return json.dumps({"error": f"Cache read failed: {exc}", "error_type": "io_error"})
+
+        profiles = list(cache.get("profiles", {}).values())
+
+        # Filter by appid list
+        if appids.strip():
+            try:
+                appid_set = {int(a.strip()) for a in appids.split(",") if a.strip()}
+                profiles = [p for p in profiles if p.get("appid") in appid_set]
+            except ValueError:
+                return json.dumps({"error": "appids must be comma-separated integers", "error_type": "validation"})
+
+        # Filter by genre tags (case-insensitive, any-match)
+        if genre_tags.strip():
+            tag_set = {t.strip().lower() for t in genre_tags.split(",") if t.strip()}
+            profiles = [
+                p for p in profiles
+                if any(t.lower() in tag_set for t in p.get("genre_tags", []))
+            ]
+
+        return json.dumps({
+            "profiles": profiles,
+            "count": len(profiles),
+            "cache_meta": cache.get("_meta", {}),
+        })
