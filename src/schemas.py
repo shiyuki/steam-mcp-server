@@ -176,6 +176,17 @@ class CommercialData(CachedResponse):
     api_warnings: list[str] = Field(default_factory=list)
     data_quality: str = "gamalytic"  # "gamalytic" | "review_estimate"
 
+    # Phase 13: Data migration + extended Pro fields
+    # Fields sourced from Gamalytic Pro API (playtimeData, wishlists, reviewsSteam, earlyAccessExitDate)
+    wishlists: int | None = None  # Top-level current wishlist count
+    avg_playtime: float | None = None  # Gamalytic top-level avgPlaytime (in hours)
+    playtime_distribution: dict[str, float] = Field(default_factory=dict)  # Bucket histogram from playtimeData.distribution {"0-1h": pct, ...}
+    playtime_median: float | None = None  # Median playtime in hours from playtimeData.median
+    reviews_steam: int | None = None  # Steam-purchase-only review count (reviewsSteam)
+    ea_exit_date: str | None = None  # ISO date when game left Early Access (earlyAccessExitDate)
+    playtime_source: str | None = None  # None = Gamalytic (default); "steamspy" = fallback
+    ownership_source: str | None = None  # None = Gamalytic (default); "steamspy" = fallback
+
 
 class EngagementData(CachedResponse):
     """Player engagement metrics for a single Steam game from SteamSpy."""
