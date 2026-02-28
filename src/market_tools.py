@@ -410,6 +410,98 @@ def _build_top_games(games: list[dict], top_n: int) -> list[GameProfile]:
     return [_build_game_profile(g) for g in sorted_games[:top_n]]
 
 
+_NAME_BACKFILL_TIMEOUT = 10  # seconds — fail fast, names are cosmetic
+
+
+async def _resolve_missing_names(steam_store: "SteamStoreClient", appids: list[int]) -> dict[int, str]:
+    """Fetch game names from Steam Store for a list of AppIDs. Returns {appid: name}.
+
+    Applies a short timeout so a slow Steam API never delays analysis results.
+    """
+
+    async def _fetch_name(appid: int) -> tuple[int, str | None]:
+        try:
+            meta = await steam_store.get_app_details(appid)
+            if hasattr(meta, "name"):
+                return appid, meta.name
+        except Exception:
+            pass
+        return appid, None
+
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*[_fetch_name(a) for a in appids], return_exceptions=True),
+            timeout=_NAME_BACKFILL_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(f"Name backfill timed out after {_NAME_BACKFILL_TIMEOUT}s for {len(appids)} games")
+        return {}
+    return {r[0]: r[1] for r in results if isinstance(r, tuple) and r[1]}
+
+
+async def _backfill_top_game_names(result: dict, steam_store: "SteamStoreClient") -> None:
+    """Fetch names from Steam Store for top_games entries with missing names.
+
+    Mutates result["top_games"] in place. Errors are silently ignored
+    so a metadata fetch failure never blocks the analysis result.
+    """
+    top_games = result.get("top_games", [])
+    missing = [(i, g["appid"]) for i, g in enumerate(top_games) if not g.get("name")]
+    if not missing:
+        return
+
+    logger.info(f"Backfilling names for {len(missing)} top games via Steam Store")
+    name_map = await _resolve_missing_names(steam_store, [appid for _, appid in missing])
+
+    for idx, appid in missing:
+        if appid in name_map:
+            top_games[idx]["name"] = name_map[appid]
+        else:
+            # Last resort: show AppID so the game is identifiable
+            top_games[idx]["name"] = f"AppID:{appid}"
+
+    backfilled = sum(1 for _, appid in missing if appid in name_map)
+    if backfilled:
+        logger.info(f"Backfilled {backfilled}/{len(missing)} game names")
+    fallback_count = len(missing) - backfilled
+    if fallback_count:
+        logger.warning(f"Name backfill: {fallback_count} games fell back to AppID display")
+
+
+async def _backfill_overlap_names(
+    overlaps: list, steam_store: "SteamStoreClient",
+    global_overlap=None,
+) -> None:
+    """Backfill missing names in OverlapInfo.overlap_games (Pydantic GameProfile objects)."""
+    all_missing: dict[int, list[GameProfile]] = {}
+    sources = list(overlaps)
+    if global_overlap is not None:
+        sources.append(global_overlap)
+
+    for oi in sources:
+        for gp in getattr(oi, "overlap_games", []):
+            if not gp.name and gp.appid:
+                all_missing.setdefault(gp.appid, []).append(gp)
+
+    if not all_missing:
+        return
+
+    logger.info(f"Backfilling names for {len(all_missing)} overlap games via Steam Store")
+    name_map = await _resolve_missing_names(steam_store, list(all_missing.keys()))
+
+    for appid, profiles in all_missing.items():
+        resolved_name = name_map.get(appid) or f"AppID:{appid}"
+        for gp in profiles:
+            gp.name = resolved_name
+
+    backfilled = sum(1 for appid in all_missing if appid in name_map)
+    if backfilled:
+        logger.info(f"Backfilled {backfilled}/{len(all_missing)} overlap game names")
+    fallback_count = len(all_missing) - backfilled
+    if fallback_count:
+        logger.warning(f"Overlap name backfill: {fallback_count} games fell back to AppID display")
+
+
 # ---------------------------------------------------------------------------
 # Methodology Builder
 # ---------------------------------------------------------------------------
@@ -1351,6 +1443,10 @@ async def _enrich_with_gamalytic_bulk(
         gam_data = gamalytic_lookup.get(appid) if appid else None
         if gam_data:
             enriched = dict(game)
+            # Merge name from Gamalytic if SteamSpy didn't provide one
+            gam_name = gam_data.get("name")
+            if gam_name and not enriched.get("name"):
+                enriched["name"] = gam_name
             # Merge revenue (Gamalytic has single revenue int from bulk endpoint)
             raw_revenue = gam_data.get("revenue")
             if raw_revenue is not None and raw_revenue > 0:
@@ -1444,6 +1540,9 @@ async def _enrich_with_gamalytic_bulk(
             tier1_5_count += 1
             comm = tier1_5_commercial.get(appid)
             if comm:
+                # Merge name if still missing
+                if not enriched.get("name") and getattr(comm, "name", None):
+                    enriched["name"] = comm.name
                 rev = _commercial_data_to_revenue(comm)
                 if rev is not None:
                     current_rev = enriched.get("revenue")
@@ -1469,8 +1568,11 @@ async def _enrich_with_gamalytic_bulk(
                 if getattr(comm, "release_date", None) is not None:
                     enriched["release_date"] = comm.release_date
             engagement = tier1_5_tags.get(appid)
-            if engagement and hasattr(engagement, "tags") and engagement.tags:
-                enriched["tags"] = dict(engagement.tags)
+            if engagement:
+                if not enriched.get("name") and hasattr(engagement, "name") and engagement.name:
+                    enriched["name"] = engagement.name
+                if hasattr(engagement, "tags") and engagement.tags:
+                    enriched["tags"] = dict(engagement.tags)
             enriched_games[i] = enriched
 
         enrichment_meta["tier1_5_count"] = len(tier1_5_appids)
@@ -1551,6 +1653,9 @@ async def _enrich_with_gamalytic_bulk(
                 # Deep-merge CommercialData fields (overwrites Tier 1 bulk fields with richer per-game data)
                 comm = tier2_commercial.get(appid)
                 if comm:
+                    # Merge name if still missing
+                    if not enriched.get("name") and getattr(comm, "name", None):
+                        enriched["name"] = comm.name
                     # Revenue: use per-game midpoint only if it is higher than current value
                     rev = _commercial_data_to_revenue(comm)
                     if rev is not None:
@@ -1610,8 +1715,11 @@ async def _enrich_with_gamalytic_bulk(
 
                 # Deep-merge SteamSpy tag weights (critical for genre membership validation in plan 09-11)
                 engagement = tier2_tags.get(appid)
-                if engagement and hasattr(engagement, "tags") and engagement.tags:
-                    enriched["tags"] = dict(engagement.tags)  # {"TagName": weight_int, ...}
+                if engagement:
+                    if not enriched.get("name") and hasattr(engagement, "name") and engagement.name:
+                        enriched["name"] = engagement.name
+                    if hasattr(engagement, "tags") and engagement.tags:
+                        enriched["tags"] = dict(engagement.tags)  # {"TagName": weight_int, ...}
 
                 enriched_games[i] = enriched
 
@@ -1928,6 +2036,9 @@ async def _analyze_market_single_impl(
             return result, enriched_games
         return result
 
+    # Backfill missing game names in top_games via Steam Store metadata
+    await _backfill_top_game_names(result, steam_store)
+
     # Patch released count into methodology
     if total_released_count is not None and result.get("methodology"):
         result["methodology"]["total_released_on_steam"] = total_released_count
@@ -2195,7 +2306,7 @@ def _find_competitors(
             match = next((g for g in genre_games if g.get("appid") == entry.appid), None)
             competitors.append(CompetitorComparison(
                 appid=entry.appid,
-                name=entry.name or (match.get("name", "") if match else ""),
+                name=entry.name or (match.get("name") if match else None) or f"AppID:{entry.appid}",
                 revenue=entry.revenue or (match.get("revenue") if match else None),
                 review_score=entry.score or (match.get("review_score") if match else None),
                 price=match.get("price") if match else None,
@@ -2248,7 +2359,7 @@ def _find_competitors(
     for score, g, shared_tags in top:
         competitors.append(CompetitorComparison(
             appid=g.get("appid", 0),
-            name=g.get("name", ""),
+            name=g.get("name") or f"AppID:{g.get('appid', 0)}",
             revenue=g.get("revenue"),
             review_score=g.get("review_score"),
             price=g.get("price"),
@@ -3034,6 +3145,9 @@ async def compare_markets_analysis(
             "tier2_count": tier2,
         }
 
+        # Backfill missing game names in top_games
+        await _backfill_top_game_names(analysis, steam_store)
+
         if "error" in analysis:
             warnings.append(f"Market '{label}': {analysis['error']}")
 
@@ -3056,6 +3170,9 @@ async def compare_markets_analysis(
         (g for ml, g in market_game_sets if ml == label), []
     ))]]
     pairwise_overlap, global_overlap = _compute_overlap(market_game_sets)
+
+    # Backfill missing names in overlap game profiles
+    await _backfill_overlap_names(pairwise_overlap, steam_store, global_overlap)
 
     # Confidence notes
     confidence_notes = _compute_confidence_notes(market_analyses)
