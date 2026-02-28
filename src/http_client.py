@@ -226,6 +226,55 @@ class CachedAPIClient:
         cache_age = int(time.monotonic() - entry.created_at)
         return entry.value, entry.fetched_at, cache_age
 
+    async def get_with_metadata_stale(
+        self,
+        url: str,
+        params: dict = None,
+        cache_ttl: float = None,
+        stale_ttl: float = None,
+        headers: dict = None,
+    ) -> tuple[dict, datetime, int, bool]:
+        """Like get_with_metadata(), but adds stale-while-revalidate support.
+
+        When the cache entry is within the stale window (cache_ttl < age < stale_ttl),
+        attempts to revalidate. If revalidation fails, returns stale data with
+        is_stale=True so callers can surface a warning.
+
+        Args:
+            url: The URL to request
+            params: Optional query parameters
+            cache_ttl: Fresh TTL in seconds. None uses cache default. 0 bypasses cache.
+            stale_ttl: Stale window TTL in seconds. None means no stale window (identical
+                to get_with_metadata). Must be >= cache_ttl if provided.
+            headers: Optional extra headers for the request
+
+        Returns:
+            Tuple of (data dict, fetched_at datetime, cache_age_seconds int, is_stale bool).
+            is_stale is True only when serving stale cached data after a failed revalidation.
+        """
+        if cache_ttl == 0:
+            data = await self._fetch_with_timeout(url, params, headers)
+            return data, datetime.now(timezone.utc), 0, False
+
+        host = self._extract_host(url)
+        endpoint = url.split(host)[-1] if host else url
+        auth_state = None
+        if headers:
+            for k in headers:
+                if k.lower() in ("authorization", "x-api-key", "api-key"):
+                    auth_state = "authed"
+                    break
+        cache_key = make_cache_key(host, endpoint, params, auth_state=auth_state)
+
+        entry, is_stale = await self.cache.get_or_fetch_stale(
+            key=cache_key,
+            fetch_func=lambda: self._fetch_with_timeout(url, params, headers),
+            ttl=cache_ttl,
+            stale_ttl=stale_ttl,
+        )
+        cache_age = int(time.monotonic() - entry.created_at)
+        return entry.value, entry.fetched_at, cache_age, is_stale
+
     async def close(self):
         """Close the HTTP client."""
         await self.client.aclose()

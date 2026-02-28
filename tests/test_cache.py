@@ -1,6 +1,7 @@
 """Tests for TTL cache with stampede prevention."""
 
 import asyncio
+import time
 import pytest
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
@@ -203,6 +204,140 @@ class TestTTLCache:
         entry2 = cache.get("key1")
         assert entry2 is not None
         assert entry2.value.cache_age_seconds >= 1  # Should be >= 1 after rounding
+
+
+class TestGetOrFetchStale:
+    """Tests for TTLCache.get_or_fetch_stale (stale-while-revalidate semantics)."""
+
+    @pytest.mark.asyncio
+    async def test_stale_fresh_hit(self):
+        """Entry within fresh TTL returns (entry, False) without calling fetch_func again."""
+        cache = TTLCache(default_ttl=3600)
+        fetch_func = AsyncMock(return_value="initial_value")
+
+        # Populate the cache
+        entry1, is_stale1 = await cache.get_or_fetch_stale("key", fetch_func, ttl=3600, stale_ttl=7200)
+        assert entry1.value == "initial_value"
+        assert is_stale1 is False
+
+        # Immediately re-request — still within fresh TTL
+        entry2, is_stale2 = await cache.get_or_fetch_stale("key", fetch_func, ttl=3600, stale_ttl=7200)
+        assert entry2.value == "initial_value"
+        assert is_stale2 is False
+        fetch_func.assert_called_once()  # fetch_func not called again
+
+    @pytest.mark.asyncio
+    async def test_stale_revalidate_success(self):
+        """Entry past fresh TTL but within stale TTL: successful fetch returns fresh entry, is_stale=False."""
+        cache = TTLCache(default_ttl=3600)
+        fetch_func = AsyncMock(side_effect=["stale_value", "fresh_value"])
+
+        # Populate with very short fresh TTL
+        await cache.get_or_fetch_stale("key", fetch_func, ttl=0.05, stale_ttl=10.0)
+
+        # Wait past fresh TTL but well within stale window
+        await asyncio.sleep(0.1)
+
+        # Revalidation attempt should succeed and return fresh value
+        entry, is_stale = await cache.get_or_fetch_stale("key", fetch_func, ttl=0.05, stale_ttl=10.0)
+        assert entry.value == "fresh_value"
+        assert is_stale is False
+        assert fetch_func.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_stale_revalidate_failure(self):
+        """Entry past fresh TTL, within stale window, fetch raises: returns stale entry, is_stale=True."""
+        cache = TTLCache(default_ttl=3600)
+
+        # First call populates the cache
+        populate_func = AsyncMock(return_value="stale_value")
+        await cache.get_or_fetch_stale("key", populate_func, ttl=0.05, stale_ttl=10.0)
+
+        # Wait past fresh TTL
+        await asyncio.sleep(0.1)
+
+        # Revalidation fetch raises — should serve stale data
+        failing_fetch = AsyncMock(side_effect=RuntimeError("network error"))
+        entry, is_stale = await cache.get_or_fetch_stale("key", failing_fetch, ttl=0.05, stale_ttl=10.0)
+        assert entry.value == "stale_value"
+        assert is_stale is True
+        failing_fetch.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stale_expired(self):
+        """Entry past stale TTL: successful fetch returns fresh entry, is_stale=False."""
+        cache = TTLCache(default_ttl=3600)
+        fetch_func = AsyncMock(side_effect=["old_value", "new_value"])
+
+        # Populate with very short ttl AND stale_ttl
+        await cache.get_or_fetch_stale("key", fetch_func, ttl=0.03, stale_ttl=0.06)
+
+        # Wait past stale window entirely
+        await asyncio.sleep(0.1)
+
+        entry, is_stale = await cache.get_or_fetch_stale("key", fetch_func, ttl=0.03, stale_ttl=0.06)
+        assert entry.value == "new_value"
+        assert is_stale is False
+        assert fetch_func.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_stale_expired_fetch_fails(self):
+        """Entry past stale TTL, fetch raises: exception propagates (no stale to serve)."""
+        cache = TTLCache(default_ttl=3600)
+
+        # Populate with very short ttl AND stale_ttl
+        populate_func = AsyncMock(return_value="old_value")
+        await cache.get_or_fetch_stale("key", populate_func, ttl=0.03, stale_ttl=0.06)
+
+        # Wait past stale window entirely
+        await asyncio.sleep(0.1)
+
+        failing_fetch = AsyncMock(side_effect=RuntimeError("network dead"))
+        with pytest.raises(RuntimeError, match="network dead"):
+            await cache.get_or_fetch_stale("key", failing_fetch, ttl=0.03, stale_ttl=0.06)
+
+    @pytest.mark.asyncio
+    async def test_stale_no_entry_fetch_fails(self):
+        """No cached entry at all, fetch raises: exception propagates."""
+        cache = TTLCache(default_ttl=3600)
+        failing_fetch = AsyncMock(side_effect=ConnectionError("no network"))
+
+        with pytest.raises(ConnectionError, match="no network"):
+            await cache.get_or_fetch_stale("key", failing_fetch, ttl=3600, stale_ttl=7200)
+
+    @pytest.mark.asyncio
+    async def test_stale_default_no_stale_window(self):
+        """stale_ttl=None defaults to ttl — behaves identically to get_or_fetch (no stale serving)."""
+        cache = TTLCache(default_ttl=3600)
+        fetch_func = AsyncMock(side_effect=["old_value", "new_value"])
+
+        # Populate with very short TTL, no stale window
+        await cache.get_or_fetch_stale("key", fetch_func, ttl=0.05, stale_ttl=None)
+
+        # Wait for TTL to expire
+        await asyncio.sleep(0.1)
+
+        # Past TTL with no stale window — fetch fresh
+        entry, is_stale = await cache.get_or_fetch_stale("key", fetch_func, ttl=0.05, stale_ttl=None)
+        assert entry.value == "new_value"
+        assert is_stale is False
+        assert fetch_func.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_stale_return_type(self):
+        """get_or_fetch_stale always returns a 2-tuple of (CacheEntry, bool)."""
+        cache = TTLCache(default_ttl=3600)
+        fetch_func = AsyncMock(return_value={"data": 42})
+
+        result = await cache.get_or_fetch_stale("key", fetch_func, ttl=3600, stale_ttl=7200)
+
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        entry, is_stale = result
+        assert isinstance(entry, CacheEntry)
+        assert isinstance(is_stale, bool)
+        assert entry.value == {"data": 42}
+        assert is_stale is False
 
 
 class TestMakeCacheKey:
