@@ -13,6 +13,7 @@ from src.analytics import (
     compute_success_rates, compute_tag_multipliers, compute_score_revenue,
     compute_publisher_analysis, compute_release_timing, compute_sub_genres,
     compute_competitive_density,
+    compute_visual_multipliers,
     # Constants
     PRICE_BRACKETS, SCORE_RANGES, REVENUE_TIERS, STANDARD_BIASES,
     KNOWN_PUBLISHERS,
@@ -984,3 +985,127 @@ class TestEndToEnd:
         assert isinstance(compute_release_timing(games), ReleaseTimingResult)
         assert isinstance(compute_sub_genres(games), SubGenreResult)
         assert isinstance(compute_competitive_density(games), CompetitiveDensityResult)
+
+
+# ---------------------------------------------------------------------------
+# Phase 14: Visual Intelligence analytics tests
+# ---------------------------------------------------------------------------
+
+def _make_profile(appid, character_style='pixel', environment_style='pixel',
+                  fidelity='low', mood='dark', palette='dark',
+                  ui_density='minimal', perspective='top_down',
+                  header='logo_abstract', genre_tags=None):
+    return {
+        "appid": appid,
+        "character_style_primary": character_style,
+        "environment_style_primary": environment_style,
+        "production_fidelity": fidelity,
+        "mood_primary": mood,
+        "palette": palette,
+        "ui_density": ui_density,
+        "perspective": perspective,
+        "header_composition": header,
+        "genre_tags": genre_tags or [],
+    }
+
+
+class TestComputeVisualMultipliers:
+    def test_empty_profiles_returns_empty_dict(self):
+        assert compute_visual_multipliers([], {}) == {}
+
+    def test_no_commercial_overlap_returns_empty_dict(self):
+        profiles = [_make_profile(1), _make_profile(2)]
+        commercial = {3: 100_000, 4: 200_000}
+        assert compute_visual_multipliers(profiles, commercial) == {}
+
+    def test_basic_multiplier_computation(self):
+        # 3 pixel games (low rev) + 3 illustrated games (high rev)
+        profiles = [
+            _make_profile(1, character_style='pixel'),
+            _make_profile(2, character_style='pixel'),
+            _make_profile(3, character_style='pixel'),
+            _make_profile(4, character_style='illustrated'),
+            _make_profile(5, character_style='illustrated'),
+            _make_profile(6, character_style='illustrated'),
+        ]
+        commercial = {1: 100_000, 2: 200_000, 3: 300_000, 4: 400_000, 5: 500_000, 6: 600_000}
+        result = compute_visual_multipliers(profiles, commercial)
+
+        assert "character_style_primary" in result
+        entries = {e["value"]: e for e in result["character_style_primary"]}
+        assert entries["pixel"]["mean_multiplier"] < 1.0
+        assert entries["illustrated"]["mean_multiplier"] > 1.0
+        assert entries["pixel"]["game_count"] == 3
+        assert entries["illustrated"]["game_count"] == 3
+
+    def test_min_games_filters_small_buckets(self):
+        profiles = [
+            _make_profile(1, character_style='pixel'),
+            _make_profile(2, character_style='pixel'),
+            _make_profile(3, character_style='pixel'),
+            _make_profile(4, character_style='illustrated'),  # only 1
+        ]
+        commercial = {1: 100_000, 2: 200_000, 3: 300_000, 4: 500_000}
+
+        # With default min_games=3, illustrated excluded
+        result = compute_visual_multipliers(profiles, commercial)
+        assert "character_style_primary" in result
+        values = [e["value"] for e in result["character_style_primary"]]
+        assert "illustrated" not in values
+
+        # With min_games=1, illustrated included
+        result = compute_visual_multipliers(profiles, commercial, min_games=1)
+        values = [e["value"] for e in result["character_style_primary"]]
+        assert "illustrated" in values
+
+    def test_all_eight_attributes_analyzed(self):
+        # 3 identical profiles with commercial data — all 8 attrs should appear
+        profiles = [_make_profile(i) for i in range(1, 4)]
+        commercial = {1: 100_000, 2: 200_000, 3: 300_000}
+        result = compute_visual_multipliers(profiles, commercial)
+
+        expected_attrs = [
+            "character_style_primary", "environment_style_primary",
+            "production_fidelity", "mood_primary", "palette",
+            "ui_density", "perspective", "header_composition",
+        ]
+        for attr in expected_attrs:
+            assert attr in result, f"Missing attribute: {attr}"
+
+    def test_multiplier_sorted_descending(self):
+        profiles = [
+            _make_profile(1, mood='dark'),
+            _make_profile(2, mood='dark'),
+            _make_profile(3, mood='dark'),
+            _make_profile(4, mood='whimsical'),
+            _make_profile(5, mood='whimsical'),
+            _make_profile(6, mood='whimsical'),
+        ]
+        commercial = {1: 50_000, 2: 100_000, 3: 150_000, 4: 400_000, 5: 500_000, 6: 600_000}
+        result = compute_visual_multipliers(profiles, commercial)
+
+        entries = result["mood_primary"]
+        multipliers = [e["mean_multiplier"] for e in entries]
+        assert multipliers == sorted(multipliers, reverse=True)
+
+    def test_none_revenue_excluded(self):
+        profiles = [_make_profile(1), _make_profile(2), _make_profile(3)]
+        commercial = {1: 100_000, 2: None, 3: 300_000}
+        result = compute_visual_multipliers(profiles, commercial)
+        # Only 2 profiles with valid revenue — below min_games=3
+        # Should return empty since no bucket has 3+ games
+        assert result == {}
+
+    def test_zero_genre_avg_returns_empty(self):
+        profiles = [_make_profile(1), _make_profile(2), _make_profile(3)]
+        commercial = {1: 0, 2: 0, 3: 0}
+        assert compute_visual_multipliers(profiles, commercial) == {}
+
+    def test_avg_revenue_field_present(self):
+        profiles = [_make_profile(i) for i in range(1, 4)]
+        commercial = {1: 100_000, 2: 200_000, 3: 300_000}
+        result = compute_visual_multipliers(profiles, commercial)
+        for attr_entries in result.values():
+            for entry in attr_entries:
+                assert "avg_revenue" in entry
+                assert isinstance(entry["avg_revenue"], (int, float))

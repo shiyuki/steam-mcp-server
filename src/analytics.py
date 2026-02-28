@@ -1050,3 +1050,84 @@ def compute_competitive_density(games: list[dict]) -> CompetitiveDensityResult |
         ),
     )
     return CompetitiveDensityResult(periods=periods, pipeline_count=pipeline_count, meta=meta)
+
+
+# ---------------------------------------------------------------------------
+# Phase 14: Visual Intelligence analytics
+# ---------------------------------------------------------------------------
+
+# Attributes to aggregate (primary fields only — larger buckets)
+_VISUAL_PRIMARY_ATTRS = [
+    "character_style_primary", "environment_style_primary",
+    "production_fidelity", "mood_primary", "palette",
+    "ui_density", "perspective", "header_composition",
+]
+
+
+def compute_visual_multipliers(
+    profiles: list[dict],
+    commercial_data: dict[int, float],
+    min_games: int = 3,
+) -> dict[str, list[dict]]:
+    """Cross-tabulate visual attribute values with revenue data.
+
+    Mirrors compute_tag_multipliers pattern. Groups games by each visual
+    attribute value, computes mean/median revenue per bucket, divides by
+    genre average to produce multipliers.
+
+    Args:
+        profiles: List of VisualProfile dicts (from load_visual_profiles output).
+        commercial_data: {appid: revenue_float} — caller provides fresh data.
+            Use revenue midpoint: (revenue_min + revenue_max) / 2.
+        min_games: Minimum games per bucket to include (skip smaller buckets).
+            Default 3 (lower than tag multipliers' 5 because visual sample
+            sizes are smaller — 10-30 classified games vs 200+ with tags).
+
+    Returns:
+        Dict mapping attribute_name -> list of entry dicts:
+        [{value, mean_multiplier, median_multiplier, game_count, avg_revenue}, ...]
+        Sorted by mean_multiplier descending per attribute.
+        Empty dict if no joined data or genre_avg is 0.
+    """
+    # Join profiles with commercial data
+    joined = [
+        (p, commercial_data[p["appid"]])
+        for p in profiles
+        if p.get("appid") in commercial_data and commercial_data[p["appid"]] is not None
+    ]
+    if not joined:
+        return {}
+
+    all_revenues = [rev for _, rev in joined]
+    genre_avg = _safe_mean(all_revenues)
+    genre_median = _safe_median(all_revenues)
+    if not genre_avg:
+        return {}
+
+    result: dict[str, list[dict]] = {}
+    for attr in _VISUAL_PRIMARY_ATTRS:
+        bucket_revs: dict[str, list[float]] = defaultdict(list)
+        for profile, revenue in joined:
+            val = profile.get(attr)
+            if val:
+                bucket_revs[val].append(revenue)
+
+        entries = []
+        for val, revenues in bucket_revs.items():
+            if len(revenues) < min_games:
+                continue
+            mean_rev = statistics.mean(revenues)
+            median_rev = statistics.median(revenues)
+            entries.append({
+                "value": val,
+                "mean_multiplier": round(mean_rev / genre_avg, 3),
+                "median_multiplier": round(median_rev / genre_median, 3) if genre_median else 0.0,
+                "game_count": len(revenues),
+                "avg_revenue": round(mean_rev),
+            })
+
+        entries.sort(key=lambda e: e["mean_multiplier"], reverse=True)
+        if entries:
+            result[attr] = entries
+
+    return result
