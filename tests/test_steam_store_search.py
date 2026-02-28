@@ -205,7 +205,7 @@ class TestScoreRankCoercion:
     @pytest.mark.asyncio
     async def test_engagement_data_handles_int_score_rank(self, mock_http):
         """get_engagement_data should handle int score_rank from SteamSpy."""
-        mock_http.get_with_metadata.return_value = (
+        mock_http.get_with_metadata_stale.return_value = (
             {
                 "appid": 12345,
                 "name": "Test Game",
@@ -227,6 +227,7 @@ class TestScoreRankCoercion:
             },
             datetime.now(timezone.utc),
             0,
+            False,
         )
         client = SteamSpyClient(mock_http)
         result = await client.get_engagement_data(12345)

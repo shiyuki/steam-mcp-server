@@ -1530,6 +1530,10 @@ async def _enrich_with_gamalytic_bulk(
         for appid, tag_result in zip(tier1_5_appids, tier1_5_tag_results):
             if tag_result is not None and not isinstance(tag_result, Exception) and not isinstance(tag_result, APIErrorSchema):
                 tier1_5_tags[appid] = tag_result
+                # Propagate stale cache warning (deduplicated — one warning is enough)
+                stale_w = getattr(tag_result, "stale_cache_warning", None)
+                if stale_w and stale_w not in warnings:
+                    warnings.append(stale_w)
 
         tier1_5_count = 0
         for i, game in enumerate(enriched_games):
@@ -1639,6 +1643,10 @@ async def _enrich_with_gamalytic_bulk(
             for appid, tag_result in zip(tier2_appids, tag_results):
                 if tag_result is not None and not isinstance(tag_result, Exception) and not isinstance(tag_result, APIErrorSchema):
                     tier2_tags[appid] = tag_result
+                    # Propagate stale cache warning (deduplicated — one warning is enough)
+                    stale_w = getattr(tag_result, "stale_cache_warning", None)
+                    if stale_w and stale_w not in warnings:
+                        warnings.append(stale_w)
 
             # Deep-merge Tier 2 data over Tier 1 for each qualifying game
             tier2_count = 0
@@ -1983,6 +1991,10 @@ async def _analyze_market_single_impl(
                     and not isinstance(result, APIError)
                     and hasattr(result, "tags") and result.tags):
                     tag_lookup[g["appid"]] = dict(result.tags)
+                    # Propagate stale cache warning (deduplicated — one warning is enough)
+                    stale_w = getattr(result, "stale_cache_warning", None)
+                    if stale_w and stale_w not in enrich_warnings:
+                        enrich_warnings.append(stale_w)
             if tag_lookup:
                 for i, game in enumerate(enriched_games):
                     appid = game.get("appid")

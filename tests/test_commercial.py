@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch, call
 
 from src.config import Config
-from src.schemas import CommercialData, APIError
+from src.schemas import CommercialData, APIError, EngagementData
 from src.steam_api import GamalyticClient
 
 
@@ -2334,3 +2334,266 @@ class TestPhase13Migration:
         assert result.playtime_median is None
         assert result.reviews_steam is None
         assert result.ea_exit_date is None
+
+
+# ---------------------------------------------------------------------------
+# SteamSpy Outage Resilience Tests
+# ---------------------------------------------------------------------------
+
+class TestSteamSpyOutageResilience:
+    """Verify system behavior when SteamSpy is fully or partially unreachable.
+
+    After Phase 13-05, SteamSpy tag weights use stale-while-revalidate caching
+    (7-day fresh / 14-day stale window). These tests verify:
+    - Gamalytic success path never needs SteamSpy
+    - Stale cache is served with a warning when SteamSpy is unreachable
+    - Market tools continue returning results when SteamSpy is completely offline
+    - fetch_engagement returns an error when SteamSpy is unreachable (SteamSpy-only tool)
+    """
+
+    @pytest.mark.asyncio
+    async def test_steamspy_outage_fetch_commercial_still_works(self):
+        """fetch_commercial works when SteamSpy is unreachable — Gamalytic success path."""
+        mock_http = AsyncMock()
+        gamalytic_data = {
+            "steamId": "646570",
+            "name": "Slay the Spire",
+            "revenue": 50000000,
+            "reviews": 82000,
+            "reviewScore": 98,
+            "price": 24.99,
+            "copies": 2000000,
+        }
+        # Only Gamalytic is called on the success path (SteamSpy triangulation removed in 13-04)
+        mock_http.get_with_metadata.return_value = (gamalytic_data, datetime.now(timezone.utc), 0)
+
+        client = GamalyticClient(mock_http)
+        result = await client.get_commercial_data(646570)
+
+        assert isinstance(result, CommercialData)
+        assert result.source == "gamalytic"
+        assert result.confidence == "high"
+        # Verify SteamSpy was NOT called — only Gamalytic endpoint
+        gamalytic_calls = [
+            c for c in mock_http.get_with_metadata.call_args_list
+            if "gamalytic" in str(c)
+        ]
+        steamspy_calls = [
+            c for c in mock_http.get_with_metadata.call_args_list
+            if "steamspy.com" in str(c)
+        ]
+        assert len(gamalytic_calls) >= 1, "Expected at least one Gamalytic call"
+        assert len(steamspy_calls) == 0, "SteamSpy should not be called on Gamalytic success path"
+
+    @pytest.mark.asyncio
+    async def test_steamspy_outage_analyze_market_with_stale_cache(self):
+        """Stale cache is served with warning when SteamSpy is unreachable during revalidation."""
+        from src.steam_api import SteamSpyClient
+
+        mock_http = AsyncMock()
+        # get_with_metadata_stale returns stale data (is_stale=True)
+        engagement_data = {
+            "appid": 646570,
+            "name": "Slay the Spire",
+            "owners": "2,000,000 .. 5,000,000",
+            "ccu": 1500,
+            "positive": 82000,
+            "negative": 1500,
+            "average_forever": 4212,
+            "average_2weeks": 420,
+            "median_forever": 2520,
+            "median_2weeks": 180,
+            "price": "2499",
+            "tags": {"Roguelike": 500, "Card Game": 450},
+        }
+        mock_http.get_with_metadata_stale.return_value = (
+            engagement_data,
+            datetime.now(timezone.utc),
+            900000,  # 10+ days old — stale
+            True,    # is_stale=True
+        )
+
+        client = SteamSpyClient(mock_http)
+        result = await client.get_engagement_data(646570)
+
+        assert isinstance(result, EngagementData)
+        # Stale data is returned (not an error)
+        assert result.appid == 646570
+        assert result.tags == {"Roguelike": 500, "Card Game": 450}
+        # Stale warning is set
+        assert result.stale_cache_warning is not None
+        assert "stale cache" in result.stale_cache_warning.lower()
+
+    @pytest.mark.asyncio
+    async def test_steamspy_outage_analyze_market_no_cache(self):
+        """Market analysis returns non-error results when SteamSpy completely unreachable with no cache.
+
+        When SteamSpy is down and no cache exists, analyze_market_single falls back
+        to Steam Store search, then enriches via Gamalytic. SteamSpy tag weight fetches
+        (Tier 1.5, Tier 2) silently fail but don't break the result.
+        """
+        from src.market_tools import _enrich_with_gamalytic_bulk
+
+        # Simulate a set of games from Steam Store fallback (no SteamSpy data)
+        games = [
+            {"appid": i, "name": f"Game {i}", "owners": i * 10000,
+             "revenue": i * 100000, "price": 14.99, "tags": {}}
+            for i in range(1, 31)
+        ]
+
+        # Gamalytic returns revenue for all games (steamId as int to match real normalization)
+        mock_gamalytic = AsyncMock()
+        mock_gamalytic.list_games_by_tag.return_value = (
+            [{"steamId": g["appid"], "name": g["name"], "revenue": g["revenue"]}
+             for g in games],
+            {"is_partial": False, "pages_fetched": 1, "total_pages": 1,
+             "total_expected": 30, "error": None}
+        )
+
+        # SteamSpy completely unreachable — all tag weight calls return APIError
+        mock_steamspy = AsyncMock()
+        mock_steamspy.get_engagement_data.return_value = APIError(
+            error_code=503,
+            error_type="api_error",
+            message="SteamSpy unreachable",
+        )
+
+        enriched_games, warnings, meta = await _enrich_with_gamalytic_bulk(
+            games, mock_gamalytic, steamspy=mock_steamspy, tags=["Roguelike"]
+        )
+
+        # Results are returned even when SteamSpy is completely down
+        assert len(enriched_games) > 0
+        # No staleness warning (SteamSpy returned error, not stale data)
+        stale_warnings = [w for w in warnings if "stale cache" in w.lower()]
+        assert len(stale_warnings) == 0
+
+    @pytest.mark.asyncio
+    async def test_steamspy_outage_fetch_engagement_returns_error(self):
+        """fetch_engagement returns APIError when SteamSpy is unreachable.
+
+        fetch_engagement is a SteamSpy-only tool — it has no fallback.
+        When SteamSpy is down and no stale cache exists, an error is expected.
+        """
+        from src.steam_api import SteamSpyClient
+
+        mock_http = AsyncMock()
+        request = httpx.Request("GET", "https://steamspy.com/api.php")
+        response = httpx.Response(503, request=request)
+        mock_http.get_with_metadata_stale.side_effect = httpx.HTTPStatusError(
+            "Service Unavailable", request=request, response=response
+        )
+
+        client = SteamSpyClient(mock_http)
+        result = await client.get_engagement_data(646570)
+
+        assert isinstance(result, APIError)
+        assert result.error_code == 503
+        assert result.error_type == "api_error"
+
+    @pytest.mark.asyncio
+    async def test_stale_cache_warning_propagated_to_market_result(self):
+        """Stale cache warning from EngagementData propagates to analyze_market warnings list."""
+        from src.market_tools import _enrich_with_gamalytic_bulk
+
+        # 30 games with no tags (they will need Tier 1.5/2 SteamSpy tag fetches)
+        games = [
+            {"appid": i, "name": f"Game {i}", "owners": i * 10000,
+             "revenue": i * 100000, "price": 14.99, "tags": {}}
+            for i in range(1, 31)
+        ]
+
+        # Gamalytic returns revenue data (steamId as int to match real normalization)
+        mock_gamalytic = AsyncMock()
+        mock_gamalytic.list_games_by_tag.return_value = (
+            [{"steamId": g["appid"], "name": g["name"], "revenue": g["revenue"]}
+             for g in games],
+            {"is_partial": False, "pages_fetched": 1, "total_pages": 1,
+             "total_expected": 30, "error": None}
+        )
+
+        # SteamSpy returns stale data with warning
+        stale_engagement = EngagementData(
+            appid=1,
+            name="Game 1",
+            ccu=100,
+            owners_min=100000,
+            owners_max=200000,
+            owners_midpoint=150000.0,
+            average_forever=10.0,
+            average_2weeks=1.0,
+            median_forever=8.0,
+            median_2weeks=0.5,
+            positive=500,
+            negative=50,
+            total_reviews=550,
+            price=14.99,
+            fetched_at=datetime.now(timezone.utc),
+            tags={"Roguelike": 100},
+            stale_cache_warning="SteamSpy: tag weights served from stale cache (7+ days old)",
+        )
+
+        mock_steamspy = AsyncMock()
+        mock_steamspy.get_engagement_data.return_value = stale_engagement
+
+        enriched_games, warnings, meta = await _enrich_with_gamalytic_bulk(
+            games, mock_gamalytic, steamspy=mock_steamspy, tags=["Roguelike"]
+        )
+
+        # Staleness warning should appear in warnings (deduplicated — only once)
+        stale_warnings = [w for w in warnings if "stale cache" in w.lower()]
+        assert len(stale_warnings) == 1, (
+            f"Expected exactly 1 stale cache warning, got {len(stale_warnings)}: {stale_warnings}"
+        )
+        assert "SteamSpy" in stale_warnings[0]
+
+    @pytest.mark.asyncio
+    async def test_fresh_cache_no_warning(self):
+        """No stale cache warning when SteamSpy returns fresh data."""
+        from src.market_tools import _enrich_with_gamalytic_bulk
+
+        games = [
+            {"appid": i, "name": f"Game {i}", "owners": i * 10000,
+             "revenue": i * 100000, "price": 14.99, "tags": {}}
+            for i in range(1, 31)
+        ]
+
+        mock_gamalytic = AsyncMock()
+        mock_gamalytic.list_games_by_tag.return_value = (
+            [{"steamId": g["appid"], "name": g["name"], "revenue": g["revenue"]}
+             for g in games],
+            {"is_partial": False, "pages_fetched": 1, "total_pages": 1,
+             "total_expected": 30, "error": None}
+        )
+
+        # SteamSpy returns fresh data — no stale_cache_warning
+        fresh_engagement = EngagementData(
+            appid=1,
+            name="Game 1",
+            ccu=100,
+            owners_min=100000,
+            owners_max=200000,
+            owners_midpoint=150000.0,
+            average_forever=10.0,
+            average_2weeks=1.0,
+            median_forever=8.0,
+            median_2weeks=0.5,
+            positive=500,
+            negative=50,
+            total_reviews=550,
+            price=14.99,
+            fetched_at=datetime.now(timezone.utc),
+            tags={"Roguelike": 100},
+            stale_cache_warning=None,  # Fresh — no warning
+        )
+
+        mock_steamspy = AsyncMock()
+        mock_steamspy.get_engagement_data.return_value = fresh_engagement
+
+        enriched_games, warnings, meta = await _enrich_with_gamalytic_bulk(
+            games, mock_gamalytic, steamspy=mock_steamspy, tags=["Roguelike"]
+        )
+
+        # No stale cache warning in results
+        stale_warnings = [w for w in warnings if "stale cache" in w.lower()]
+        assert len(stale_warnings) == 0
