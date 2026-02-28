@@ -223,6 +223,10 @@ def _ms_to_iso(ms_ts) -> str | None:
     return datetime.fromtimestamp(ms_ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
+STEAMSPY_TAG_FRESH_TTL = 604800   # 7 days — tag weights are stable; revalidate weekly
+STEAMSPY_TAG_STALE_TTL = 1209600  # 14 days — serve stale if SteamSpy unreachable
+
+
 class SteamSpyClient:
     """Client for SteamSpy API (tag-based game search)."""
 
@@ -362,11 +366,13 @@ class SteamSpyClient:
             EngagementData with CCU, owners, playtime, reviews, tags, and derived metrics, or APIError on failure
         """
         try:
-            # Use get_with_metadata for freshness tracking (1 hour cache TTL)
-            data, fetched_at, cache_age = await self.http.get_with_metadata(
+            # Use stale-while-revalidate: fresh for 7 days, stale-but-usable for 14 days.
+            # When SteamSpy is unreachable and cache is stale, returns stale data with is_stale=True.
+            data, fetched_at, cache_age, is_stale = await self.http.get_with_metadata_stale(
                 self.BASE_URL,
                 params={"request": "appdetails", "appid": str(appid)},
-                cache_ttl=3600
+                cache_ttl=STEAMSPY_TAG_FRESH_TTL,
+                stale_ttl=STEAMSPY_TAG_STALE_TTL,
             )
 
             # Parse owner range: "20,000 .. 50,000" -> owners_min, owners_max, owners_midpoint
@@ -440,7 +446,7 @@ class SteamSpyClient:
             else:
                 reviews_quality = "available"
 
-            return EngagementData(
+            engagement = EngagementData(
                 appid=appid,
                 name=data.get("name", ""),
                 developer=data.get("developer", ""),
@@ -470,8 +476,13 @@ class SteamSpyClient:
                 playtime_quality=playtime_quality,
                 reviews_quality=reviews_quality,
                 fetched_at=fetched_at,
-                cache_age_seconds=cache_age
+                cache_age_seconds=cache_age,
             )
+            if is_stale:
+                engagement.stale_cache_warning = (
+                    "SteamSpy: tag weights served from stale cache (7+ days old)"
+                )
+            return engagement
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
             error_type = "rate_limit" if status == 429 else "api_error"

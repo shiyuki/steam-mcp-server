@@ -12,7 +12,7 @@ from src.steam_api import SteamSpyClient, normalize_tag
 
 @pytest.fixture
 def mock_http():
-    """Mock CachedAPIClient with get_with_metadata method."""
+    """Mock CachedAPIClient with get_with_metadata and get_with_metadata_stale methods."""
     client = AsyncMock()
     return client
 
@@ -46,10 +46,11 @@ class TestGetEngagementData:
                 "Strategy": 400
             }
         }
-        mock_http.get_with_metadata.return_value = (
+        mock_http.get_with_metadata_stale.return_value = (
             steamspy_data,
             datetime.now(timezone.utc),
-            0
+            0,
+            False,
         )
 
         client = SteamSpyClient(mock_http)
@@ -96,10 +97,11 @@ class TestGetEngagementData:
             "median_2weeks": 30,
             "price": "999"
         }
-        mock_http.get_with_metadata.return_value = (
+        mock_http.get_with_metadata_stale.return_value = (
             steamspy_data,
             datetime.now(timezone.utc),
-            0
+            0,
+            False,
         )
 
         client = SteamSpyClient(mock_http)
@@ -126,10 +128,11 @@ class TestGetEngagementData:
             "median_2weeks": 20,
             "price": "499"
         }
-        mock_http.get_with_metadata.return_value = (
+        mock_http.get_with_metadata_stale.return_value = (
             steamspy_data,
             datetime.now(timezone.utc),
-            0
+            0,
+            False,
         )
 
         client = SteamSpyClient(mock_http)
@@ -156,10 +159,11 @@ class TestGetEngagementData:
             "median_2weeks": 10,
             "price": "0"
         }
-        mock_http.get_with_metadata.return_value = (
+        mock_http.get_with_metadata_stale.return_value = (
             steamspy_data,
             datetime.now(timezone.utc),
-            0
+            0,
+            False,
         )
 
         client = SteamSpyClient(mock_http)
@@ -186,10 +190,11 @@ class TestGetEngagementData:
             "median_2weeks": 30,
             "price": "1999"
         }
-        mock_http.get_with_metadata.return_value = (
+        mock_http.get_with_metadata_stale.return_value = (
             steamspy_data,
             datetime.now(timezone.utc),
-            0
+            0,
+            False,
         )
 
         client = SteamSpyClient(mock_http)
@@ -215,10 +220,11 @@ class TestGetEngagementData:
             "median_2weeks": 0,
             "price": "0"
         }
-        mock_http.get_with_metadata.return_value = (
+        mock_http.get_with_metadata_stale.return_value = (
             steamspy_data,
             datetime.now(timezone.utc),
-            0
+            0,
+            False,
         )
 
         client = SteamSpyClient(mock_http)
@@ -243,10 +249,11 @@ class TestGetEngagementData:
             "median_2weeks": 30,
             "price": "1999"
         }
-        mock_http.get_with_metadata.return_value = (
+        mock_http.get_with_metadata_stale.return_value = (
             steamspy_data,
             datetime.now(timezone.utc),
-            0
+            0,
+            False,
         )
 
         client = SteamSpyClient(mock_http)
@@ -272,10 +279,11 @@ class TestGetEngagementData:
             "median_2weeks": 10,
             "price": "999"
         }
-        mock_http.get_with_metadata.return_value = (
+        mock_http.get_with_metadata_stale.return_value = (
             steamspy_data,
             datetime.now(timezone.utc),
-            0
+            0,
+            False,
         )
 
         client = SteamSpyClient(mock_http)
@@ -301,10 +309,11 @@ class TestGetEngagementData:
             "median_2weeks": 60,
             "price": "1999"
         }
-        mock_http.get_with_metadata.return_value = (
+        mock_http.get_with_metadata_stale.return_value = (
             steamspy_data,
             datetime.now(timezone.utc),
-            0
+            0,
+            False,
         )
 
         client = SteamSpyClient(mock_http)
@@ -330,10 +339,11 @@ class TestGetEngagementData:
             "median_2weeks": 30,
             "price": "1999"
         }
-        mock_http.get_with_metadata.return_value = (
+        mock_http.get_with_metadata_stale.return_value = (
             steamspy_data,
             datetime.now(timezone.utc),
-            0
+            0,
+            False,
         )
 
         client = SteamSpyClient(mock_http)
@@ -359,10 +369,11 @@ class TestGetEngagementData:
             "median_2weeks": 30,
             "price": "999"
         }
-        mock_http.get_with_metadata.return_value = (
+        mock_http.get_with_metadata_stale.return_value = (
             steamspy_data,
             datetime.now(timezone.utc),
-            0
+            0,
+            False,
         )
 
         client = SteamSpyClient(mock_http)
@@ -387,10 +398,11 @@ class TestGetEngagementData:
             "median_2weeks": 30,
             "price": "1999"
         }
-        mock_http.get_with_metadata.return_value = (
+        mock_http.get_with_metadata_stale.return_value = (
             steamspy_data,
             datetime.now(timezone.utc),
-            0
+            0,
+            False,
         )
 
         client = SteamSpyClient(mock_http)
@@ -418,10 +430,11 @@ class TestGetEngagementData:
             "median_2weeks": 0,
             "price": "0"
         }
-        mock_http.get_with_metadata.return_value = (
+        mock_http.get_with_metadata_stale.return_value = (
             steamspy_data,
             datetime.now(timezone.utc),
-            0
+            0,
+            False,
         )
 
         client = SteamSpyClient(mock_http)
@@ -449,10 +462,11 @@ class TestGetEngagementData:
             "median_2weeks": 180,
             "price": "0"
         }
-        mock_http.get_with_metadata.return_value = (
+        mock_http.get_with_metadata_stale.return_value = (
             steamspy_data,
             datetime.now(timezone.utc),
-            0
+            0,
+            False,
         )
 
         client = SteamSpyClient(mock_http)
@@ -467,7 +481,7 @@ class TestGetEngagementData:
         """Test HTTP error returns APIError with correct type."""
         request = httpx.Request("GET", "https://steamspy.com/api.php")
         response = httpx.Response(429, request=request)
-        mock_http.get_with_metadata.side_effect = httpx.HTTPStatusError(
+        mock_http.get_with_metadata_stale.side_effect = httpx.HTTPStatusError(
             "Rate limited",
             request=request,
             response=response
@@ -483,7 +497,7 @@ class TestGetEngagementData:
     @pytest.mark.asyncio
     async def test_connection_error_returns_api_error(self, mock_http):
         """Test connection error returns APIError."""
-        mock_http.get_with_metadata.side_effect = ConnectionError("DNS resolution failed")
+        mock_http.get_with_metadata_stale.side_effect = ConnectionError("DNS resolution failed")
 
         client = SteamSpyClient(mock_http)
         result = await client.get_engagement_data(12345)
@@ -500,10 +514,11 @@ class TestGetEngagementData:
             "name": "Minimal Data"
             # Missing: tags, genre, languages, developer, publisher, score_rank
         }
-        mock_http.get_with_metadata.return_value = (
+        mock_http.get_with_metadata_stale.return_value = (
             steamspy_data,
             datetime.now(timezone.utc),
-            0
+            0,
+            False,
         )
 
         client = SteamSpyClient(mock_http)
@@ -762,14 +777,14 @@ class TestAggregateEngagement:
         }
 
         # First call succeeds, second fails, third succeeds
-        mock_http.get_with_metadata.side_effect = [
-            (successful_data_1, datetime.now(timezone.utc), 0),
+        mock_http.get_with_metadata_stale.side_effect = [
+            (successful_data_1, datetime.now(timezone.utc), 0, False),
             httpx.HTTPStatusError(
                 "Not found",
                 request=httpx.Request("GET", "https://steamspy.com/api.php"),
                 response=httpx.Response(404, request=httpx.Request("GET", "https://steamspy.com/api.php"))
             ),
-            (successful_data_2, datetime.now(timezone.utc), 0)
+            (successful_data_2, datetime.now(timezone.utc), 0, False),
         ]
 
         client = SteamSpyClient(mock_http)
@@ -790,9 +805,9 @@ class TestAggregateEngagement:
         """Test AppID list with all failures returns error."""
         request = httpx.Request("GET", "https://steamspy.com/api.php")
         response = httpx.Response(404, request=request)
-        mock_http.get_with_metadata.side_effect = [
+        mock_http.get_with_metadata_stale.side_effect = [
             httpx.HTTPStatusError("Not found", request=request, response=response),
-            httpx.HTTPStatusError("Not found", request=request, response=response)
+            httpx.HTTPStatusError("Not found", request=request, response=response),
         ]
 
         client = SteamSpyClient(mock_http)
@@ -1804,8 +1819,8 @@ class TestAggregateSingleGame:
             "median_2weeks": 180,
             "price": "2499",
         }
-        mock_http.get_with_metadata.return_value = (
-            game_data, datetime.now(timezone.utc), 0
+        mock_http.get_with_metadata_stale.return_value = (
+            game_data, datetime.now(timezone.utc), 0, False,
         )
 
         client = SteamSpyClient(mock_http)
@@ -1856,8 +1871,8 @@ class TestAggregateAppIdDuplicates:
             "median_2weeks": 180,
             "price": "2499",
         }
-        mock_http.get_with_metadata.return_value = (
-            game_data, datetime.now(timezone.utc), 0
+        mock_http.get_with_metadata_stale.return_value = (
+            game_data, datetime.now(timezone.utc), 0, False,
         )
 
         client = SteamSpyClient(mock_http)

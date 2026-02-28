@@ -236,6 +236,9 @@ class EngagementData(CachedResponse):
     playtime_quality: str | None = None
     reviews_quality: str | None = None
 
+    # Phase 13: Staleness tracking for stale-while-revalidate cache
+    stale_cache_warning: str | None = None  # Set when tag weights served from stale cache (7+ days old)
+
 
 class MetricStats(BaseModel):
     """Statistical distribution for a single metric across multiple games."""
