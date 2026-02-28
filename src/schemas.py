@@ -691,6 +691,8 @@ class GamalyticHistoryEntry(BaseModel):
     avg_playtime: float | None = None
     sales: int | None = None
     revenue: float | None = None
+    # Phase 13: wishlists present in ~47% of entries (mid-2024+ only; absent = None)
+    wishlists: int | None = None
 
 
 class CountryDataEntry(BaseModel):
@@ -707,6 +709,12 @@ class CompetitorEntry(BaseModel):
     revenue: float | None = None
     followers: int | None = None
     score: float | None = None
+    # Phase 13: Extended competitor sub-fields from Pro API
+    # Note: followers and score are NOT present in API responses; kept above for backward compat
+    release_date: str | None = None  # ISO date (converted from ms timestamp)
+    price: float | None = None  # Current price in USD (API returns int or float)
+    genres: list[str] = Field(default_factory=list)  # Steam genre tags
+    copies_sold: int | None = None  # Gamalytic Pro copies sold estimate
 
 
 class EstimateModelEntry(BaseModel):
