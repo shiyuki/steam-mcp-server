@@ -1,5 +1,6 @@
 """Configuration management for Steam MCP Server."""
 
+import logging
 import os
 from dotenv import load_dotenv
 
@@ -16,6 +17,7 @@ class Config:
     RATE_LIMIT_DELAY: float = float(os.getenv("RATE_LIMIT_DELAY", "1.5"))
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     GAMALYTIC_API_KEY: str = os.getenv("GAMALYTIC_API_KEY", "")
+    REPORTS_DIR: str = os.getenv("REPORTS_DIR", "")
 
     @classmethod
     def validate(cls) -> bool:
@@ -34,6 +36,11 @@ class Config:
             )
         if cls.RATE_LIMIT_DELAY < 1.0:
             raise ValueError("RATE_LIMIT_DELAY must be >= 1.0 seconds")
+        if not cls.REPORTS_DIR:
+            logging.getLogger(__name__).warning(
+                "REPORTS_DIR is not set. Report generation will not work. "
+                "Set REPORTS_DIR in your environment to enable reports."
+            )
         return True
 
 
