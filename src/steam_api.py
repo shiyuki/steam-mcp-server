@@ -1354,7 +1354,8 @@ class GamalyticClient:
 
             gamalytic_is_early_access = None
             try:
-                raw = data.get("isEarlyAccess")
+                # NOTE: API field is "earlyAccess" (not "isEarlyAccess") — confirmed by Pro API audit
+                raw = data.get("earlyAccess")
                 if raw is not None:
                     gamalytic_is_early_access = bool(raw)
             except Exception:
@@ -1373,6 +1374,61 @@ class GamalyticClient:
                 raw = data.get("releaseDate")
                 if raw is not None:
                     release_date_iso = _ms_to_iso(raw)
+            except Exception:
+                pass
+
+            # --- Phase 13: New Pro API fields ---
+
+            wishlists = None
+            try:
+                raw = data.get("wishlists")
+                if raw is not None:
+                    val = int(raw)
+                    wishlists = val if val >= 0 else None
+            except Exception:
+                pass
+
+            avg_playtime = None
+            try:
+                raw = data.get("avgPlaytime")
+                if raw is not None:
+                    avg_playtime = float(raw)  # Hours — confirmed by Pro API audit
+            except Exception:
+                pass
+
+            playtime_distribution: dict[str, float] = {}
+            playtime_median = None
+            try:
+                raw_ptd = data.get("playtimeData")
+                if isinstance(raw_ptd, dict):
+                    raw_dist = raw_ptd.get("distribution")
+                    if isinstance(raw_dist, dict):
+                        playtime_distribution = {
+                            str(k): float(v)
+                            for k, v in raw_dist.items()
+                            if v is not None
+                        }
+                    raw_median = raw_ptd.get("median")
+                    if raw_median is not None:
+                        playtime_median = float(raw_median)
+            except Exception:
+                playtime_distribution = {}
+                playtime_median = None
+
+            reviews_steam = None
+            try:
+                raw = data.get("reviewsSteam")
+                if raw is not None:
+                    val = int(raw)
+                    reviews_steam = val if val >= 0 else None
+            except Exception:
+                pass
+
+            ea_exit_date = None
+            try:
+                raw = data.get("earlyAccessExitDate")
+                if raw is not None:
+                    ea_exit_date = _ms_to_iso(raw)
             except Exception:
                 pass
 
@@ -1398,6 +1454,8 @@ class GamalyticClient:
                         avg_playtime=entry.get("avgPlaytime"),
                         sales=entry.get("sales"),
                         revenue=entry.get("revenue"),
+                        # Phase 13: wishlists present in ~47% of entries (mid-2024+); absent = None
+                        wishlists=entry.get("wishlists"),
                     ))
             except Exception:
                 history_entries = []
@@ -1422,42 +1480,52 @@ class GamalyticClient:
                                 share_pct=float(share_raw) if share_raw is not None else None,
                             ))
                 country_entries.sort(key=lambda x: x.share_pct or 0, reverse=True)
-                country_entries = country_entries[:10]
+                country_entries = country_entries[:50]  # Phase 13: lifted from 10 to 50
             except Exception:
                 country_entries = []
 
-            # --- Audience overlap (up to 10 entries) ---
+            # --- Audience overlap (up to 500 entries; Phase 13: lifted from 10) ---
             overlap_entries = []
             try:
                 raw_overlap = data.get("audienceOverlap", [])
                 if isinstance(raw_overlap, list):
-                    for item in raw_overlap[:10]:
+                    for item in raw_overlap[:500]:
                         if isinstance(item, dict):
+                            raw_appid = item.get("steamId") or item.get("appId")
                             overlap_entries.append(CompetitorEntry(
-                                appid=item.get("appId") or item.get("steamId"),
+                                appid=int(raw_appid) if raw_appid is not None else None,
                                 name=str(item.get("name", "")),
                                 overlap_pct=item.get("link") or item.get("overlap") or item.get("overlapPercent"),
                                 revenue=item.get("revenue"),
-                                followers=item.get("followers"),
-                                score=item.get("score"),
+                                # Phase 13: Extended sub-fields from Pro API
+                                # followers/score not present in API responses (always None)
+                                release_date=_ms_to_iso(item.get("releaseDate")),
+                                price=float(item["price"]) if item.get("price") is not None else None,
+                                genres=item.get("genres") if isinstance(item.get("genres"), list) else [],
+                                copies_sold=item.get("copiesSold"),
                             ))
             except Exception:
                 overlap_entries = []
 
-            # --- Also played (up to 10 entries) ---
+            # --- Also played (up to 500 entries; Phase 13: lifted from 10) ---
             also_played_entries = []
             try:
                 raw_also = data.get("alsoPlayed", [])
                 if isinstance(raw_also, list):
-                    for item in raw_also[:10]:
+                    for item in raw_also[:500]:
                         if isinstance(item, dict):
+                            raw_appid = item.get("steamId") or item.get("appId")
                             also_played_entries.append(CompetitorEntry(
-                                appid=item.get("appId") or item.get("steamId"),
+                                appid=int(raw_appid) if raw_appid is not None else None,
                                 name=str(item.get("name", "")),
                                 overlap_pct=item.get("link") or item.get("overlap") or item.get("overlapPercent"),
                                 revenue=item.get("revenue"),
-                                followers=item.get("followers"),
-                                score=item.get("score"),
+                                # Phase 13: Extended sub-fields from Pro API
+                                # followers/score not present in API responses (always None)
+                                release_date=_ms_to_iso(item.get("releaseDate")),
+                                price=float(item["price"]) if item.get("price") is not None else None,
+                                genres=item.get("genres") if isinstance(item.get("genres"), list) else [],
+                                copies_sold=item.get("copiesSold"),
                             ))
             except Exception:
                 also_played_entries = []
@@ -1566,14 +1634,19 @@ class GamalyticClient:
                 player_count_note=player_count_note,
                 # Phase 10: Explicit data quality (success path)
                 data_quality="gamalytic",
+                # Phase 13: New Pro API fields
+                wishlists=wishlists,
+                avg_playtime=avg_playtime,
+                playtime_distribution=playtime_distribution,
+                playtime_median=playtime_median,
+                reviews_steam=reviews_steam,
+                ea_exit_date=ea_exit_date,
+                # playtime_source and ownership_source remain None (Gamalytic is default/trusted source)
             )
 
-            # Triangulation: Compare with SteamSpy owner data
-            try:
-                await self._add_triangulation_warning(commercial_data, appid, revenue)
-            except Exception as e:
-                logger.error(f"Triangulation check failed for AppID {appid}: {e}")
-                # Triangulation is informational only - continue without warning
+            # Phase 13: Triangulation removed — Gamalytic is trusted primary source
+            # _add_triangulation_warning method and schema fields retained for backward compat
+            # (triangulation_warning, steamspy_implied_revenue, gamalytic_revenue still on schema)
 
             return commercial_data
 
@@ -1676,6 +1749,9 @@ class GamalyticClient:
                 current_player_count=current_player_count,
                 player_count_source=player_count_source,
                 player_count_note=player_count_note,
+                # Phase 13: Tag fallback path as SteamSpy-sourced
+                playtime_source="steamspy",
+                ownership_source="steamspy",
             )
 
         except httpx.HTTPStatusError as e:
