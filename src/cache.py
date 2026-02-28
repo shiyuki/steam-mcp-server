@@ -94,6 +94,90 @@ class TTLCache:
             self._cache[key] = entry
             return entry
 
+    async def get_or_fetch_stale(
+        self,
+        key: str,
+        fetch_func: Callable[[], Awaitable[Any]],
+        ttl: float | None = None,
+        stale_ttl: float | None = None,
+    ) -> tuple["CacheEntry", bool]:
+        """Get cached value with stale-while-revalidate semantics.
+
+        Three zones based on entry age:
+        - age < ttl: fresh cache hit — returns (entry, False)
+        - ttl <= age < stale_ttl: attempt fresh fetch; on failure serve stale — returns (entry, True)
+        - age >= stale_ttl: fetch fresh; on failure raise — no stale to serve
+        - no cached entry: fetch fresh; on failure raise
+
+        When stale_ttl is None, defaults to same as ttl — identical to get_or_fetch.
+
+        Args:
+            key: Cache key
+            fetch_func: Async function to call on cache miss / revalidation
+            ttl: Fresh TTL in seconds (uses default_ttl if None)
+            stale_ttl: Stale window TTL in seconds. Must be >= ttl. Defaults to ttl (no stale window).
+
+        Returns:
+            Tuple of (CacheEntry, is_stale). is_stale is True when serving stale data
+            because a revalidation fetch failed.
+
+        Raises:
+            Exception: Propagates fetch_func exception when no stale entry is available.
+        """
+        use_ttl = ttl if ttl is not None else self._default_ttl
+        use_stale_ttl = stale_ttl if stale_ttl is not None else use_ttl
+
+        # Get or create per-key lock
+        async with self._locks_lock:
+            if key not in self._locks:
+                self._locks[key] = asyncio.Lock()
+            lock = self._locks[key]
+
+        # Per-key lock prevents stampede
+        async with lock:
+            now = time.monotonic()
+            existing_entry: CacheEntry | None = self._cache.get(key)
+
+            if existing_entry is not None:
+                age = now - existing_entry.created_at
+
+                if age < use_ttl:
+                    # Fresh cache hit
+                    if hasattr(existing_entry.value, 'cache_age_seconds'):
+                        existing_entry.value.cache_age_seconds = round(age)
+                    return existing_entry, False
+
+                if age < use_stale_ttl:
+                    # In stale window — try to revalidate, fall back to stale on failure
+                    try:
+                        value = await fetch_func()
+                        entry = CacheEntry(
+                            value=value,
+                            created_at=time.monotonic(),
+                            fetched_at=datetime.now(timezone.utc),
+                            ttl=use_ttl
+                        )
+                        self._cache[key] = entry
+                        return entry, False
+                    except Exception:
+                        # Serve stale — caller gets is_stale=True
+                        if hasattr(existing_entry.value, 'cache_age_seconds'):
+                            existing_entry.value.cache_age_seconds = round(age)
+                        return existing_entry, True
+
+                # Past stale window — fall through to unconditional fetch
+
+            # No entry or past stale TTL — fetch fresh; propagate exceptions
+            value = await fetch_func()
+            entry = CacheEntry(
+                value=value,
+                created_at=time.monotonic(),
+                fetched_at=datetime.now(timezone.utc),
+                ttl=use_ttl
+            )
+            self._cache[key] = entry
+            return entry, False
+
     def get(self, key: str) -> CacheEntry | None:
         """Get cached entry without fetching.
 
