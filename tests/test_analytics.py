@@ -14,6 +14,7 @@ from src.analytics import (
     compute_publisher_analysis, compute_release_timing, compute_sub_genres,
     compute_competitive_density,
     compute_visual_multipliers,
+    compute_dlc_analytics, compute_launch_metrics, compute_update_impact,
     # Constants
     PRICE_BRACKETS, SCORE_RANGES, REVENUE_TIERS, STANDARD_BIASES,
     KNOWN_PUBLISHERS,
@@ -1109,3 +1110,573 @@ class TestComputeVisualMultipliers:
             for entry in attr_entries:
                 assert "avg_revenue" in entry
                 assert isinstance(entry["avg_revenue"], (int, float))
+
+
+# ---------------------------------------------------------------------------
+# Phase 15: Strategy Data Sources compute function tests
+# ---------------------------------------------------------------------------
+
+# ---- helpers ---------------------------------------------------------------
+
+def _make_dlc(name="Expansion Pack", price=9.99, release_date="2020-06-01"):
+    return {"name": name, "price": price, "release_date": release_date}
+
+
+def _make_history_entry(timestamp, revenue, followers=100, sales=500):
+    """Create a history entry dict (fields match GamalyticHistoryEntry)."""
+    return {
+        "entry_type": "daily",
+        "timestamp": timestamp,
+        "revenue": revenue,
+        "followers": followers,
+        "sales": sales,
+    }
+
+
+def _make_news_activity(total=20, last_365=10, last_90=4, post_dates=None):
+    return {
+        "developer_posts_total": total,
+        "developer_posts_last_365d": last_365,
+        "developer_posts_last_90d": last_90,
+        "developer_post_dates": post_dates or [],
+    }
+
+
+# ============================================================================
+# TestComputeDLCAnalytics
+# ============================================================================
+
+class TestComputeDLCAnalytics:
+
+    def test_basic_dlc_analytics(self):
+        """3 games, 2 with DLC — verify penetration, count, and price."""
+        games = [
+            {
+                "appid": 1,
+                "gamalytic_dlc": [
+                    _make_dlc("Expansion", price=9.99),
+                    _make_dlc("Soundtrack", price=4.99, release_date="2020-09-01"),
+                ],
+            },
+            {
+                "appid": 2,
+                "gamalytic_dlc": [
+                    _make_dlc("DLC 1", price=14.99),
+                ],
+            },
+            {
+                "appid": 3,
+                "gamalytic_dlc": [],  # no DLC
+            },
+        ]
+        result = compute_dlc_analytics(games)
+        assert result is not None
+        assert result["total_games"] == 3
+        assert result["games_with_dlc"] == 2
+        assert result["dlc_penetration_pct"] == pytest.approx(66.7, abs=0.1)
+        assert result["avg_dlc_count"] == pytest.approx(1.5, abs=0.1)
+        assert result["dlc_revenue_available"] is False
+
+    def test_empty_games_list(self):
+        """Empty input returns None."""
+        assert compute_dlc_analytics([]) is None
+
+    def test_no_games_with_dlc(self):
+        """All games have empty DLC lists → penetration 0%."""
+        games = [
+            {"appid": 1, "gamalytic_dlc": []},
+            {"appid": 2, "gamalytic_dlc": []},
+        ]
+        result = compute_dlc_analytics(games)
+        assert result is not None
+        assert result["dlc_penetration_pct"] == 0.0
+        assert result["games_with_dlc"] == 0
+
+    def test_price_tiers(self):
+        """Verify binning at $5/$15/$30 boundaries."""
+        games = [
+            {
+                "appid": 1,
+                "gamalytic_dlc": [
+                    _make_dlc("Free DLC", price=0.0),
+                    _make_dlc("Cheap", price=2.99),       # under_5
+                    _make_dlc("Medium", price=9.99),      # 5_to_15
+                    _make_dlc("Premium", price=19.99),    # 15_to_30
+                    _make_dlc("Expensive", price=39.99),  # 30_plus
+                ],
+            }
+        ]
+        result = compute_dlc_analytics(games)
+        assert result is not None
+        tiers = result["price_tiers"]
+        assert tiers["free"] == 1
+        assert tiers["under_5"] == 1
+        assert tiers["5_to_15"] == 1
+        assert tiers["15_to_30"] == 1
+        assert tiers["30_plus"] == 1
+
+    def test_cadence_computation(self):
+        """3 DLC ~90 days apart → avg cadence ~90 days."""
+        games = [
+            {
+                "appid": 1,
+                "gamalytic_dlc": [
+                    _make_dlc("DLC 1", release_date="2020-01-01"),
+                    _make_dlc("DLC 2", release_date="2020-04-01"),  # 91 days
+                    _make_dlc("DLC 3", release_date="2020-07-01"),  # 91 days
+                ],
+            }
+        ]
+        result = compute_dlc_analytics(games)
+        assert result is not None
+        # 2020-01-01 to 2020-04-01 = 91 days, 2020-04-01 to 2020-07-01 = 91 days
+        assert result["avg_cadence_days"] == pytest.approx(91.0, abs=1.0)
+        assert result["median_cadence_days"] == pytest.approx(91.0, abs=1.0)
+
+    def test_single_dlc_no_cadence(self):
+        """Game with exactly 1 DLC has no cadence data (None)."""
+        games = [{"appid": 1, "gamalytic_dlc": [_make_dlc("Solo DLC")]}]
+        result = compute_dlc_analytics(games)
+        assert result is not None
+        assert result["avg_cadence_days"] is None
+        assert result["median_cadence_days"] is None
+
+    def test_soundtrack_detection(self):
+        """Case-insensitive 'Soundtrack' match; has_soundtrack_pct computed correctly."""
+        games = [
+            {"appid": 1, "gamalytic_dlc": [_make_dlc("SOUNDTRACK")], },      # match
+            {"appid": 2, "gamalytic_dlc": [_make_dlc("Original Soundtrack")]},  # match
+            {"appid": 3, "gamalytic_dlc": [_make_dlc("Character Pack")]},     # no match
+        ]
+        result = compute_dlc_analytics(games)
+        assert result is not None
+        # 2 of 3 games with DLC have soundtrack
+        assert result["has_soundtrack_pct"] == pytest.approx(66.7, abs=0.1)
+
+    def test_null_prices_handled(self):
+        """None prices are binned as free (not excluded)."""
+        games = [
+            {
+                "appid": 1,
+                "gamalytic_dlc": [
+                    {"name": "Free DLC", "price": None, "release_date": "2020-01-01"},
+                    {"name": "Paid", "price": 7.99, "release_date": "2020-02-01"},
+                ],
+            }
+        ]
+        result = compute_dlc_analytics(games)
+        assert result is not None
+        assert result["price_tiers"]["free"] == 1
+        assert result["price_tiers"]["5_to_15"] == 1
+        # avg_dlc_price only includes paid DLC (7.99)
+        assert result["avg_dlc_price"] == pytest.approx(7.99, abs=0.01)
+
+
+# ============================================================================
+# TestComputeLaunchMetrics
+# ============================================================================
+
+class TestComputeLaunchMetrics:
+
+    def _make_game_with_history(self, appid=1, release_date="2020-01-01",
+                                 revenues=None, followers_list=None,
+                                 is_ea=False, ea_exit_date=None, ea_date=None,
+                                 followers=500, copies_sold=5000):
+        """Build a game dict with a realistic history array."""
+        if revenues is None:
+            # Default: 1000/month cumulative for 6 months
+            revenues = [1000, 5000, 8000, 10000, 11000, 12000]
+        if followers_list is None:
+            followers_list = [100] * len(revenues)
+        timestamps = [
+            f"2020-{i+1:02d}-01" for i in range(len(revenues))
+        ]
+        history = [
+            _make_history_entry(ts, rev, fol)
+            for ts, rev, fol in zip(timestamps, revenues, followers_list)
+        ]
+        return {
+            "appid": appid,
+            "release_date": release_date,
+            "gamalytic_ea_date": ea_date,
+            "ea_exit_date": ea_exit_date,
+            "gamalytic_is_early_access": is_ea,
+            "followers": followers,
+            "copies_sold": copies_sold,
+            "history": history,
+        }
+
+    def test_basic_launch_velocity(self):
+        """Verify 30d and 90d percentages from cumulative history.
+
+        anchor = 2020-01-01.
+        30d cutoff = 2020-01-31 → entries <= Jan 31 → [Jan 1: 2000] → velocity = 2000/10000 = 20%
+        90d cutoff = 2020-03-31 → entries <= Mar 31 → [Jan 1: 2000, Feb 1: 5000] → velocity = 5000/10000 = 50%
+        Apr 1 entry (7000) is NOT included (90+1 = Apr 1 > Mar 31 cutoff).
+        """
+        game = {
+            "appid": 1,
+            "release_date": "2020-01-01",
+            "gamalytic_ea_date": None,
+            "ea_exit_date": None,
+            "gamalytic_is_early_access": False,
+            "followers": 1000,
+            "copies_sold": 2000,
+            "history": [
+                _make_history_entry("2020-01-01", 2000),
+                _make_history_entry("2020-02-01", 5000),   # 31 days — within 90d but not 30d window
+                _make_history_entry("2020-04-01", 7000),   # 91 days — outside 90d window (cutoff = Mar 31)
+                _make_history_entry("2020-12-01", 10000),  # lifetime
+            ],
+        }
+        result = compute_launch_metrics([game])
+        assert result is not None
+        # 30d window: entries with timestamp <= 2020-01-31 → [2020-01-01] → revenue=2000
+        # velocity_30d = 2000/10000 * 100 = 20.0
+        assert result["launch_velocity_30d"]["mean"] == pytest.approx(20.0, abs=0.5)
+        # 90d window (cutoff = 2020-03-31): entries <= Mar 31 → [Jan 1, Feb 1] → last revenue=5000
+        # velocity_90d = 5000/10000 * 100 = 50.0
+        assert result["launch_velocity_90d"]["mean"] == pytest.approx(50.0, abs=0.5)
+
+    def test_empty_games_list(self):
+        """Empty input returns None."""
+        assert compute_launch_metrics([]) is None
+
+    def test_no_history(self):
+        """Games with no history → games_with_history = 0."""
+        games = [
+            {"appid": 1, "release_date": "2020-01-01", "history": [],
+             "gamalytic_is_early_access": False, "ea_exit_date": None,
+             "gamalytic_ea_date": None, "followers": None, "copies_sold": None},
+        ]
+        result = compute_launch_metrics(games)
+        assert result is not None
+        assert result["games_with_history"] == 0
+        assert result["launch_velocity_30d"]["sample_size"] == 0
+
+    def test_ea_game_uses_exit_date(self):
+        """EA game uses ea_exit_date as velocity anchor, not release_date.
+
+        Design: If release_date (2019-01-01) were used as anchor, the 30d window
+        (cutoff 2019-01-31) would catch only the 2019-01-01 entry (rev=1000),
+        giving velocity = 1000/300_000 * 100 ≈ 0.33%.
+        With ea_exit_date (2020-06-01) as anchor, 30d window (cutoff 2020-07-01)
+        catches entries <= 2020-07-01 → last = 2020-07-01 with revenue=150_000.
+        velocity_30d = 150_000/300_000 * 100 = 50%.
+        The test asserts 50% to confirm ea_exit_date is used as anchor.
+        """
+        game = {
+            "appid": 1,
+            "release_date": "2019-01-01",    # EA launch — should NOT be anchor
+            "gamalytic_ea_date": "2019-01-01",
+            "ea_exit_date": "2020-06-01",    # Full launch — SHOULD be anchor
+            "gamalytic_is_early_access": True,
+            "followers": 2000,
+            "copies_sold": 5000,
+            "history": [
+                # During EA period
+                _make_history_entry("2019-01-01", 1_000),   # EA launch
+                _make_history_entry("2019-06-01", 50_000),  # mid-EA
+                # At full launch (anchor = 2020-06-01):
+                _make_history_entry("2020-06-01", 100_000),  # 0d from full launch anchor
+                _make_history_entry("2020-07-01", 150_000),  # 30d from anchor (cutoff = 2020-07-01, inclusive)
+                _make_history_entry("2021-06-01", 300_000),  # lifetime
+            ],
+        }
+        result = compute_launch_metrics([game])
+        assert result is not None
+        # 30d cutoff from 2020-06-01 = 2020-07-01; entries <= "2020-07-01" → last=150_000
+        # velocity_30d = 150_000/300_000 * 100 = 50.0
+        assert result["launch_velocity_30d"]["mean"] == pytest.approx(50.0, abs=1.0)
+        # Without ea_exit_date anchor (if wrongly using 2019-01-01):
+        # 30d window = 2019-01-31; only "2019-01-01" (1000) → velocity = 1000/300_000 = 0.3%
+        # We assert 50% (not 0.3%) to confirm correct anchor used
+        assert result["launch_velocity_30d"]["mean"] > 40.0  # clearly not 0.3%
+
+    def test_wishlist_proxy(self):
+        """followers / copies_sold produces correct ratio."""
+        game = self._make_game_with_history(followers=2000, copies_sold=10000)
+        result = compute_launch_metrics([game])
+        assert result is not None
+        # 2000 / 10000 = 0.2
+        assert result["wishlist_proxy"]["mean"] == pytest.approx(0.2, abs=0.01)
+        assert result["wishlist_proxy"]["sample_size"] == 1
+
+    def test_wishlist_proxy_missing_data(self):
+        """Games with followers=None or copies_sold=0 excluded from proxy sample."""
+        games = [
+            self._make_game_with_history(appid=1, followers=None, copies_sold=5000),
+            self._make_game_with_history(appid=2, followers=500, copies_sold=0),
+            self._make_game_with_history(appid=3, followers=1000, copies_sold=2000),
+        ]
+        result = compute_launch_metrics(games)
+        assert result is not None
+        # Only game 3 qualifies
+        assert result["wishlist_proxy"]["sample_size"] == 1
+        assert result["wishlist_proxy"]["mean"] == pytest.approx(0.5, abs=0.01)
+
+    def test_ea_duration(self):
+        """EA duration calculated from gamalytic_ea_date to ea_exit_date."""
+        game = {
+            "appid": 1,
+            "release_date": "2019-01-01",
+            "gamalytic_ea_date": "2019-01-01",
+            "ea_exit_date": "2020-01-01",  # exactly 1 year = 366 days (2019 is not leap)
+            "gamalytic_is_early_access": True,
+            "followers": 1000,
+            "copies_sold": 5000,
+            "history": [
+                _make_history_entry("2019-01-01", 10_000),
+                _make_history_entry("2019-07-01", 50_000),
+                _make_history_entry("2020-01-01", 100_000),
+            ],
+        }
+        result = compute_launch_metrics([game])
+        assert result is not None
+        ea = result["ea_stats"]
+        assert ea["ea_game_count"] == 1
+        assert ea["avg_ea_duration_days"] == pytest.approx(365.0, abs=2.0)
+
+    def test_ea_duration_missing_exit(self):
+        """EA games without ea_exit_date excluded from duration sample."""
+        game = {
+            "appid": 1,
+            "release_date": "2019-01-01",
+            "gamalytic_ea_date": "2019-01-01",
+            "ea_exit_date": None,   # no exit date
+            "gamalytic_is_early_access": True,
+            "followers": 500,
+            "copies_sold": 5000,
+            "history": [
+                _make_history_entry("2019-01-01", 10_000),
+                _make_history_entry("2020-01-01", 50_000),
+            ],
+        }
+        result = compute_launch_metrics([game])
+        assert result is not None
+        ea = result["ea_stats"]
+        assert ea["ea_game_count"] == 1
+        assert ea["sample_size"] == 0         # excluded from duration sample
+        assert ea["avg_ea_duration_days"] is None
+
+    def test_cumulative_revenue_not_summed(self):
+        """CRITICAL: lifetime revenue = last entry, not sum of all entries."""
+        # If revenue were summed: 100+200+300+400 = 1000
+        # Correct (last entry): 400
+        game = {
+            "appid": 1,
+            "release_date": "2020-01-01",
+            "gamalytic_ea_date": None,
+            "ea_exit_date": None,
+            "gamalytic_is_early_access": False,
+            "followers": 400,
+            "copies_sold": 2000,
+            "history": [
+                _make_history_entry("2020-01-01", 100),
+                _make_history_entry("2020-02-01", 200),
+                _make_history_entry("2020-04-01", 300),
+                _make_history_entry("2020-12-01", 400),  # LIFETIME = 400
+            ],
+        }
+        result = compute_launch_metrics([game])
+        assert result is not None
+        # 30d: entries <= 2020-01-31 → revenue=100. velocity = 100/400 * 100 = 25.0
+        # If incorrectly summed: 100/1000 * 100 = 10.0 — different result
+        assert result["launch_velocity_30d"]["mean"] == pytest.approx(25.0, abs=0.5)
+
+    def test_history_too_short(self):
+        """Games with < 2 history entries are excluded."""
+        game = {
+            "appid": 1,
+            "release_date": "2020-01-01",
+            "gamalytic_ea_date": None,
+            "ea_exit_date": None,
+            "gamalytic_is_early_access": False,
+            "followers": 100,
+            "copies_sold": 500,
+            "history": [_make_history_entry("2020-01-01", 5000)],  # only 1 entry
+        }
+        result = compute_launch_metrics([game])
+        assert result is not None
+        assert result["games_with_history"] == 0
+        assert result["launch_velocity_30d"]["sample_size"] == 0
+
+    def test_mixed_ea_and_non_ea(self):
+        """ea_pct calculated correctly with mixed EA and non-EA games."""
+        ea_game = self._make_game_with_history(
+            appid=1, is_ea=True, ea_date="2019-01-01",
+            ea_exit_date="2020-01-01", release_date="2019-01-01"
+        )
+        non_ea1 = self._make_game_with_history(appid=2, is_ea=False)
+        non_ea2 = self._make_game_with_history(appid=3, is_ea=False)
+        result = compute_launch_metrics([ea_game, non_ea1, non_ea2])
+        assert result is not None
+        assert result["ea_stats"]["ea_game_count"] == 1
+        assert result["ea_stats"]["ea_pct"] == pytest.approx(33.3, abs=0.1)
+
+
+# ============================================================================
+# TestComputeUpdateImpact
+# ============================================================================
+
+class TestComputeUpdateImpact:
+
+    def _make_game(self, appid, history, news=None, posts_365=10):
+        """Build a game dict for update impact testing."""
+        if news is None:
+            news = _make_news_activity(last_365=posts_365)
+        return {
+            "appid": appid,
+            "history": history,
+            "news_activity": news,
+        }
+
+    def test_active_vs_quiet_periods(self):
+        """5 history entries, classify active (post in period) vs. quiet (no post)."""
+        # History: 5 entries spanning Jan-May 2020
+        history = [
+            _make_history_entry("2020-01-01", 10_000, followers=100),
+            _make_history_entry("2020-02-01", 15_000, followers=120),  # period 1: Jan→Feb (active — post Jan 15)
+            _make_history_entry("2020-03-01", 16_000, followers=121),  # period 2: Feb→Mar (quiet)
+            _make_history_entry("2020-04-01", 20_000, followers=150),  # period 3: Mar→Apr (active — post Mar 10)
+            _make_history_entry("2020-05-01", 21_000, followers=152),  # period 4: Apr→May (quiet)
+        ]
+        news = _make_news_activity(
+            last_365=2,
+            post_dates=["2020-01-15", "2020-03-10"],  # 1 post in Jan→Feb period, 1 in Mar→Apr period
+        )
+        game = self._make_game(1, history, news=news)
+        result = compute_update_impact([game])
+        assert result is not None
+        assert result["games_analyzed"] == 1
+
+        avq = result["active_vs_quiet"]
+        # Active periods: Jan→Feb (delta=5000, growth=50%), Mar→Apr (delta=4000, growth=25%)
+        # avg active growth ≈ (50 + 25) / 2 = 37.5%
+        assert avq["active_period_avg_revenue_growth_pct"] is not None
+        assert avq["active_period_avg_revenue_growth_pct"] == pytest.approx(37.5, abs=1.0)
+        # Quiet periods: Feb→Mar (delta=1000, growth≈6.7%), Apr→May (delta=1000, growth=5%)
+        assert avq["quiet_period_avg_revenue_growth_pct"] is not None
+        assert avq["active_period_count"] == 2
+        assert avq["quiet_period_count"] == 2
+
+    def test_empty_games_list(self):
+        """Empty input returns None."""
+        assert compute_update_impact([]) is None
+
+    def test_no_news_data(self):
+        """Games without news_activity → games_analyzed = 0."""
+        game = {
+            "appid": 1,
+            "history": [
+                _make_history_entry("2020-01-01", 10_000),
+                _make_history_entry("2020-02-01", 20_000),
+                _make_history_entry("2020-03-01", 30_000),
+            ],
+            "news_activity": None,
+        }
+        result = compute_update_impact([game])
+        assert result is not None
+        assert result["games_analyzed"] == 0
+
+    def test_history_too_short(self):
+        """Games with history < 3 entries excluded (need >= 3)."""
+        game = {
+            "appid": 1,
+            "history": [
+                _make_history_entry("2020-01-01", 10_000),
+                _make_history_entry("2020-02-01", 20_000),  # only 2 entries
+            ],
+            "news_activity": _make_news_activity(),
+        }
+        result = compute_update_impact([game])
+        assert result is not None
+        assert result["games_analyzed"] == 0
+
+    def test_update_frequency_tiers(self):
+        """4 games each land in different frequency tiers based on posts_last_365d."""
+        history_base = [
+            _make_history_entry("2020-01-01", 100_000),
+            _make_history_entry("2020-06-01", 200_000),
+            _make_history_entry("2020-12-01", 300_000),
+        ]
+        game_high = self._make_game(1, history_base, posts_365=15)      # >12 → high
+        game_mod  = self._make_game(2, history_base, posts_365=8)       # 4-12 → moderate
+        game_low  = self._make_game(3, history_base, posts_365=2)       # 1-3 → low
+        game_inac = self._make_game(4, history_base, posts_365=0)       # 0 → inactive
+
+        result = compute_update_impact([game_high, game_mod, game_low, game_inac])
+        assert result is not None
+        tiers = result["update_frequency_tiers"]
+        assert tiers["high"]["game_count"] == 1
+        assert tiers["moderate"]["game_count"] == 1
+        assert tiers["low"]["game_count"] == 1
+        assert tiers["inactive"]["game_count"] == 1
+        # Each tier has 1 game with lifetime revenue = 300_000
+        assert tiers["high"]["avg_lifetime_revenue"] == pytest.approx(300_000.0, rel=0.01)
+
+    def test_revenue_deltas_from_cumulative(self):
+        """Period revenue computed as delta (subtraction), not raw cumulative value."""
+        # history: 100 → 300 → 600 → 1000
+        # Period deltas: 200, 300, 400 (NOT 300, 600, 1000)
+        history = [
+            _make_history_entry("2020-01-01", 100),
+            _make_history_entry("2020-02-01", 300),
+            _make_history_entry("2020-03-01", 600),
+            _make_history_entry("2020-04-01", 1000),
+        ]
+        news = _make_news_activity(
+            last_365=1,
+            post_dates=["2020-01-15"],  # active only in Jan→Feb period
+        )
+        game = self._make_game(1, history, news=news)
+        result = compute_update_impact([game])
+        assert result is not None
+        avq = result["active_vs_quiet"]
+        # Active period Jan→Feb: delta=300-100=200, growth=200/100*100=200%
+        assert avq["active_period_avg_revenue_growth_pct"] == pytest.approx(200.0, abs=0.5)
+        # Quiet periods Feb→Mar: delta=300, growth=300/300*100=100%
+        # Quiet period Mar→Apr: delta=400, growth=400/600*100≈66.7%
+        # avg quiet = (100 + 66.67) / 2 ≈ 83.3
+        assert avq["quiet_period_avg_revenue_growth_pct"] == pytest.approx(83.33, abs=1.0)
+
+    def test_follower_growth_active_periods(self):
+        """Active periods show higher follower growth than quiet periods."""
+        history = [
+            _make_history_entry("2020-01-01", 10_000, followers=1000),
+            _make_history_entry("2020-02-01", 20_000, followers=1200),   # period 1: +200 (active)
+            _make_history_entry("2020-03-01", 21_000, followers=1201),   # period 2: +1 (quiet)
+            _make_history_entry("2020-04-01", 30_000, followers=1400),   # period 3: +199 (active)
+            _make_history_entry("2020-05-01", 31_000, followers=1401),   # period 4: +1 (quiet)
+        ]
+        news = _make_news_activity(
+            last_365=2,
+            post_dates=["2020-01-15", "2020-03-10"],
+        )
+        game = self._make_game(1, history, news=news)
+        result = compute_update_impact([game])
+        assert result is not None
+        avq = result["active_vs_quiet"]
+        # Active avg follower growth: (200 + 199) / 2 = 199.5
+        # Quiet avg follower growth: (1 + 1) / 2 = 1
+        assert avq["active_period_avg_follower_growth"] == pytest.approx(199.5, abs=1.0)
+        assert avq["quiet_period_avg_follower_growth"] == pytest.approx(1.0, abs=0.1)
+        assert avq["active_period_avg_follower_growth"] > avq["quiet_period_avg_follower_growth"]
+
+    def test_single_game_all_active(self):
+        """All periods active → quiet_period_count = 0."""
+        history = [
+            _make_history_entry("2020-01-01", 100_000),
+            _make_history_entry("2020-02-01", 200_000),
+            _make_history_entry("2020-03-01", 300_000),
+        ]
+        # Posts in every inter-entry period
+        news = _make_news_activity(
+            last_365=2,
+            post_dates=["2020-01-15", "2020-02-15"],
+        )
+        game = self._make_game(1, history, news=news)
+        result = compute_update_impact([game])
+        assert result is not None
+        assert result["active_vs_quiet"]["quiet_period_count"] == 0
+        assert result["active_vs_quiet"]["active_period_count"] == 2
