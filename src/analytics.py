@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import statistics
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from math import floor
 
 from src.schemas import (
@@ -1131,3 +1131,394 @@ def compute_visual_multipliers(
             result[attr] = entries
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Phase 15: Strategy Data Sources analytics
+# ---------------------------------------------------------------------------
+
+
+def _compute_single_velocity(
+    history: list[dict],
+    anchor_iso: str,
+    window_days: int,
+) -> float | None:
+    """Compute launch velocity: % of lifetime revenue earned within window_days of anchor.
+
+    Revenue in history is CUMULATIVE. Velocity = window_entry.revenue / last_entry.revenue * 100.
+    Returns None if insufficient data (fewer than 2 entries, no lifetime revenue, or no anchor).
+    """
+    if len(history) < 2 or not anchor_iso:
+        return None
+
+    try:
+        anchor_dt = datetime.fromisoformat(anchor_iso).replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+    cutoff_dt = anchor_dt + timedelta(days=window_days)
+    cutoff_iso = cutoff_dt.date().isoformat()
+
+    # Lifetime revenue = last entry's cumulative revenue
+    lifetime_rev = history[-1].get("revenue")
+    if not lifetime_rev or lifetime_rev <= 0:
+        return None
+
+    # Find entries within window (timestamp is ISO date string)
+    entries_in_window = [
+        e for e in history
+        if e.get("timestamp") and e["timestamp"] <= cutoff_iso
+    ]
+    if not entries_in_window:
+        return 0.0
+
+    window_rev = entries_in_window[-1].get("revenue") or 0
+    return round((window_rev / lifetime_rev) * 100, 1)
+
+
+def compute_dlc_analytics(games: list[dict]) -> dict | None:
+    """Compute DLC analytics across a set of games.
+
+    Accepts a list of game dicts where each may have `gamalytic_dlc` (list
+    of DLC entry dicts with `name`, `price`, `release_date` fields). Returns
+    a summary dict with penetration, count, price tiers, cadence, and
+    soundtrack presence.
+
+    NOTE: Per-DLC revenue is NOT available from Gamalytic API — the `revenue`
+    field is absent from DLC entries even with a Pro key. dlc_revenue_available
+    is always False.
+
+    Returns None if games is empty.
+    """
+    if not games:
+        return None
+
+    total_games = len(games)
+    games_with_dlc = [g for g in games if g.get("gamalytic_dlc")]
+    dlc_count = len(games_with_dlc)
+    dlc_penetration_pct = round(dlc_count / total_games * 100, 1)
+
+    # Per-game DLC counts
+    dlc_counts_per_game: list[int] = []
+    all_prices: list[float] = []
+    cadences: list[float] = []  # days between consecutive DLC releases
+    soundtrack_count = 0  # games with DLC containing "soundtrack" in name
+
+    price_tiers: dict[str, int] = {"free": 0, "under_5": 0, "5_to_15": 0, "15_to_30": 0, "30_plus": 0}
+
+    for game in games_with_dlc:
+        dlc_list = game["gamalytic_dlc"]
+        dlc_counts_per_game.append(len(dlc_list))
+
+        # Check for soundtrack DLC (case-insensitive)
+        has_soundtrack = any(
+            "soundtrack" in (d.get("name") or "").lower()
+            for d in dlc_list
+        )
+        if has_soundtrack:
+            soundtrack_count += 1
+
+        # Collect prices and tier counts
+        for d in dlc_list:
+            price = d.get("price")
+            if price is None:
+                # Treat None price as free
+                price_tiers["free"] += 1
+            elif price <= 0:
+                price_tiers["free"] += 1
+            elif price < 5.0:
+                price_tiers["under_5"] += 1
+                all_prices.append(price)
+            elif price < 15.0:
+                price_tiers["5_to_15"] += 1
+                all_prices.append(price)
+            elif price < 30.0:
+                price_tiers["15_to_30"] += 1
+                all_prices.append(price)
+            else:
+                price_tiers["30_plus"] += 1
+                all_prices.append(price)
+
+        # Cadence: sort by release_date, compute delta between consecutive entries
+        dated = sorted(
+            [d for d in dlc_list if d.get("release_date")],
+            key=lambda d: d["release_date"],
+        )
+        if len(dated) >= 2:
+            for i in range(1, len(dated)):
+                try:
+                    d1 = datetime.fromisoformat(dated[i - 1]["release_date"])
+                    d2 = datetime.fromisoformat(dated[i]["release_date"])
+                    delta = (d2 - d1).days
+                    if delta >= 0:
+                        cadences.append(float(delta))
+                except (ValueError, TypeError):
+                    pass
+
+    # Aggregate stats
+    avg_dlc_count = _safe_mean([float(c) for c in dlc_counts_per_game])
+    median_dlc_count = _safe_median([float(c) for c in dlc_counts_per_game])
+    max_dlc_count = max(dlc_counts_per_game) if dlc_counts_per_game else None
+
+    avg_dlc_price = _safe_mean(all_prices)
+    median_dlc_price = _safe_median(all_prices) if all_prices else None
+
+    avg_cadence_days: float | None = None
+    median_cadence_days: float | None = None
+    if cadences:
+        avg_cadence_days = round(statistics.mean(cadences), 1)
+        median_cadence_days = round(statistics.median(cadences), 1)
+
+    has_soundtrack_pct = round(soundtrack_count / dlc_count * 100, 1) if dlc_count > 0 else 0.0
+
+    return {
+        "total_games": total_games,
+        "games_with_dlc": dlc_count,
+        "dlc_penetration_pct": dlc_penetration_pct,
+        "avg_dlc_count": avg_dlc_count,
+        "median_dlc_count": median_dlc_count,
+        "max_dlc_count": max_dlc_count,
+        "avg_dlc_price": avg_dlc_price,
+        "median_dlc_price": median_dlc_price,
+        "price_tiers": price_tiers,
+        "avg_cadence_days": avg_cadence_days,
+        "median_cadence_days": median_cadence_days,
+        "has_soundtrack_pct": has_soundtrack_pct,
+        "dlc_revenue_available": False,
+    }
+
+
+def compute_launch_metrics(games: list[dict]) -> dict | None:
+    """Compute launch velocity and EA metrics from Gamalytic history arrays.
+
+    Accepts game dicts with: history (list with timestamp/revenue/sales),
+    release_date, gamalytic_ea_date, ea_exit_date, gamalytic_is_early_access,
+    followers, copies_sold.
+
+    Revenue in history is CUMULATIVE. Velocity = window_entry.revenue / last_entry.revenue * 100.
+    Anchor date: ea_exit_date for EA games (full launch), else release_date.
+
+    Returns None if games is empty.
+    """
+    if not games:
+        return None
+
+    total_games = len(games)
+    games_with_history = 0
+
+    velocities_30d: list[float] = []
+    velocities_90d: list[float] = []
+    wishlist_proxies: list[float] = []
+
+    ea_games: list[dict] = []
+    ea_durations: list[float] = []
+
+    for g in games:
+        history = g.get("history") or []
+        if len(history) < 2:
+            continue
+
+        games_with_history += 1
+
+        # Determine anchor date for launch velocity
+        is_ea = g.get("gamalytic_is_early_access") or False
+        ea_exit = g.get("ea_exit_date")
+        release = g.get("release_date")
+
+        # EA game: use ea_exit_date (full launch); non-EA: use release_date
+        if is_ea and ea_exit:
+            anchor = ea_exit
+        elif release:
+            anchor = release
+        else:
+            anchor = None
+
+        if anchor:
+            v30 = _compute_single_velocity(history, anchor, 30)
+            v90 = _compute_single_velocity(history, anchor, 90)
+            if v30 is not None:
+                velocities_30d.append(v30)
+            if v90 is not None:
+                velocities_90d.append(v90)
+
+        # Wishlist proxy: followers / copies_sold
+        followers = g.get("followers")
+        copies_sold = g.get("copies_sold")
+        if followers is not None and copies_sold and copies_sold > 0:
+            wishlist_proxies.append(round(followers / copies_sold, 4))
+
+        # EA stats
+        if is_ea:
+            ea_games.append(g)
+            ea_start = g.get("gamalytic_ea_date")
+            if ea_exit and ea_start:
+                try:
+                    start_dt = datetime.fromisoformat(ea_start)
+                    exit_dt = datetime.fromisoformat(ea_exit)
+                    duration = (exit_dt - start_dt).days
+                    if duration >= 0:
+                        ea_durations.append(float(duration))
+                except (ValueError, TypeError):
+                    pass
+
+    ea_game_count = len(ea_games)
+    ea_pct = round(ea_game_count / total_games * 100, 1) if total_games > 0 else 0.0
+
+    return {
+        "total_games": total_games,
+        "games_with_history": games_with_history,
+        "launch_velocity_30d": {
+            "mean": _safe_mean(velocities_30d),
+            "median": _safe_median(velocities_30d),
+            "sample_size": len(velocities_30d),
+        },
+        "launch_velocity_90d": {
+            "mean": _safe_mean(velocities_90d),
+            "median": _safe_median(velocities_90d),
+            "sample_size": len(velocities_90d),
+        },
+        "wishlist_proxy": {
+            "mean": _safe_mean(wishlist_proxies),
+            "median": _safe_median(wishlist_proxies),
+            "sample_size": len(wishlist_proxies),
+        },
+        "ea_stats": {
+            "ea_game_count": ea_game_count,
+            "ea_pct": ea_pct,
+            "avg_ea_duration_days": _safe_mean(ea_durations),
+            "median_ea_duration_days": _safe_median(ea_durations),
+            "sample_size": len(ea_durations),
+        },
+    }
+
+
+def compute_update_impact(games: list[dict]) -> dict | None:
+    """Correlate developer update frequency with Gamalytic history revenue/follower deltas.
+
+    Accepts game dicts with:
+    - news_activity: dict with developer_posts_total, developer_posts_last_365d,
+      developer_post_dates (list of ISO date strings)
+    - history: list of dicts with timestamp (ISO string), revenue (CUMULATIVE),
+      followers (int), sales (CUMULATIVE)
+
+    Revenue is CUMULATIVE — period revenue = history[i+1].revenue - history[i].revenue.
+    Classifies each inter-entry period as active (>=1 dev post in period) or quiet (0 posts).
+    Requires len(history) >= 3 per game. Returns None if games is empty.
+    """
+    if not games:
+        return None
+
+    total_games = len(games)
+    games_analyzed = 0
+
+    active_revenue_growths: list[float] = []   # % revenue growth in active periods
+    quiet_revenue_growths: list[float] = []    # % revenue growth in quiet periods
+    active_follower_deltas: list[float] = []   # follower change in active periods
+    quiet_follower_deltas: list[float] = []    # follower change in quiet periods
+
+    # Update frequency tiers: posts/year
+    freq_tiers: dict[str, dict] = {
+        "high": {"game_count": 0, "revenues": []},       # >12/yr
+        "moderate": {"game_count": 0, "revenues": []},   # 4-12/yr
+        "low": {"game_count": 0, "revenues": []},        # 1-3/yr
+        "inactive": {"game_count": 0, "revenues": []},   # 0/yr
+    }
+
+    for g in games:
+        history = g.get("history") or []
+        news = g.get("news_activity") or {}
+
+        if len(history) < 3 or not news:
+            continue
+
+        post_dates: list[str] = sorted(news.get("developer_post_dates") or [])
+        posts_365 = news.get("developer_posts_last_365d") or 0
+
+        # Classify into update frequency tier using posts_last_365d as proxy
+        lifetime_rev = history[-1].get("revenue")
+
+        if posts_365 > 12:
+            tier = "high"
+        elif posts_365 >= 4:
+            tier = "moderate"
+        elif posts_365 >= 1:
+            tier = "low"
+        else:
+            tier = "inactive"
+
+        freq_tiers[tier]["game_count"] += 1
+        if lifetime_rev is not None:
+            freq_tiers[tier]["revenues"].append(lifetime_rev)
+
+        games_analyzed += 1
+
+        # Period-level active vs quiet analysis
+        for i in range(len(history) - 1):
+            entry_start = history[i]
+            entry_end = history[i + 1]
+
+            ts_start = entry_start.get("timestamp")
+            ts_end = entry_end.get("timestamp")
+            if not ts_start or not ts_end:
+                continue
+
+            # Count dev posts in [ts_start, ts_end)
+            posts_in_period = sum(
+                1 for pd in post_dates
+                if ts_start <= pd < ts_end
+            )
+
+            # Revenue delta (cumulative subtraction)
+            rev_start = entry_start.get("revenue") or 0.0
+            rev_end = entry_end.get("revenue") or 0.0
+            rev_delta = rev_end - rev_start
+
+            # Revenue growth %: delta / start if start > 0
+            if rev_start > 0:
+                rev_growth_pct = round((rev_delta / rev_start) * 100, 2)
+            else:
+                rev_growth_pct = None
+
+            # Follower delta
+            fol_start = entry_start.get("followers")
+            fol_end = entry_end.get("followers")
+            if fol_start is not None and fol_end is not None:
+                fol_delta = fol_end - fol_start
+            else:
+                fol_delta = None
+
+            if posts_in_period >= 1:
+                # Active period
+                if rev_growth_pct is not None:
+                    active_revenue_growths.append(rev_growth_pct)
+                if fol_delta is not None:
+                    active_follower_deltas.append(float(fol_delta))
+            else:
+                # Quiet period
+                if rev_growth_pct is not None:
+                    quiet_revenue_growths.append(rev_growth_pct)
+                if fol_delta is not None:
+                    quiet_follower_deltas.append(float(fol_delta))
+
+    # Build update_frequency_tiers output
+    update_frequency_tiers: dict[str, dict] = {}
+    for tier_name, tier_data in freq_tiers.items():
+        revs = tier_data["revenues"]
+        update_frequency_tiers[tier_name] = {
+            "game_count": tier_data["game_count"],
+            "avg_lifetime_revenue": _safe_mean(revs),
+        }
+
+    return {
+        "total_games": total_games,
+        "games_analyzed": games_analyzed,
+        "active_vs_quiet": {
+            "active_period_avg_revenue_growth_pct": _safe_mean(active_revenue_growths),
+            "quiet_period_avg_revenue_growth_pct": _safe_mean(quiet_revenue_growths),
+            "active_period_avg_follower_growth": _safe_mean(active_follower_deltas),
+            "quiet_period_avg_follower_growth": _safe_mean(quiet_follower_deltas),
+            "active_period_count": len(active_revenue_growths),
+            "quiet_period_count": len(quiet_revenue_growths),
+        },
+        "update_frequency_tiers": update_frequency_tiers,
+    }
