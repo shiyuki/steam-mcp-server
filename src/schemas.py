@@ -88,6 +88,10 @@ class GameMetadata(CachedResponse):
     pc_requirements_rec: str = ""  # HTML-stripped plain text
     controller_support: str | None = None  # "full", "partial", or None
 
+    # Phase 15: Demo availability from Steam appdetails
+    demos_available: bool = False  # True if game has at least one demo
+    demos: list[dict] = Field(default_factory=list)  # [{appid: int, description: str}, ...]
+
 
 class GameSummary(BaseModel):
     """Per-game summary data from SteamSpy bulk endpoint.
@@ -740,6 +744,38 @@ class LanguageEntry(BaseModel):
     """Structured language support entry from Steam Store data."""
     language: str
     full_audio: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Phase 15: Strategy Data Sources schemas (additive — existing schemas unchanged)
+# ---------------------------------------------------------------------------
+
+class NewsActivity(CachedResponse):
+    """Steam News API activity data for a single game.
+
+    Splits developer announcements (feed_type=1) from press coverage (feed_type=0)
+    to enable independent analysis of update cadence vs. media visibility.
+    """
+    # Identification
+    appid: int
+
+    # Developer activity (feed_type=1 — official Steam Community Announcements)
+    developer_posts_total: int  # count of official developer posts fetched
+    developer_posts_last_90d: int = 0  # developer posts in last 90 days
+    developer_posts_last_365d: int = 0  # developer posts in last 365 days
+    developer_avg_days_between_posts: float | None = None  # mean days between consecutive developer posts (None if <2 posts)
+    developer_last_post_date: str | None = None  # ISO date of most recent developer post
+    developer_recent_titles: list[str] = Field(default_factory=list)  # titles of 5 most recent developer posts
+
+    # Press coverage (feed_type=0 — third-party articles from PC Gamer, RPS, SteamDB, etc.)
+    press_mentions_total: int = 0  # count of third-party press articles fetched
+    press_mentions_last_90d: int = 0  # press articles in last 90 days
+    press_mentions_last_365d: int = 0  # press articles in last 365 days
+
+    # Combined (all feeds)
+    total_news_items: int  # total items fetched across all feeds
+    first_activity_date: str | None = None  # ISO date of oldest fetched item (any feed)
+    last_activity_date: str | None = None  # ISO date of most recent item (any feed)
 
 
 # ---------------------------------------------------------------------------

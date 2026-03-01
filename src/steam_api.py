@@ -15,6 +15,7 @@ from src.schemas import (
     ReviewItem, ReviewsData, ReviewAggregates, PlaytimeBucket, SentimentPeriod,
     ReviewsMeta, QueryParams, ReviewSnippet, EADateInfo,
     GamalyticHistoryEntry, CountryDataEntry, CompetitorEntry, EstimateModelEntry, DLCEntry,
+    NewsActivity,
 )
 from src.logging_config import get_logger
 from src.timeout_utils import gather_with_timeout, compute_gather_timeout, GAMALYTIC_RATE
@@ -896,6 +897,8 @@ class SteamStoreClient:
                 "pc_requirements_min": "",
                 "pc_requirements_rec": "",
                 "controller_support": None,
+                "demos": [],
+                "demos_available": False,
             }
 
             # Pre-initialize languages_raw so Phase 8 block can reference it even if the main try/except exits early
@@ -1046,6 +1049,18 @@ class SteamStoreClient:
                     logger.warning(f"AppID {appid}: unexpected controller_support value: {new_fields['controller_support']}")
             except Exception as e:
                 logger.warning(f"AppID {appid}: controller_support parse error: {e}")
+
+            # Phase 15: demos field parsing
+            try:
+                demos_raw = details.get("demos", [])
+                if isinstance(demos_raw, list):
+                    new_fields["demos"] = [
+                        {"appid": d.get("appid"), "description": d.get("description", "")}
+                        for d in demos_raw if isinstance(d, dict)
+                    ]
+                    new_fields["demos_available"] = len(new_fields["demos"]) > 0
+            except Exception as e:
+                logger.warning(f"AppID {appid}: demos parse error: {e}")
 
             return GameMetadata(
                 appid=appid,
@@ -3013,4 +3028,164 @@ class SteamReviewClient:
                 dimension_profile=dimension_profile,
                 meta=meta,
                 query_params=query_params,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Phase 15: Steam News API client (additive — existing clients unchanged)
+# ---------------------------------------------------------------------------
+
+class SteamNewsClient:
+    """Client for Steam News API (ISteamNews/GetNewsForApp).
+
+    Fetches all news feeds (no filter) and splits results client-side by
+    feed_type to separate developer announcements from press coverage.
+    """
+
+    BASE_URL = "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2"
+
+    def __init__(self, http_client: CachedAPIClient):
+        """Initialize with shared CachedAPIClient."""
+        self.http = http_client
+
+    async def get_news_activity(self, appid: int) -> "NewsActivity | APIError":
+        """Fetch news/update activity for a Steam game from Steam News API.
+
+        Fetches ALL feeds without filter (no feeds= parameter), then splits
+        by feed_type client-side:
+          - feed_type=1: official Steam Community Announcements (developer posts)
+          - feed_type=0: third-party articles (PC Gamer, RPS, SteamDB, etc.)
+
+        Date timestamps in the API response are Unix SECONDS (not milliseconds
+        like Gamalytic history — do NOT divide by 1000).
+
+        Args:
+            appid: Steam AppID to fetch news for
+
+        Returns:
+            NewsActivity with developer and press coverage metrics, or APIError
+        """
+        try:
+            data, fetched_at, cache_age = await self.http.get_with_metadata(
+                self.BASE_URL,
+                params={
+                    "appid": str(appid),
+                    "count": "250",   # max items in one call
+                    "maxlength": "0", # don't truncate content (we only need date/type)
+                },
+                cache_ttl=86400,  # 24 hours — news activity is stable signal
+            )
+
+            # Response: {"appnews": {"appid": N, "newsitems": [...], "count": M}}
+            appnews = data.get("appnews", {})
+            newsitems = appnews.get("newsitems", [])
+
+            # Sort all items by date descending (API may not guarantee order)
+            newsitems_sorted = sorted(newsitems, key=lambda x: x.get("date", 0), reverse=True)
+
+            # Split by feed_type: 1=developer/official, 0=press/third-party
+            developer_items = [item for item in newsitems_sorted if item.get("feed_type") == 1]
+            press_items = [item for item in newsitems_sorted if item.get("feed_type") == 0]
+
+            now_dt = datetime.now(tz=timezone.utc)
+            cutoff_90d = now_dt.timestamp() - (90 * 86400)
+            cutoff_365d = now_dt.timestamp() - (365 * 86400)
+
+            # --- Developer metrics ---
+            developer_posts_total = len(developer_items)
+
+            developer_posts_last_90d = sum(
+                1 for item in developer_items
+                if (item.get("date") or 0) >= cutoff_90d
+            )
+            developer_posts_last_365d = sum(
+                1 for item in developer_items
+                if (item.get("date") or 0) >= cutoff_365d
+            )
+
+            developer_avg_days_between_posts: float | None = None
+            if len(developer_items) >= 2:
+                # Compute mean days between consecutive posts (sorted desc → reverse for asc)
+                dev_dates = [item["date"] for item in reversed(developer_items) if item.get("date")]
+                if len(dev_dates) >= 2:
+                    deltas_days = [
+                        (dev_dates[i + 1] - dev_dates[i]) / 86400
+                        for i in range(len(dev_dates) - 1)
+                    ]
+                    developer_avg_days_between_posts = round(
+                        sum(deltas_days) / len(deltas_days), 1
+                    )
+
+            developer_last_post_date: str | None = None
+            if developer_items:
+                last_dev_ts = developer_items[0].get("date")
+                if last_dev_ts:
+                    developer_last_post_date = datetime.fromtimestamp(
+                        last_dev_ts, tz=timezone.utc
+                    ).date().isoformat()
+
+            developer_recent_titles = [
+                item.get("title", "") for item in developer_items[:5]
+            ]
+
+            # --- Press coverage metrics ---
+            press_mentions_total = len(press_items)
+
+            press_mentions_last_90d = sum(
+                1 for item in press_items
+                if (item.get("date") or 0) >= cutoff_90d
+            )
+            press_mentions_last_365d = sum(
+                1 for item in press_items
+                if (item.get("date") or 0) >= cutoff_365d
+            )
+
+            # --- Combined metrics (all feeds) ---
+            total_news_items = len(newsitems_sorted)
+
+            first_activity_date: str | None = None
+            last_activity_date: str | None = None
+            if newsitems_sorted:
+                # sorted desc → last item is oldest
+                oldest_ts = newsitems_sorted[-1].get("date")
+                newest_ts = newsitems_sorted[0].get("date")
+                if oldest_ts:
+                    first_activity_date = datetime.fromtimestamp(
+                        oldest_ts, tz=timezone.utc
+                    ).date().isoformat()
+                if newest_ts:
+                    last_activity_date = datetime.fromtimestamp(
+                        newest_ts, tz=timezone.utc
+                    ).date().isoformat()
+
+            return NewsActivity(
+                appid=appid,
+                fetched_at=fetched_at,
+                cache_age_seconds=cache_age,
+                developer_posts_total=developer_posts_total,
+                developer_posts_last_90d=developer_posts_last_90d,
+                developer_posts_last_365d=developer_posts_last_365d,
+                developer_avg_days_between_posts=developer_avg_days_between_posts,
+                developer_last_post_date=developer_last_post_date,
+                developer_recent_titles=developer_recent_titles,
+                press_mentions_total=press_mentions_total,
+                press_mentions_last_90d=press_mentions_last_90d,
+                press_mentions_last_365d=press_mentions_last_365d,
+                total_news_items=total_news_items,
+                first_activity_date=first_activity_date,
+                last_activity_date=last_activity_date,
+            )
+
+        except httpx.HTTPStatusError as e:
+            return APIError(
+                error_code=e.response.status_code,
+                error_type="api_error",
+                message=f"Steam News API error: {e.response.status_code}"
+            )
+        except Exception as e:
+            logger.error(f"SteamNewsClient error for appid {appid}: {e}")
+            return APIError(
+                error_code=500,
+                error_type="api_error",
+                message=str(e)
             )
