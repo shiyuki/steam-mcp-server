@@ -12,6 +12,7 @@ from src.schemas import (
     GamalyticHistoryEntry,
     CompetitorEntry,
     VisualProfile,
+    NewsActivity,
 )
 
 
@@ -493,3 +494,134 @@ class TestVisualProfile:
         assert restored.character_style_secondary == original.character_style_secondary
         assert restored.mood_secondary == original.mood_secondary
         assert restored.genre_tags == original.genre_tags
+
+
+# ---------------------------------------------------------------------------
+# Phase 15: NewsActivity schema tests
+# ---------------------------------------------------------------------------
+
+class TestNewsActivity:
+    """Tests for the NewsActivity Pydantic schema (Phase 15)."""
+
+    def test_minimal_construction(self):
+        """Minimal required fields — developer_posts_total and total_news_items."""
+        na = NewsActivity(
+            appid=646570,
+            developer_posts_total=10,
+            total_news_items=15,
+            fetched_at=datetime.now(timezone.utc),
+        )
+        assert na.appid == 646570
+        assert na.developer_posts_total == 10
+        assert na.total_news_items == 15
+
+    def test_developer_fields_defaults(self):
+        """Developer time-window fields default to zero."""
+        na = NewsActivity(
+            appid=1,
+            developer_posts_total=0,
+            total_news_items=0,
+            fetched_at=datetime.now(timezone.utc),
+        )
+        assert na.developer_posts_last_90d == 0
+        assert na.developer_posts_last_365d == 0
+        assert na.developer_avg_days_between_posts is None
+        assert na.developer_last_post_date is None
+        assert na.developer_recent_titles == []
+
+    def test_press_fields_defaults(self):
+        """Press coverage fields default to zero."""
+        na = NewsActivity(
+            appid=1,
+            developer_posts_total=0,
+            total_news_items=0,
+            fetched_at=datetime.now(timezone.utc),
+        )
+        assert na.press_mentions_total == 0
+        assert na.press_mentions_last_90d == 0
+        assert na.press_mentions_last_365d == 0
+
+    def test_combined_fields_defaults(self):
+        """Combined activity fields default to None."""
+        na = NewsActivity(
+            appid=1,
+            developer_posts_total=0,
+            total_news_items=0,
+            fetched_at=datetime.now(timezone.utc),
+        )
+        assert na.first_activity_date is None
+        assert na.last_activity_date is None
+
+    def test_full_construction(self):
+        """All fields can be set."""
+        na = NewsActivity(
+            appid=646570,
+            developer_posts_total=50,
+            developer_posts_last_90d=5,
+            developer_posts_last_365d=30,
+            developer_avg_days_between_posts=7.2,
+            developer_last_post_date="2026-02-01",
+            developer_recent_titles=["Update 1.5", "Hotfix", "Patch Notes", "Dev Log", "Anniversary"],
+            press_mentions_total=12,
+            press_mentions_last_90d=2,
+            press_mentions_last_365d=8,
+            total_news_items=62,
+            first_activity_date="2019-01-23",
+            last_activity_date="2026-02-01",
+            fetched_at=datetime.now(timezone.utc),
+        )
+        assert na.developer_posts_total == 50
+        assert na.press_mentions_total == 12
+        assert na.total_news_items == 62
+        assert na.developer_avg_days_between_posts == 7.2
+        assert len(na.developer_recent_titles) == 5
+
+    def test_model_dump_serializable(self):
+        """model_dump() output is JSON-serializable via default=str."""
+        import json
+        na = NewsActivity(
+            appid=646570,
+            developer_posts_total=5,
+            total_news_items=5,
+            fetched_at=datetime.now(timezone.utc),
+        )
+        dumped = na.model_dump()
+        # Should not raise
+        json.dumps(dumped, default=str)
+
+    def test_field_count(self):
+        """NewsActivity has the expected number of fields (12+ data fields)."""
+        fields = NewsActivity.model_fields.keys()
+        # Core data fields: appid, developer_posts_total, developer_posts_last_90d,
+        # developer_posts_last_365d, developer_avg_days_between_posts, developer_last_post_date,
+        # developer_recent_titles, press_mentions_total, press_mentions_last_90d,
+        # press_mentions_last_365d, total_news_items, first_activity_date, last_activity_date
+        # Plus inherited: fetched_at, cache_age_seconds
+        assert len(list(fields)) >= 14  # 13 data + 2 inherited
+
+
+class TestGameMetadataDemosFields:
+    """Tests for demos_available and demos fields on GameMetadata (Phase 15)."""
+
+    def test_demos_default_false(self):
+        """demos_available defaults to False."""
+        gm = GameMetadata(appid=1, name="Test", fetched_at=datetime.now(timezone.utc))
+        assert gm.demos_available is False
+
+    def test_demos_default_empty_list(self):
+        """demos defaults to empty list."""
+        gm = GameMetadata(appid=1, name="Test", fetched_at=datetime.now(timezone.utc))
+        assert gm.demos == []
+
+    def test_demos_set_true(self):
+        """demos_available=True and demos=[...] can be set."""
+        gm = GameMetadata(
+            appid=1,
+            name="Test",
+            demos_available=True,
+            demos=[{"appid": 12346, "description": ""}],
+            fetched_at=datetime.now(timezone.utc),
+        )
+        assert gm.demos_available is True
+        assert len(gm.demos) == 1
+        assert gm.demos[0]["appid"] == 12346

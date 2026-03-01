@@ -12,7 +12,7 @@ from src.http_client import CachedAPIClient
 from src.cache import TTLCache
 from src.config import Config
 from src.rate_limiter import HostRateLimiter
-from src.steam_api import SteamSpyClient, SteamStoreClient, GamalyticClient, SteamReviewClient
+from src.steam_api import SteamSpyClient, SteamStoreClient, GamalyticClient, SteamReviewClient, SteamNewsClient
 from src.schemas import APIError, SearchResult, GameSummary, EngagementData, VisualProfile
 from src.logging_config import get_logger
 from src.market_tools import (
@@ -31,6 +31,7 @@ _steamspy: SteamSpyClient | None = None
 _steam_store: SteamStoreClient | None = None
 _gamalytic: GamalyticClient | None = None
 _review_client: SteamReviewClient | None = None
+_steam_news: SteamNewsClient | None = None
 
 # Semaphore for review fetching concurrency control
 _review_semaphore = asyncio.Semaphore(5)
@@ -73,7 +74,7 @@ def _validate_game_tags(
 
 def register_tools(mcp: FastMCP):
     """Register all MCP tools with the server."""
-    global _http_client, _steamspy, _steam_store, _gamalytic, _review_client
+    global _http_client, _steamspy, _steam_store, _gamalytic, _review_client, _steam_news
 
     # Initialize shared infrastructure with per-host rate limiting and TTL cache
     cache = TTLCache(default_ttl=3600)  # 1 hour default
@@ -83,6 +84,7 @@ def register_tools(mcp: FastMCP):
     _steam_store = SteamStoreClient(_http_client)
     _gamalytic = GamalyticClient(_http_client)
     _review_client = SteamReviewClient(_http_client)
+    _steam_news = SteamNewsClient(_http_client)
 
     logger.info("Initializing MCP tools with per-host rate limiting and TTL cache")
 
@@ -720,6 +722,51 @@ def register_tools(mcp: FastMCP):
                 include_dimensions=include_dimensions,
             )
 
+        return json.dumps(result.model_dump(), default=str)
+
+    # --- Phase 15: Strategy Data Sources ---
+
+    @mcp.tool()
+    async def fetch_news_activity(appid: int) -> str:
+        """Fetch news and update activity for a Steam game via Steam News API.
+
+        Returns developer post metrics (official Steam Community Announcements, feed_type=1)
+        and press coverage metrics (third-party articles, feed_type=0) separately, enabling
+        independent analysis of update cadence vs. media visibility.
+
+        Use this tool to assess:
+        - How actively a developer communicates with their community
+        - How frequently a game receives press coverage
+        - Whether a game is still receiving updates (last activity date)
+        - Typical post frequency for developers in a genre
+
+        Args:
+            appid: Steam AppID of the game to fetch news activity for
+
+        Returns:
+            JSON-serialized NewsActivity with developer_posts_* and press_mentions_* fields,
+            or APIError on failure.
+
+        Example response fields:
+            developer_posts_total: Total official developer posts fetched (up to 250)
+            developer_posts_last_90d: Developer posts in last 90 days
+            developer_posts_last_365d: Developer posts in last 365 days
+            developer_avg_days_between_posts: Mean days between developer posts
+            developer_last_post_date: ISO date of most recent developer post
+            developer_recent_titles: Titles of 5 most recent developer posts
+            press_mentions_total: Total third-party articles fetched
+            press_mentions_last_90d: Press articles in last 90 days
+            press_mentions_last_365d: Press articles in last 365 days
+            total_news_items: All items combined (developer + press)
+            first_activity_date: Oldest fetched item date (any feed)
+            last_activity_date: Most recent item date (any feed)
+        """
+        if appid <= 0:
+            return json.dumps({"error": "appid must be positive", "error_type": "validation"})
+
+        result = await _steam_news.get_news_activity(appid)
+        if isinstance(result, APIError):
+            return json.dumps(result.model_dump())
         return json.dumps(result.model_dump(), default=str)
 
     # --- Phase 9: Market Analysis Tools ---
