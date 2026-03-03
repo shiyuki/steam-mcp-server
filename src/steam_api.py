@@ -3071,7 +3071,7 @@ class SteamNewsClient:
                 params={
                     "appid": str(appid),
                     "count": "250",   # max items in one call
-                    "maxlength": "0", # don't truncate content (we only need date/type)
+                    "maxlength": "500", # truncate content to reduce payload (metrics-only tool)
                 },
                 cache_ttl=86400,  # 24 hours — news activity is stable signal
             )
