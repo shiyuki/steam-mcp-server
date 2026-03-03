@@ -766,6 +766,7 @@ class NewsActivity(CachedResponse):
     developer_avg_days_between_posts: float | None = None  # mean days between consecutive developer posts (None if <2 posts)
     developer_last_post_date: str | None = None  # ISO date of most recent developer post
     developer_recent_titles: list[str] = Field(default_factory=list)  # titles of 5 most recent developer posts
+    developer_post_dates: list[str] = Field(default_factory=list)  # ISO dates of all developer posts (for compute_update_impact period classification)
 
     # Press coverage (feed_type=0 — third-party articles from PC Gamer, RPS, SteamDB, etc.)
     press_mentions_total: int = 0  # count of third-party press articles fetched

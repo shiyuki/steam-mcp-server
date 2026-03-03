@@ -3128,6 +3128,15 @@ class SteamNewsClient:
                 item.get("title", "") for item in developer_items[:5]
             ]
 
+            # Collect all developer post dates for compute_update_impact period classification
+            developer_post_dates: list[str] = []
+            for item in developer_items:
+                ts = item.get("date")
+                if ts:
+                    developer_post_dates.append(
+                        datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
+                    )
+
             # --- Press coverage metrics ---
             press_mentions_total = len(press_items)
 
@@ -3168,6 +3177,7 @@ class SteamNewsClient:
                 developer_avg_days_between_posts=developer_avg_days_between_posts,
                 developer_last_post_date=developer_last_post_date,
                 developer_recent_titles=developer_recent_titles,
+                developer_post_dates=developer_post_dates,
                 press_mentions_total=press_mentions_total,
                 press_mentions_last_90d=press_mentions_last_90d,
                 press_mentions_last_365d=press_mentions_last_365d,
